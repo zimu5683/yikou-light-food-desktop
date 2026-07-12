@@ -23,6 +23,8 @@ class App(tk.Tk):
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self._closing = False
+        self._log_lines: list[str] = []
+        self._search_var = tk.StringVar()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
         self._load_saved_values()
@@ -57,10 +59,20 @@ class App(tk.Tk):
         ttk.Button(buttons, text="安装/检查浏览器", command=self.install_browser).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="清除已保存密码", command=self.clear_password).pack(side="left")
 
-        ttk.Label(frame, text="运行日志").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        search = ttk.Frame(frame)
+        search.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 4))
+        search.columnconfigure(1, weight=1)
+        ttk.Label(search, text="搜索订单日志").grid(row=0, column=0, padx=(0, 8))
+        search_entry = ttk.Entry(search, textvariable=self._search_var)
+        search_entry.grid(row=0, column=1, sticky="ew")
+        search_entry.bind("<Return>", lambda _event: self.search_log())
+        ttk.Button(search, text="搜索", command=self.search_log).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(search, text="清除搜索", command=self.clear_log_search).grid(row=0, column=3, padx=(8, 0))
+
+        ttk.Label(frame, text="运行日志").grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 4))
         self.log = tk.Text(frame, height=18, state="disabled", wrap="word")
-        self.log.grid(row=7, column=0, columnspan=3, sticky="nsew")
-        frame.rowconfigure(7, weight=1)
+        self.log.grid(row=8, column=0, columnspan=3, sticky="nsew")
+        frame.rowconfigure(8, weight=1)
 
     def _load_saved_values(self) -> None:
         config = AppConfig.load()
@@ -85,9 +97,33 @@ class App(tk.Tk):
                          excel_path=self.vars["excel"].get().strip(), browser_mode="auto")
 
     def _append(self, text: str) -> None:
+        self._log_lines.append(text.rstrip())
         self.log.configure(state="normal")
         self.log.insert("end", text.rstrip() + "\n")
         self.log.see("end")
+        self.log.configure(state="disabled")
+
+    def search_log(self) -> None:
+        query = self._search_var.get().strip().lower()
+        if not query:
+            return
+        for index, line in enumerate(self._log_lines):
+            if query in line.lower():
+                self.log.configure(state="normal")
+                self.log.tag_remove("search_hit", "1.0", "end")
+                start = f"{index + 1}.0"
+                end = f"{index + 1}.end"
+                self.log.tag_add("search_hit", start, end)
+                self.log.tag_configure("search_hit", background="#fff2a8")
+                self.log.see(start)
+                self.log.configure(state="disabled")
+                return
+        messagebox.showinfo("搜索结果", f"未找到包含“{self._search_var.get().strip()}”的订单日志。")
+
+    def clear_log_search(self) -> None:
+        self._search_var.set("")
+        self.log.configure(state="normal")
+        self.log.tag_remove("search_hit", "1.0", "end")
         self.log.configure(state="disabled")
 
     def _drain_events(self) -> None:

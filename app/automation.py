@@ -259,6 +259,11 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                             setattr(order, attr, meals)
                             for meal in meals:
                                 for _ in range(max(1, meal.count)): _write_order(wb, order, meal, typ)
+                        meal_text = _format_order_meals(order)
+                        _emit(progress_callback, (
+                            f"订单详情：订单号={order.order_no}，姓名={order.name or '未填写'}，"
+                            f"电话={order.phone or '未填写'}，地址={order.address or '未填写'}，餐品={meal_text}"
+                        ))
                         found += 1
                         page.go_back(); page.wait_for_load_state("networkidle")
                         _wait_for_order_table(page, timeout)
@@ -296,6 +301,16 @@ def _save_workbook_with_retry(workbook: Any, excel_path: Path,
             decision = decision_callback(str(exc)).strip().lower()
             if decision not in {"retry", "重试", "再次保存"}:
                 raise PermissionError(f"已取消保存 Excel 文件：{excel_path}") from exc
+
+
+def _format_order_meals(order: OrderInfo) -> str:
+    parts: list[str] = []
+    for meal_type, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
+        for meal in meals:
+            grade = meal.grade or "未标注"
+            total = f"{meal.total_meals}餐" if meal.total_meals else "餐品"
+            parts.append(f"{meal_type}{grade}{total} x{meal.count}")
+    return "、".join(parts) if parts else "未识别"
 
 
 def _wait_for_order_table(page: Any, timeout: int) -> None:

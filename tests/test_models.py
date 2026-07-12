@@ -38,3 +38,14 @@ def test_save_workbook_retries_after_locked_file():
     workbook = LockedWorkbook()
     _save_workbook_with_retry(workbook, "locked.xlsx", lambda error: "retry")
     assert workbook.calls == 2
+
+
+def test_order_log_contains_order_details():
+    from app.automation import _format_order_meals
+
+    order = OrderInfo(
+        order_no="W8",
+        name="测试用户",
+        lunch=[MealInfo(total_meals=6, grade="经济", count=2, meal_type="午餐")],
+    )
+    assert "午餐经济6餐 x2" in _format_order_meals(order)
