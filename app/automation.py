@@ -28,6 +28,7 @@ REG_XIAOXI = re.compile(r"小西.*?([a-zA-Z]+\d+|\d+[a-zA-Z]+)", re.I)
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
 MAX_PAGE_SEARCH = 20
+SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 ADDRESS_SHEET_MAP = {"联建": "衣锦", "衣锦": "衣锦", "医学院": "医学院", "东湖": "东湖", "农林": "东湖"}
 
@@ -157,7 +158,7 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> N
         return
     weekday = WEEKDAYS[(_dt.datetime.now().weekday() + 1) % 7]
     weekday_sheet = wb[weekday] if weekday in wb.sheetnames else wb.create_sheet(weekday)
-    target_name = f"{base}{meal_type}"
+    target_name = f"{base}{SHEET_MEAL_SUFFIX.get(meal_type, meal_type)}"
     target = wb[target_name] if target_name in wb.sheetnames else wb.create_sheet(target_name)
     columns = ("A", "B", "C", "D", "E", "F") if meal_type == "午餐" else ("G", "H", "I", "J", "K", "L")
     row = max(3, weekday_sheet.max_row + 1)
@@ -210,13 +211,13 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 page.locator('div.detail:has-text("门店地址")').dblclick(); page.wait_for_url("**/home", timeout=timeout)
                 page.locator('div.navBarItem:has-text("订单")').click(); page.wait_for_url("**/order/**", timeout=timeout)
                 page.locator("text=外送订单").click(); page.wait_for_load_state("networkidle")
+                _wait_for_order_table(page, timeout)
                 _emit(progress_callback, "登录成功，开始搜索订单")
                 for number in range(order_count, 0, -1):
                     if stop_event.is_set(): break
                     code = f"W{number}"; _emit(progress_callback, f"搜索 {code}")
                     try:
-                        cell = page.locator(f'//td[normalize-space()="{code}"]').first
-                        cell.wait_for(timeout=int(getattr(config, "order_search_timeout_ms", 1000)))
+                        cell = _find_order_cell(page, code, config, progress_callback)
                         cell.locator("xpath=ancestor::tr").locator("text=详情").first.click()
                         page.wait_for_timeout(300)
                         receiver = _label(page, "收货人", timeout)
@@ -231,7 +232,9 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                             setattr(order, attr, meals)
                             for meal in meals:
                                 for _ in range(max(1, meal.count)): _write_order(wb, order, meal, typ)
-                        found += 1; page.go_back(); page.wait_for_load_state("networkidle")
+                        found += 1
+                        page.go_back(); page.wait_for_load_state("networkidle")
+                        _wait_for_order_table(page, timeout)
                     except PlaywrightTimeout:
                         _emit(progress_callback, f"{code} 未找到，跳过")
                     processed += 1
@@ -242,6 +245,31 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
         wb.close()
     _emit(progress_callback, f"处理完成：找到 {found}/{processed} 个订单")
     return {"processed": processed, "found": found}
+
+
+def _wait_for_order_table(page: Any, timeout: int) -> None:
+    """Wait for the SPA to render at least one order row."""
+    page.wait_for_load_state("domcontentloaded", timeout=timeout)
+    page.locator(".el-table__body-wrapper tbody tr, table tbody tr").first.wait_for(timeout=timeout)
+
+
+def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None) -> Any:
+    """Retry while the table is being replaced after navigation or back."""
+    timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
+    pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
+    attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
+    cell = page.locator(f'//td[normalize-space()="{code}"]').first
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            cell.wait_for(state="visible", timeout=timeout)
+            return cell
+        except Exception as exc:
+            last_error = exc
+            if attempt < attempts:
+                _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
+                page.wait_for_timeout(pause)
+    raise last_error or TimeoutError(f"订单 {code} 未找到")
 
 
 __all__ = ["run_job", "ensure_browser", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]

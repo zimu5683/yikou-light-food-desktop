@@ -32,15 +32,18 @@ class AppConfig:
     max_page_search: int = 20
     element_timeout_ms: int = 8000
     network_idle_timeout_ms: int = 5000
-    order_search_timeout_ms: int = 1000
-    retry_wait_ms: int = 300
+    # The order table is rendered asynchronously after navigation/back.
+    order_search_timeout_ms: int = 8000
+    retry_wait_ms: int = 1000
+    order_search_attempts: int = 3
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
                  excel_path: str | os.PathLike[str] = "", browser_mode: str = "auto", headless: bool = False,
                  max_page_search: int = 20, element_timeout_ms: int = 8000,
-                 network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 1000,
-                 retry_wait_ms: int = 300, config_path: Optional[str] = None,
+                 network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
+                 retry_wait_ms: int = 1000, order_search_attempts: int = 3,
+                 config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
         # url/phone/browser are compatibility aliases used by the GUI.
@@ -54,6 +57,7 @@ class AppConfig:
         self.network_idle_timeout_ms = network_idle_timeout_ms
         self.order_search_timeout_ms = order_search_timeout_ms
         self.retry_wait_ms = retry_wait_ms
+        self.order_search_attempts = order_search_attempts
         self.config_path = config_path
 
     @property
