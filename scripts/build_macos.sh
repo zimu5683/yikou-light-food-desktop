@@ -12,5 +12,10 @@ python3 -m pip install -r requirements.txt
 export PLAYWRIGHT_BROWSERS_PATH=0
 python3 -m PyInstaller --clean --noconfirm "yikou-light-food.spec"
 
-echo "Build complete: $ROOT/dist/yikou-light-food"
+APP="$ROOT/dist/yikou-light-food.app"
+if [[ ! -d "$APP" ]]; then
+  echo "PyInstaller did not create $APP" >&2
+  exit 1
+fi
+echo "Build complete: $APP"
 

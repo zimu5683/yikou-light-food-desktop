@@ -38,12 +38,12 @@ class BrowserNotFoundError(RuntimeError):
 
     def __init__(self, browsers: dict[str, str | None] | None = None) -> None:
         self.browsers = browsers or detect_browsers()
-        super().__init__("未检测到 Microsoft Edge 或 Google Chrome，请先安装浏览器")
+        super().__init__("未检测到可用浏览器，请安装 Microsoft Edge/Google Chrome，或安装 Playwright Chromium")
 
 
 def detect_browsers() -> dict[str, str | None]:
-    """Find installed Edge/Chrome executables without launching installers."""
-    candidates: dict[str, list[Path]] = {"msedge": [], "chrome": []}
+    """Find system browsers and an already-installed Playwright Chromium."""
+    candidates: dict[str, list[Path]] = {"msedge": [], "chrome": [], "chromium": []}
     for name in candidates:
         found = shutil.which(name) or shutil.which(name + ".exe")
         if found:
@@ -52,7 +52,33 @@ def detect_browsers() -> dict[str, str | None]:
         roots = [Path(os.environ.get(k, "")) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
         candidates["msedge"] += [root / "Microsoft/Edge/Application/msedge.exe" for root in roots if str(root)]
         candidates["chrome"] += [root / "Google/Chrome/Application/chrome.exe" for root in roots if str(root)]
+    elif sys.platform == "darwin":
+        candidates["msedge"] += _macos_browser_paths("msedge")
+        candidates["chrome"] += _macos_browser_paths("chrome")
+    chromium = _playwright_chromium_path()
+    if chromium:
+        candidates["chromium"].append(chromium)
     return {name: next((str(path) for path in paths if path.is_file()), None) for name, paths in candidates.items()}
+
+
+def _macos_browser_paths(browser: str) -> list[Path]:
+    app_roots = (Path("/Applications"), Path.home() / "Applications")
+    app_name, executable = {
+        "msedge": ("Microsoft Edge.app", "Microsoft Edge"),
+        "chrome": ("Google Chrome.app", "Google Chrome"),
+    }[browser]
+    return [root / app_name / "Contents" / "MacOS" / executable for root in app_roots]
+
+
+def _playwright_chromium_path() -> Path | None:
+    """Return Playwright's Chromium executable when the browser payload exists."""
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as playwright:
+            path = Path(playwright.chromium.executable_path)
+        return path if path.is_file() else None
+    except Exception:
+        return None
 
 
 def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
@@ -133,8 +159,8 @@ def get_yijin_address_from_product_note(note: str) -> str:
     return "外卖柜" if "联建门口外卖柜" in (note or "") else "校门口"
 
 
-def ensure_browser(mode: str = "auto") -> str:
-    """Return the selected system browser; never install from a frozen exe."""
+def ensure_browser(mode: str = "auto", allow_install: bool = True) -> str:
+    """Return a usable browser, installing Playwright Chromium when needed."""
     mode = (mode or "auto").lower()
     found = detect_browsers()
     if mode in {"msedge", "edge"}:
@@ -149,6 +175,18 @@ def ensure_browser(mode: str = "auto") -> str:
         return "msedge"
     if found["chrome"]:
         return "chrome"
+    if found.get("chromium"):
+        return "chromium"
+    if allow_install and not getattr(sys, "frozen", False):
+        try:
+            _install_chromium()
+        except Exception as exc:
+            error = BrowserNotFoundError(found)
+            error.__cause__ = exc
+            raise error from exc
+        found = detect_browsers()
+        if found.get("chromium"):
+            return "chromium"
     raise BrowserNotFoundError(found)
 
 
@@ -160,7 +198,7 @@ def _install_chromium() -> None:
 
 
 def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
-    preferred = ensure_browser(mode)
+    preferred = ensure_browser(mode, allow_install=(str(mode or "auto").lower() == "auto"))
     kwargs = {"headless": headless, "args": ["--window-size=1300,900"]}
     executable = detect_browsers().get(preferred)
     if not executable:
