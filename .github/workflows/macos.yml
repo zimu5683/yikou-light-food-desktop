@@ -1,0 +1,23 @@
+name: Build macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*.*.*"]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Build app
+        run: bash scripts/build_macos.sh
+      - name: Archive app
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/一口轻食助手" "一口轻食助手-macos.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 一口轻食助手-macos
+          path: 一口轻食助手-macos.zip

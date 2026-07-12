@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Build artefacts
+build/
+dist/
+*.spec~
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+config.json
+credentials.json
+
+# User data / logs / browser cache
+*.xlsx
+*.xlsm
+*.xls
+logs/
+*.log
+.playwright/
+playwright-browsers/
+
+# IDE and OS files
+.vs/
+.vscode/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
