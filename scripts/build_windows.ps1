@@ -15,5 +15,10 @@ python -m pip install -r requirements.txt
 $env:PLAYWRIGHT_BROWSERS_PATH = "0"
 python -m PyInstaller --clean --noconfirm "yikou-light-food.spec"
 
+$exe = Join-Path $root "dist\yikou-light-food.exe"
+if (-not (Test-Path $exe)) { throw "PyInstaller did not create $exe" }
+$sizeMb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+Write-Host "Executable size: $sizeMb MB (Playwright browsers are external)"
+
 Write-Host "Build complete: $root\dist\yikou-light-food.exe"
 

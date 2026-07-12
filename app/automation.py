@@ -33,6 +33,28 @@ WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日"
 ADDRESS_SHEET_MAP = {"联建": "衣锦", "衣锦": "衣锦", "医学院": "医学院", "东湖": "东湖", "农林": "东湖"}
 
 
+class BrowserNotFoundError(RuntimeError):
+    """Raised when no supported system browser is available."""
+
+    def __init__(self, browsers: dict[str, str | None] | None = None) -> None:
+        self.browsers = browsers or detect_browsers()
+        super().__init__("未检测到 Microsoft Edge 或 Google Chrome，请先安装浏览器")
+
+
+def detect_browsers() -> dict[str, str | None]:
+    """Find installed Edge/Chrome executables without launching installers."""
+    candidates: dict[str, list[Path]] = {"msedge": [], "chrome": []}
+    for name in candidates:
+        found = shutil.which(name) or shutil.which(name + ".exe")
+        if found:
+            candidates[name].append(Path(found))
+    if os.name == "nt":
+        roots = [Path(os.environ.get(k, "")) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+        candidates["msedge"] += [root / "Microsoft/Edge/Application/msedge.exe" for root in roots if str(root)]
+        candidates["chrome"] += [root / "Google/Chrome/Application/chrome.exe" for root in roots if str(root)]
+    return {name: next((str(path) for path in paths if path.is_file()), None) for name, paths in candidates.items()}
+
+
 def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
     if callback:
         callback(message)
@@ -112,22 +134,27 @@ def get_yijin_address_from_product_note(note: str) -> str:
 
 
 def ensure_browser(mode: str = "auto") -> str:
-    """Return a Playwright channel name, installing Chromium as fallback."""
+    """Return the selected system browser; never install from a frozen exe."""
     mode = (mode or "auto").lower()
+    found = detect_browsers()
     if mode in {"msedge", "edge"}:
+        if found["msedge"]:
+            return "msedge"
+        raise BrowserNotFoundError(found)
+    if mode in {"chrome", "google-chrome"}:
+        if found["chrome"]:
+            return "chrome"
+        raise BrowserNotFoundError(found)
+    if found["msedge"]:
         return "msedge"
-    if mode == "chromium":
-        _install_chromium()
-        return "chromium"
-    # The channel is preferred even if Edge is not on PATH; Playwright gives a
-    # deterministic error and run_job then falls back to bundled Chromium.
-    if shutil.which("msedge") or shutil.which("msedge.exe") or sys.platform == "win32":
-        return "msedge"
-    _install_chromium()
-    return "chromium"
+    if found["chrome"]:
+        return "chrome"
+    raise BrowserNotFoundError(found)
 
 
 def _install_chromium() -> None:
+    if getattr(sys, "frozen", False):
+        raise BrowserNotFoundError()
     command = [sys.executable, "-m", "playwright", "install", "chromium"]
     subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
@@ -135,12 +162,10 @@ def _install_chromium() -> None:
 def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
     preferred = ensure_browser(mode)
     kwargs = {"headless": headless, "args": ["--window-size=1300,900"]}
-    if preferred == "msedge":
-        try:
-            return playwright.chromium.launch(channel="msedge", **kwargs)
-        except Exception:
-            _install_chromium()
-    return playwright.chromium.launch(**kwargs)
+    executable = detect_browsers().get(preferred)
+    if not executable:
+        raise BrowserNotFoundError()
+    return playwright.chromium.launch(executable_path=executable, **kwargs)
 
 
 def _label(page: Any, label: str, timeout: int) -> str:
@@ -175,7 +200,8 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> N
         target.cell(row2, idx).value = value
 
 
-def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None) -> dict[str, int]:
+def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
+            order_decision_callback: Callable[[str, str], str] | None = None) -> dict[str, int]:
     """Process the newest W orders and append their meals to the workbook."""
     excel_path = Path(getattr(config, "excel_path", ""))
     if not excel_path.exists():
@@ -235,7 +261,16 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                         found += 1
                         page.go_back(); page.wait_for_load_state("networkidle")
                         _wait_for_order_table(page, timeout)
-                    except PlaywrightTimeout:
+                    except Exception as exc:
+                        decision = "skip"
+                        if order_decision_callback:
+                            decision = order_decision_callback(code, str(exc)).lower()
+                        if decision == "retry":
+                            _emit(progress_callback, f"重试 {code}")
+                            continue
+                        if decision == "stop":
+                            stop_event.set()
+                            break
                         _emit(progress_callback, f"{code} 未找到，跳过")
                     processed += 1
             finally:
@@ -250,7 +285,9 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
 def _wait_for_order_table(page: Any, timeout: int) -> None:
     """Wait for the SPA to render at least one order row."""
     page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    page.locator(".el-table__body-wrapper tbody tr, table tbody tr").first.wait_for(timeout=timeout)
+    page.locator(".el-table__body-wrapper tbody tr:visible, table tbody tr:visible").first.wait_for(
+        state="visible", timeout=timeout
+    )
 
 
 def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None) -> Any:
@@ -258,7 +295,9 @@ def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str]
     timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
     pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
     attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
-    cell = page.locator(f'//td[normalize-space()="{code}"]').first
+    cell = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
+        has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
+    ).first
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
@@ -272,4 +311,4 @@ def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str]
     raise last_error or TimeoutError(f"订单 {code} 未找到")
 
 
-__all__ = ["run_job", "ensure_browser", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]
+__all__ = ["run_job", "ensure_browser", "detect_browsers", "BrowserNotFoundError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]

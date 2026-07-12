@@ -4,10 +4,11 @@ from __future__ import annotations
 import queue
 import threading
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .automation import ensure_browser, run_job
+from .automation import BrowserNotFoundError, detect_browsers, ensure_browser, run_job
 from .config import AppConfig
 from .credentials import delete_password, get_password, set_password
 
@@ -21,6 +22,8 @@ class App(tk.Tk):
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
+        self._closing = False
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
         self._load_saved_values()
         self.after(100, self._drain_events)
@@ -104,9 +107,35 @@ class App(tk.Tk):
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
                     self.worker = None
+                elif kind == "browser_missing":
+                    self._append(value)
+                    self.start_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                    self.worker = None
+                    self.choose_browser_download()
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
+
+    def _on_close(self) -> None:
+        if not self.worker or not self.worker.is_alive():
+            self.destroy()
+            return
+        if self._closing:
+            return
+        action = messagebox.askyesnocancel("正在处理", "任务仍在运行。点击“是”停止并关闭，点击“否”继续处理，点击“取消”返回。")
+        if action is None or action is False:
+            return
+        self._closing = True
+        self.stop_event.set()
+        self._append("正在停止并清理浏览器，请稍候...")
+        self.after(100, self._wait_for_worker_close)
+
+    def _wait_for_worker_close(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self.after(100, self._wait_for_worker_close)
+        else:
+            self.destroy()
 
     def start(self) -> None:
         try:
@@ -131,14 +160,29 @@ class App(tk.Tk):
 
     def _run(self, config: AppConfig, count: int, password: str) -> None:
         try:
-            result = run_job(config, count, self.stop_event, lambda msg: self.events.put(("log", msg)), password=password)
+            result = run_job(config, count, self.stop_event, lambda msg: self.events.put(("log", msg)), password=password,
+                             order_decision_callback=self._order_decision)
             self.events.put(("done", f"处理完成：{result}"))
+        except BrowserNotFoundError as exc:
+            self.events.put(("browser_missing", str(exc)))
         except Exception as exc:
             self.events.put(("error", str(exc)))
 
     def stop(self) -> None:
-        self.stop_event.set()
-        self._append("已请求停止，正在等待浏览器操作结束...")
+        if not self.worker or not self.worker.is_alive():
+            return
+        action = messagebox.askyesnocancel("暂停处理", "是否停止当前任务？点击“是”停止，点击“否”继续处理，点击“取消”返回。")
+        if action:
+            self.stop_event.set()
+            self._append("已请求停止，正在等待浏览器操作结束...")
+
+    def _order_decision(self, code: str, error: str) -> str:
+        result: queue.Queue[str] = queue.Queue(maxsize=1)
+        def ask() -> None:
+            choice = messagebox.askyesnocancel("订单定位失败", f"订单 {code} 定位失败：\n{error}\n\n是=重试，否=跳过，取消=停止")
+            result.put("retry" if choice is True else "skip" if choice is False else "stop")
+        self.after(0, ask)
+        return result.get()
 
     def install_browser(self) -> None:
         self._append("正在检查浏览器...")
@@ -150,6 +194,10 @@ class App(tk.Tk):
             self.events.put(("log", f"浏览器可用：{path}"))
         except Exception as exc:
             self.events.put(("error", str(exc)))
+
+    def choose_browser_download(self) -> None:
+        choice = messagebox.askyesno("未安装浏览器", "打开 Microsoft Edge 下载页面吗？选择“否”将打开 Google Chrome 下载页面。")
+        webbrowser.open("https://www.microsoft.com/edge/download" if choice else "https://www.google.com/chrome/")
 
     def clear_password(self) -> None:
         phone = self.vars["phone"].get().strip()

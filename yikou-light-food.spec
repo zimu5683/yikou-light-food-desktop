@@ -6,6 +6,9 @@ from PyInstaller.utils.hooks import collect_all
 
 project = Path(SPECPATH)
 datas, binaries, hiddenimports = collect_all("playwright")
+# The browser payload is machine-specific and is intentionally not bundled.
+datas = [item for item in datas if ".local-browsers" not in str(item[0])]
+binaries = [item for item in binaries if ".local-browsers" not in str(item[0])]
 
 analysis = Analysis(
     [str(project / "run.py")],
