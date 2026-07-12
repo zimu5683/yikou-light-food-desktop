@@ -1,4 +1,4 @@
-<#!
+﻿<#!
 .SYNOPSIS
     Build the Windows executable with PyInstaller.
 #>
@@ -13,6 +13,7 @@ python -m pip install -r requirements.txt
 # this variable keeps PyInstaller from trying to bundle a machine-specific
 # browser into the executable.
 $env:PLAYWRIGHT_BROWSERS_PATH = "0"
-python -m PyInstaller --clean --noconfirm "一口轻食.spec"
+python -m PyInstaller --clean --noconfirm "yikou-light-food.spec"
 
 Write-Host "Build complete: $root\dist\yikou-light-food.exe"
+

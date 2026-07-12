@@ -1,5 +1,5 @@
-# PyInstaller build specification for the desktop application.
-# Build with: python -m PyInstaller --clean --noconfirm 一口轻食.spec
+﻿# PyInstaller build specification for the desktop application.
+# Build with: python -m PyInstaller --clean --noconfirm yikou-light-food.spec
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -33,3 +33,4 @@ exe = EXE(
     upx=True,
     console=False,
 )
+
