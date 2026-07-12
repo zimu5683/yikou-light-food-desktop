@@ -1,6 +1,7 @@
 ﻿# PyInstaller build specification for the desktop application.
 # Build with: python -m PyInstaller --clean --noconfirm yikou-light-food.spec
 from pathlib import Path
+import sys
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -36,4 +37,11 @@ exe = EXE(
     upx=True,
     console=False,
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        exe,
+        name="yikou-light-food.app",
+        bundle_identifier="com.zimu5683.yikou-light-food",
+    )
 
