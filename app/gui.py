@@ -18,7 +18,7 @@ from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_in
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Yikou Light Food - Order Processing")
+        self.title("一口轻食 - 订单处理")
         self.geometry("980x700")
         self.minsize(820, 600)
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
@@ -57,53 +57,53 @@ class App(tk.Tk):
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
-        ttk.Label(outer, text='Yikou Light Food', style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(outer, text='Order automation center  |  Configure a task and monitor live status', style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 18))
+        ttk.Label(outer, text="一口轻食", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(outer, text="订单自动处理中心  |  配置任务并实时查看运行状态", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 18))
 
         card = ttk.Frame(outer, style="Card.TFrame", padding=20)
         card.grid(row=2, column=0, sticky="nsew")
         card.columnconfigure(1, weight=1)
         card.rowconfigure(9, weight=1)
-        ttk.Label(card, text='Task configuration', style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
+        ttk.Label(card, text="任务配置", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
         fields = [("管理网址", "url"), ("手机号 / 账号", "phone"), ("Excel 文件", "excel")]
         self.vars: dict[str, tk.StringVar] = {key: tk.StringVar() for _, key in fields}
         for row, (label, key) in enumerate(fields, start=1):
             ttk.Label(card, text=label, style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 14), pady=6)
             ttk.Entry(card, textvariable=self.vars[key]).grid(row=row, column=1, sticky="ew", pady=6)
             if key == "excel":
-                ttk.Button(card, text='Browse', command=self._choose_excel).grid(row=row, column=2, padx=(10, 0), pady=6)
-        ttk.Label(card, text='Login password', style="Field.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 14), pady=6)
+                ttk.Button(card, text="选择文件", command=self._choose_excel).grid(row=row, column=2, padx=(10, 0), pady=6)
+        ttk.Label(card, text="登录密码", style="Field.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 14), pady=6)
         self.password = tk.StringVar()
         ttk.Entry(card, textvariable=self.password, show="*").grid(row=4, column=1, sticky="ew", pady=6)
         self.remember = tk.BooleanVar(value=True)
-        ttk.Checkbutton(card, text='Save to credential manager', variable=self.remember).grid(row=4, column=2, padx=(10, 0), sticky="w")
-        ttk.Label(card, text='Orders to process', style="Field.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 14), pady=6)
+        ttk.Checkbutton(card, text="保存到系统凭据管理器", variable=self.remember).grid(row=4, column=2, padx=(10, 0), sticky="w")
+        ttk.Label(card, text="待处理订单数", style="Field.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 14), pady=6)
         self.order_count = tk.StringVar(value="1")
         ttk.Spinbox(card, from_=1, to=9999, textvariable=self.order_count, width=10).grid(row=5, column=1, sticky="w", pady=6)
 
         buttons = ttk.Frame(card, style="Card.TFrame")
         buttons.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(14, 12))
-        self.start_button = ttk.Button(buttons, text='Start processing', style="Primary.TButton", command=self.start)
+        self.start_button = ttk.Button(buttons, text="开始处理", style="Primary.TButton", command=self.start)
         self.start_button.pack(side="left", padx=(0, 8))
-        self.stop_button = ttk.Button(buttons, text='Stop', style="Danger.TButton", command=self.stop, state="disabled")
+        self.stop_button = ttk.Button(buttons, text="停止", style="Danger.TButton", command=self.stop, state="disabled")
         self.stop_button.pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text='Install / check browser', command=self.install_browser).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text='Clear saved password', command=self.clear_password).pack(side="left")
-        ttk.Button(buttons, text='Check for updates', command=lambda: self.check_for_updates(manual=True)).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="安装 / 检查浏览器", command=self.install_browser).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="清除已保存密码", command=self.clear_password).pack(side="left")
+        ttk.Button(buttons, text="检查更新", command=lambda: self.check_for_updates(manual=True)).pack(side="left", padx=(8, 0))
         self.status = tk.StringVar(value="就绪")
         ttk.Label(buttons, textvariable=self.status, foreground="#60758a", background="#ffffff").pack(side="right")
 
         search = ttk.Frame(card, style="Card.TFrame")
         search.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 4))
         search.columnconfigure(1, weight=1)
-        ttk.Label(search, text='Search run log', style="Field.TLabel").grid(row=0, column=0, padx=(0, 8))
+        ttk.Label(search, text="搜索运行日志", style="Field.TLabel").grid(row=0, column=0, padx=(0, 8))
         search_entry = ttk.Entry(search, textvariable=self._search_var)
         search_entry.grid(row=0, column=1, sticky="ew")
         search_entry.bind("<Return>", lambda _event: self.search_log())
-        ttk.Button(search, text='Search', command=self.search_log).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(search, text='Clear', command=self.clear_log_search).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(search, text="搜索", command=self.search_log).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(search, text="清除", command=self.clear_log_search).grid(row=0, column=3, padx=(8, 0))
 
-        ttk.Label(card, text='Ready', style="Section.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 6))
+        ttk.Label(card, text="运行日志", style="Section.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 6))
         log_frame = ttk.Frame(card, style="Card.TFrame")
         log_frame.grid(row=9, column=0, columnspan=3, sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
@@ -192,14 +192,14 @@ class App(tk.Tk):
                 elif kind == "update":
                     release = value
                     if isinstance(release, ReleaseInfo):
-                        details = release.body or "(No release notes provided.)"
-                        prompt = f"New version {release.tag_name} (current {__version__})\n\nChanges:\n{details}\n\nDownload and install now?"
-                        if messagebox.askyesno("Update available", prompt):
+                        details = release.body or "（暂无更新说明）"
+                        prompt = f"发现新版本 {release.tag_name}（当前版本 {__version__}）\n\n更新内容：\n{details}\n\n是否立即下载并安装？"
+                        if messagebox.askyesno("发现新版本", prompt):
                             self._install_update(release)
                 elif kind == "update_latest":
-                    messagebox.showinfo("Check for updates", f"You are using the latest version ({__version__}).")
+                    messagebox.showinfo("检查更新", f"当前已是最新版本（{__version__}）。")
                 elif kind == "update_error":
-                    self._append("Update check failed: " + value)
+                    self._append("检查更新失败：" + value)
                 elif kind == "update_installed":
                     self._append(value)
                     messagebox.showinfo("更新完成", "更新已下载，点击确定后程序将关闭并自动重启。")
@@ -307,7 +307,7 @@ class App(tk.Tk):
         if getattr(self, "_update_checking", False):
             return
         self._update_checking = True
-        self._append("Checking for updates...")
+        self._append("正在检查更新...")
         threading.Thread(target=self._check_updates_worker, args=(manual,), daemon=True).start()
 
     def _check_updates_worker(self, manual: bool) -> None:
