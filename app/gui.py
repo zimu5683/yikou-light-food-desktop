@@ -11,6 +11,8 @@ from tkinter import filedialog, messagebox, ttk
 from .automation import BrowserNotFoundError, detect_browsers, ensure_browser, run_job
 from .config import AppConfig
 from .credentials import delete_password, get_password, set_password
+from . import __version__
+from .updater import ReleaseInfo, UpdateError, check_for_update
 
 
 class App(tk.Tk):
@@ -29,6 +31,7 @@ class App(tk.Tk):
         self._build_widgets()
         self._load_saved_values()
         self.after(100, self._drain_events)
+        self.after(700, self.check_for_updates)
 
     def _build_widgets(self) -> None:
         frame = ttk.Frame(self, padding=16)
@@ -58,6 +61,7 @@ class App(tk.Tk):
         self.stop_button.pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="安装/检查浏览器", command=self.install_browser).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="清除已保存密码", command=self.clear_password).pack(side="left")
+        ttk.Button(buttons, text="检查更新", command=lambda: self.check_for_updates(manual=True)).pack(side="left", padx=(8, 0))
 
         search = ttk.Frame(frame)
         search.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(8, 4))
@@ -149,6 +153,17 @@ class App(tk.Tk):
                     self.stop_button.configure(state="disabled")
                     self.worker = None
                     self.choose_browser_download()
+                elif kind == "update":
+                    release = value
+                    if isinstance(release, ReleaseInfo):
+                        details = release.body or "(No release notes provided.)"
+                        prompt = f"New version {release.tag_name} (current {__version__})\n\nChanges:\n{details}\n\nOpen download page?"
+                        if messagebox.askyesno("Update available", prompt) and release.html_url:
+                            webbrowser.open(release.html_url)
+                elif kind == "update_latest":
+                    messagebox.showinfo("Check for updates", f"You are using the latest version ({__version__}).")
+                elif kind == "update_error":
+                    self._append("Update check failed: " + value)
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
@@ -246,6 +261,22 @@ class App(tk.Tk):
     def choose_browser_download(self) -> None:
         choice = messagebox.askyesno("未安装浏览器", "打开 Microsoft Edge 下载页面吗？选择“否”将打开 Google Chrome 下载页面。")
         webbrowser.open("https://www.microsoft.com/edge/download" if choice else "https://www.google.com/chrome/")
+
+    def check_for_updates(self, manual: bool = False) -> None:
+        if getattr(self, "_update_checking", False):
+            return
+        self._update_checking = True
+        self._append("Checking for updates...")
+        threading.Thread(target=self._check_updates_worker, args=(manual,), daemon=True).start()
+
+    def _check_updates_worker(self, manual: bool) -> None:
+        try:
+            release = check_for_update()
+            self.events.put(("update", release) if release else ("update_latest", "") if manual else ("log", "已是最新版本"))
+        except UpdateError as exc:
+            self.events.put(("update_error", str(exc)))
+        finally:
+            self._update_checking = False
 
     def clear_password(self) -> None:
         phone = self.vars["phone"].get().strip()

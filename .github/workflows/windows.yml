@@ -1,0 +1,59 @@
+name: Build Windows executable
+
+on:
+  # A version tag is the production release trigger.  Manual runs are useful
+  # for checking that the packaging toolchain still works and upload an
+  # Actions artifact without creating a release.
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build executable
+        shell: pwsh
+        run: ./scripts/build_windows.ps1
+
+      - name: Create release notes
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "manual-$env:GITHUB_RUN_NUMBER" }
+          $previous = git tag --sort=-creatordate | Where-Object { $_ -ne $tag } | Select-Object -First 1
+          if ($previous) {
+            $changes = git log "$previous..HEAD" --pretty=format:'- %s (%h)'
+          } else {
+            $changes = git log -5 --pretty=format:'- %s (%h)'
+          }
+          @("## $tag", "", "$changes") | Set-Content -Path release-notes.md -Encoding utf8
+
+      - name: Upload executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yikou-light-food-windows
+          path: dist/yikou-light-food.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "${{ github.ref_name }}"
+          body_path: release-notes.md
+          files: dist/yikou-light-food.exe
+          fail_on_unmatched_files: true
