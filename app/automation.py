@@ -201,7 +201,8 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> N
 
 
 def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
-            order_decision_callback: Callable[[str, str], str] | None = None) -> dict[str, int]:
+            order_decision_callback: Callable[[str, str], str] | None = None,
+            save_decision_callback: Callable[[str], str] | None = None) -> dict[str, int]:
     """Process the newest W orders and append their meals to the workbook."""
     excel_path = Path(getattr(config, "excel_path", ""))
     if not excel_path.exists():
@@ -275,11 +276,26 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                     processed += 1
             finally:
                 browser.close()
-        wb.save(excel_path)
+        _save_workbook_with_retry(wb, excel_path, save_decision_callback)
     finally:
         wb.close()
     _emit(progress_callback, f"处理完成：找到 {found}/{processed} 个订单")
     return {"processed": processed, "found": found}
+
+
+def _save_workbook_with_retry(workbook: Any, excel_path: Path,
+                              decision_callback: Callable[[str], str] | None = None) -> None:
+    """Save an Excel workbook, allowing the user to close a locked file and retry."""
+    while True:
+        try:
+            workbook.save(str(excel_path))
+            return
+        except PermissionError as exc:
+            if decision_callback is None:
+                raise
+            decision = decision_callback(str(exc)).strip().lower()
+            if decision not in {"retry", "重试", "再次保存"}:
+                raise PermissionError(f"已取消保存 Excel 文件：{excel_path}") from exc
 
 
 def _wait_for_order_table(page: Any, timeout: int) -> None:

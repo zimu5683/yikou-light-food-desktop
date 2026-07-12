@@ -161,7 +161,8 @@ class App(tk.Tk):
     def _run(self, config: AppConfig, count: int, password: str) -> None:
         try:
             result = run_job(config, count, self.stop_event, lambda msg: self.events.put(("log", msg)), password=password,
-                             order_decision_callback=self._order_decision)
+                             order_decision_callback=self._order_decision,
+                             save_decision_callback=self._save_decision)
             self.events.put(("done", f"处理完成：{result}"))
         except BrowserNotFoundError as exc:
             self.events.put(("browser_missing", str(exc)))
@@ -181,6 +182,17 @@ class App(tk.Tk):
         def ask() -> None:
             choice = messagebox.askyesnocancel("订单定位失败", f"订单 {code} 定位失败：\n{error}\n\n是=重试，否=跳过，取消=停止")
             result.put("retry" if choice is True else "skip" if choice is False else "stop")
+        self.after(0, ask)
+        return result.get()
+
+    def _save_decision(self, error: str) -> str:
+        result: queue.Queue[str] = queue.Queue(maxsize=1)
+        def ask() -> None:
+            choice = messagebox.askretrycancel(
+                "Excel 文件正在使用",
+                "保存失败，Excel 文件可能正在被打开或占用。\n请关闭 Excel 文件后点击“重试保存”。\n\n" + error,
+            )
+            result.put("retry" if choice else "cancel")
         self.after(0, ask)
         return result.get()
 
