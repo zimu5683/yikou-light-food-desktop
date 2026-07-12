@@ -1,4 +1,4 @@
-from playwright.sync_api import sync_playwright, TimeoutError
+﻿from playwright.sync_api import sync_playwright, TimeoutError
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
@@ -10,9 +10,9 @@ import sys
 
 # ===================== 核心配置 =====================
 TARGET_URL = "https://m.icall.me/admin/#/login"
-PHONE_NUMBER = "13968033834"
-LOGIN_PASSWORD = "13968033834"
-EXCEL_PATH = r"D:\子木\下载\一口轻食\工作.xlsx"
+PHONE_NUMBER = ""
+LOGIN_PASSWORD = ""
+EXCEL_PATH = ""
 ADDRESS_SHEET_MAP = {"联建": "衣锦", "衣锦": "衣锦", "医学院": "医学院", "东湖": "东湖"}
 EXTENDED_ADDRESS_MAP = {"农林": "东湖"}
 WEEKDAY_SHEET_COL_MAP = {
@@ -594,3 +594,4 @@ if __name__ == "__main__":
     print("   2. playwright install msedge")
     print(f"\n配置确认：Excel={EXCEL_PATH} | 账号={PHONE_NUMBER}")
     run_auto_operation()
+
