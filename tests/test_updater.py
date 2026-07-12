@@ -29,3 +29,13 @@ def test_check_for_update_returns_none_when_current_is_latest():
         return io.BytesIO(payload)
 
     assert check_for_update("1.2.0", opener=opener) is None
+
+
+def test_release_executable_asset_is_selected():
+    from app.updater import _decode_release
+
+    release = _decode_release({
+        "tag_name": "v1.3.0",
+        "assets": [{"name": "notes.txt"}, {"name": "yikou-light-food.exe", "browser_download_url": "https://github.com/example.exe"}],
+    })
+    assert release.executable_asset["name"] == "yikou-light-food.exe"

@@ -8,9 +8,15 @@ from __future__ import annotations
 
 import json
 import re
+import os
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable
+from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -34,6 +40,15 @@ class ReleaseInfo:
     @property
     def version(self) -> str:
         return normalize_version(self.tag_name)
+
+    @property
+    def executable_asset(self) -> dict[str, Any] | None:
+        """Return the Windows executable asset attached to this release."""
+        for asset in self.assets:
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food.exe" or name.endswith(".exe"):
+                return asset
+        return None
 
 
 def normalize_version(value: str) -> str:
@@ -109,3 +124,59 @@ def check_for_update(
     release = _decode_release(payload)
     return release if compare_versions(release.version, current_version) > 0 else None
 
+
+def download_and_install(
+    release: ReleaseInfo,
+    *,
+    current_executable: str | os.PathLike[str] | None = None,
+    timeout: float = 60.0,
+    opener: Callable[..., Any] | None = None,
+) -> Path:
+    """Download a release exe and schedule replacement after this process exits.
+
+    Windows locks the running executable, so a short-lived command script does
+    the final move and relaunches the updated file after the GUI closes.
+    """
+    if os.name != "nt":
+        raise UpdateError("Automatic installation is currently supported on Windows only")
+    asset = release.executable_asset
+    url = str(asset.get("browser_download_url") if asset else "")
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+        raise UpdateError("Release does not contain a trusted Windows executable download")
+    target = Path(current_executable or sys.executable).resolve()
+    if target.suffix.lower() != ".exe":
+        raise UpdateError("Automatic installation is only available from the packaged exe")
+    temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
+    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
+    try:
+        with (opener or urlopen)(request, timeout=timeout) as response, temporary.open("wb") as output:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to download update: {exc}") from exc
+    if temporary.stat().st_size < 1_000_000:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError("Downloaded update is unexpectedly small")
+
+    script = Path(tempfile.gettempdir()) / f"yikou-light-food-update-{os.getpid()}.cmd"
+    script.write_text(
+        "@echo off\r\n"
+        "timeout /t 2 /nobreak >nul\r\n"
+        f'move /Y "{temporary}" "{target}" >nul\r\n'
+        f'if errorlevel 1 exit /b 1\r\nstart "" "{target}"\r\n'
+        "del \"%~f0\"\r\n",
+        encoding="ascii",
+    )
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(["cmd.exe", "/c", str(script)], creationflags=flags, close_fds=True)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        script.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to start update installer: {exc}") from exc
+    return target

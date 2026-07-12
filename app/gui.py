@@ -12,7 +12,7 @@ from .automation import BrowserNotFoundError, detect_browsers, ensure_browser, r
 from .config import AppConfig
 from .credentials import delete_password, get_password, set_password
 from . import __version__
-from .updater import ReleaseInfo, UpdateError, check_for_update
+from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
 
 class App(tk.Tk):
@@ -157,13 +157,18 @@ class App(tk.Tk):
                     release = value
                     if isinstance(release, ReleaseInfo):
                         details = release.body or "(No release notes provided.)"
-                        prompt = f"New version {release.tag_name} (current {__version__})\n\nChanges:\n{details}\n\nOpen download page?"
-                        if messagebox.askyesno("Update available", prompt) and release.html_url:
-                            webbrowser.open(release.html_url)
+                        prompt = f"New version {release.tag_name} (current {__version__})\n\nChanges:\n{details}\n\nDownload and install now?"
+                        if messagebox.askyesno("Update available", prompt):
+                            self._install_update(release)
                 elif kind == "update_latest":
                     messagebox.showinfo("Check for updates", f"You are using the latest version ({__version__}).")
                 elif kind == "update_error":
                     self._append("Update check failed: " + value)
+                elif kind == "update_installed":
+                    self._append(value)
+                    messagebox.showinfo("更新完成", "更新已下载，点击确定后程序将关闭并自动重启。")
+                    self._closing = True
+                    self.destroy()
         except queue.Empty:
             pass
         self.after(100, self._drain_events)
@@ -277,6 +282,17 @@ class App(tk.Tk):
             self.events.put(("update_error", str(exc)))
         finally:
             self._update_checking = False
+
+    def _install_update(self, release: ReleaseInfo) -> None:
+        self._append(f"正在下载版本 {release.version}...")
+        threading.Thread(target=self._install_update_worker, args=(release,), daemon=True).start()
+
+    def _install_update_worker(self, release: ReleaseInfo) -> None:
+        try:
+            download_and_install(release)
+            self.events.put(("update_installed", "更新已下载，程序将重启"))
+        except UpdateError as exc:
+            self.events.put(("update_error", str(exc)))
 
     def clear_password(self) -> None:
         phone = self.vars["phone"].get().strip()
