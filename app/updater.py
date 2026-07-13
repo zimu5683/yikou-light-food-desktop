@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import re
 import os
+import base64
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from typing import Any, Callable
 from pathlib import Path
@@ -131,6 +131,7 @@ def download_and_install(
     current_executable: str | os.PathLike[str] | None = None,
     timeout: float = 60.0,
     opener: Callable[..., Any] | None = None,
+    progress_callback: Callable[[int, int | None], None] | None = None,
 ) -> Path:
     """Download a release exe and schedule replacement after this process exits.
 
@@ -151,32 +152,57 @@ def download_and_install(
     request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
     try:
         with (opener or urlopen)(request, timeout=timeout) as response, temporary.open("wb") as output:
+            content_length = None
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                try:
+                    content_length = int(headers.get("Content-Length") or 0) or None
+                except (TypeError, ValueError):
+                    content_length = None
+            downloaded = 0
+            if progress_callback:
+                progress_callback(downloaded, content_length)
             while True:
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
                 output.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, content_length)
     except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
         temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to download update: {exc}") from exc
     if temporary.stat().st_size < 1_000_000:
         temporary.unlink(missing_ok=True)
         raise UpdateError("Downloaded update is unexpectedly small")
+    with temporary.open("rb") as downloaded_file:
+        if downloaded_file.read(2) != b"MZ":
+            temporary.unlink(missing_ok=True)
+            raise UpdateError("Downloaded file is not a valid Windows executable")
 
-    script = Path(tempfile.gettempdir()) / f"yikou-light-food-update-{os.getpid()}.cmd"
-    script.write_text(
-        "@echo off\r\n"
-        "timeout /t 2 /nobreak >nul\r\n"
-        f'move /Y "{temporary}" "{target}" >nul\r\n'
-        f'if errorlevel 1 exit /b 1\r\nstart "" "{target}"\r\n'
-        "del \"%~f0\"\r\n",
-        encoding="ascii",
+    # Use an encoded PowerShell command rather than a .cmd file.  This keeps
+    # paths containing Chinese characters intact and waits for the locked
+    # PyInstaller executable to exit before replacing it.
+    quote = lambda value: str(value).replace("'", "''")
+    powershell = (
+        "$ErrorActionPreference = 'Stop'\n"
+        f"Wait-Process -Id {os.getpid()} -Timeout 120 -ErrorAction SilentlyContinue\n"
+        f"Move-Item -LiteralPath '{quote(temporary)}' -Destination '{quote(target)}' -Force\n"
+        f"Start-Process -FilePath '{quote(target)}'\n"
     )
+    encoded_command = base64.b64encode(powershell.encode("utf-16le")).decode("ascii")
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.Popen(["cmd.exe", "/c", str(script)], creationflags=flags, close_fds=True)
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded_command],
+            creationflags=flags,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except OSError as exc:
         temporary.unlink(missing_ok=True)
-        script.unlink(missing_ok=True)
         raise UpdateError(f"Unable to start update installer: {exc}") from exc
     return target

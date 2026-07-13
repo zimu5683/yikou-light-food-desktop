@@ -1,6 +1,8 @@
 import io
+import base64
+import os
 
-from app.updater import check_for_update, compare_versions
+from app.updater import ReleaseInfo, check_for_update, compare_versions, download_and_install
 
 
 def test_compare_versions_handles_release_and_prerelease():
@@ -39,3 +41,39 @@ def test_release_executable_asset_is_selected():
         "assets": [{"name": "notes.txt"}, {"name": "yikou-light-food.exe", "browser_download_url": "https://github.com/example.exe"}],
     })
     assert release.executable_asset["name"] == "yikou-light-food.exe"
+
+
+def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypatch):
+    payload = b"MZ" + b"x" * 1_000_000
+
+    class Response(io.BytesIO):
+        headers = {"Content-Length": str(len(payload))}
+
+    release = ReleaseInfo(
+        tag_name="v1.3.2",
+        name="v1.3.2",
+        body="",
+        html_url="",
+        assets=({
+            "name": "yikou-light-food.exe",
+            "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.2/yikou-light-food.exe",
+        },),
+    )
+    target = tmp_path / "一口轻食.exe"
+    progress = []
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append((args, kwargs)))
+
+    download_and_install(
+        release,
+        current_executable=target,
+        opener=lambda _request, timeout: Response(payload),
+        progress_callback=lambda downloaded, total: progress.append((downloaded, total)),
+    )
+
+    assert progress[0] == (0, len(payload))
+    assert progress[-1] == (len(payload), len(payload))
+    encoded = launched[0][0][-1]
+    script = base64.b64decode(encoded).decode("utf-16le")
+    assert str(target.resolve()) in script
+    target.with_name(f".{target.stem}.update-{os.getpid()}.tmp").unlink()

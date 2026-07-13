@@ -21,7 +21,7 @@ class App(tk.Tk):
         self.title("一口轻食 - 订单处理")
         self.geometry("980x700")
         self.minsize(820, 600)
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
+        self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self._closing = False
@@ -200,8 +200,16 @@ class App(tk.Tk):
                     messagebox.showinfo("检查更新", f"当前已是最新版本（{__version__}）。")
                 elif kind == "update_error":
                     self._append("检查更新失败：" + value)
+                elif kind == "update_progress":
+                    downloaded, total = value
+                    self._set_update_progress(downloaded, total)
+                elif kind == "update_install_error":
+                    self._close_update_progress()
+                    self._append("更新失败：" + value)
+                    messagebox.showerror("更新失败", value)
                 elif kind == "update_installed":
                     self._append(value)
+                    self._set_update_progress(1, 1)
                     messagebox.showinfo("更新完成", "更新已下载，点击确定后程序将关闭并自动重启。")
                     self._closing = True
                     self.destroy()
@@ -321,14 +329,60 @@ class App(tk.Tk):
 
     def _install_update(self, release: ReleaseInfo) -> None:
         self._append(f"正在下载版本 {release.version}...")
+        self._show_update_progress(release)
         threading.Thread(target=self._install_update_worker, args=(release,), daemon=True).start()
 
     def _install_update_worker(self, release: ReleaseInfo) -> None:
         try:
-            download_and_install(release)
+            download_and_install(
+                release,
+                progress_callback=lambda downloaded, total: self.events.put(("update_progress", (downloaded, total))),
+            )
             self.events.put(("update_installed", "更新已下载，程序将重启"))
-        except UpdateError as exc:
-            self.events.put(("update_error", str(exc)))
+        except Exception as exc:
+            self.events.put(("update_install_error", str(exc)))
+
+    def _show_update_progress(self, release: ReleaseInfo) -> None:
+        existing = getattr(self, "_update_progress_window", None)
+        if existing and existing.winfo_exists():
+            existing.lift()
+            return
+        dialog = tk.Toplevel(self)
+        self._update_progress_window = dialog
+        dialog.title("正在更新")
+        dialog.geometry("480x170")
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+        content = ttk.Frame(dialog, padding=22)
+        content.pack(fill="both", expand=True)
+        ttk.Label(content, text=f"正在下载一口轻食 {release.tag_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        self._update_progress_text = tk.StringVar(value="正在连接 GitHub...")
+        ttk.Label(content, textvariable=self._update_progress_text).pack(anchor="w", pady=(8, 8))
+        self._update_progressbar = ttk.Progressbar(content, maximum=100, mode="indeterminate")
+        self._update_progressbar.pack(fill="x")
+        self._update_progressbar.start(12)
+        ttk.Label(content, text="下载完成后程序会自动关闭、替换并重新启动。", foreground="#60758a").pack(anchor="w", pady=(10, 0))
+        dialog.grab_set()
+
+    def _set_update_progress(self, downloaded: int, total: int | None) -> None:
+        dialog = getattr(self, "_update_progress_window", None)
+        if not dialog or not dialog.winfo_exists():
+            return
+        downloaded_mb = downloaded / (1024 * 1024)
+        if total:
+            self._update_progressbar.stop()
+            self._update_progressbar.configure(mode="determinate", value=min(downloaded * 100 / total, 100))
+            self._update_progress_text.set(f"已下载 {downloaded_mb:.1f} MB / {total / (1024 * 1024):.1f} MB（{min(downloaded * 100 / total, 100):.0f}%）")
+        else:
+            self._update_progress_text.set(f"已下载 {downloaded_mb:.1f} MB")
+
+    def _close_update_progress(self) -> None:
+        dialog = getattr(self, "_update_progress_window", None)
+        if dialog and dialog.winfo_exists():
+            self._update_progressbar.stop()
+            dialog.grab_release()
+            dialog.destroy()
 
     def clear_password(self) -> None:
         phone = self.vars["phone"].get().strip()
