@@ -21,11 +21,12 @@ def test_detect_browsers_finds_macos_app_paths(monkeypatch, tmp_path):
 
 
 def test_detect_browsers_finds_playwright_chromium(monkeypatch):
+    expected = str(automation.Path("C:/tmp/chromium"))
     monkeypatch.setattr(automation.shutil, "which", lambda _: None)
     monkeypatch.setattr(automation, "_playwright_chromium_path", lambda: automation.Path("C:/tmp/chromium"))
-    monkeypatch.setattr(automation.Path, "is_file", lambda self: str(self) == "C:\\tmp\\chromium")
+    monkeypatch.setattr(automation.Path, "is_file", lambda self: str(self) == expected)
     result = automation.detect_browsers()
-    assert result["chromium"] == "C:\\tmp\\chromium"
+    assert result["chromium"] == expected
 
 
 def test_ensure_browser_installs_chromium_when_missing(monkeypatch):

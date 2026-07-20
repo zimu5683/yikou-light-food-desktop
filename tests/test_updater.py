@@ -46,6 +46,7 @@ def test_release_executable_asset_is_selected():
     assert release.executable_asset["name"] == "yikou-light-food.exe"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")
 def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypatch):
     payload = b"MZ" + b"x" * 1_000_000
     checksum = hashlib.sha256(payload).hexdigest().encode("ascii") + b"  yikou-light-food.exe\n"
