@@ -5,6 +5,9 @@ on:
   push:
     tags: ["v*.*.*"]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-latest
@@ -21,8 +24,20 @@ jobs:
       - name: Build app
         run: bash scripts/build_macos.sh
       - name: Archive app
-        run: ditto -c -k --sequesterRsrc --keepParent "dist/yikou-light-food.app" "yikou-light-food-macos.zip"
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/yikou-light-food.app" "yikou-light-food-macos.zip"
+          shasum -a 256 "yikou-light-food-macos.zip" > "yikou-light-food-macos.zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: yikou-light-food-macos
-          path: yikou-light-food-macos.zip
+          path: |
+            yikou-light-food-macos.zip
+            yikou-light-food-macos.zip.sha256
+      - name: Publish macOS app to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            yikou-light-food-macos.zip
+            yikou-light-food-macos.zip.sha256
+          fail_on_unmatched_files: true

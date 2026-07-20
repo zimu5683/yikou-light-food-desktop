@@ -24,11 +24,15 @@ python run.py
 
 ## macOS 构建
 
+普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-macos.zip`。解压后将 `yikou-light-food.app` 拖入“应用程序”目录即可运行。当前下载包适用于 Apple 芯片（M1/M2/M3/M4 等）Mac；首次打开若被 macOS 拦截，请右键应用选择“打开”，或前往“系统设置 → 隐私与安全性”允许运行。
+
+开发者也可以在 macOS 上从源码构建：
+
 ```bash
 ./scripts/build_macos.sh
 ```
 
-GitHub Actions 的 macOS runner 也会自动构建 `.app`。首次启动可能需要在“系统设置 → 隐私与安全性”允许应用运行。
+推送版本标签后，GitHub Actions 会构建 `.app`，打包为 `yikou-light-food-macos.zip`，并自动附加到对应的 GitHub Release 下载页面。
 
 ## 数据与安全
 
@@ -45,4 +49,4 @@ git tag v1.1.0
 git push origin main --tags
 ```
 
-推送 `vX.Y.Z` 标签会触发 Windows 工作流构建并发布 `yikou-light-food.exe` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；打包版发现新版本后可校验、下载并自动安装，源码运行模式只提示用户前往 Release 页面下载，避免误覆盖 Python 解释器。
+推送 `vX.Y.Z` 标签会触发 Windows 和 macOS 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版 ZIP，源码运行模式也只提示前往 Release 页面。
