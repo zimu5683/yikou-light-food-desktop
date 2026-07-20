@@ -1,11 +1,11 @@
 import io
-import base64
 import hashlib
 import os
+from pathlib import Path
 
 import pytest
 
-from app.updater import ReleaseInfo, UpdateError, check_for_update, compare_versions, download_and_install
+from app.updater import ReleaseInfo, UpdateError, apply_pending_update, check_for_update, compare_versions, download_and_install
 
 
 def test_compare_versions_handles_release_and_prerelease():
@@ -84,10 +84,28 @@ def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypa
 
     assert progress[0] == (0, len(payload))
     assert progress[-1] == (len(payload), len(payload))
-    encoded = launched[0][0][-1]
-    script = base64.b64decode(encoded).decode("utf-16le")
-    assert str(target.resolve()) in script
+    helper_args = launched[0][0]
+    assert helper_args[1] == "--apply-update"
+    assert helper_args[3] == str(target.resolve())
+    helper = Path(helper_args[0])
+    assert helper.is_file()
+    helper.unlink()
     target.with_name(f".{target.stem}.update-{os.getpid()}.tmp").unlink()
+
+
+def test_pending_update_atomically_replaces_and_restarts(tmp_path, monkeypatch):
+    source = tmp_path / "download.tmp"
+    target = tmp_path / "一口轻食.exe"
+    source.write_bytes(b"new executable")
+    target.write_bytes(b"old executable")
+    launched = []
+    monkeypatch.setattr("app.updater._schedule_helper_cleanup", lambda _helper: None)
+
+    apply_pending_update(source, target, launcher=lambda args, **kwargs: launched.append((args, kwargs)))
+
+    assert target.read_bytes() == b"new executable"
+    assert not source.exists()
+    assert launched[0][0] == [str(target.resolve())]
 
 
 def test_source_mode_cannot_replace_python_executable(monkeypatch):

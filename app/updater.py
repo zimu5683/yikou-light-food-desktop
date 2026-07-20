@@ -9,10 +9,12 @@ from __future__ import annotations
 import json
 import re
 import os
-import base64
 import hashlib
+import shutil
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 from pathlib import Path
@@ -214,22 +216,17 @@ def download_and_install(
         temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
 
-    # Use an encoded PowerShell command rather than a .cmd file.  This keeps
-    # paths containing Chinese characters intact and waits for the locked
-    # PyInstaller executable to exit before replacing it.
-    def quote(value: Any) -> str:
-        return str(value).replace("'", "''")
-    powershell = (
-        "$ErrorActionPreference = 'Stop'\n"
-        f"Wait-Process -Id {os.getpid()} -Timeout 120 -ErrorAction SilentlyContinue\n"
-        f"Move-Item -LiteralPath '{quote(temporary)}' -Destination '{quote(target)}' -Force\n"
-        f"Start-Process -FilePath '{quote(target)}'\n"
-    )
-    encoded_command = base64.b64encode(powershell.encode("utf-16le")).decode("ascii")
+    # A running executable cannot replace itself on Windows.  Launch a copy
+    # of the freshly downloaded version from the user's temporary directory;
+    # that copy waits for this process to exit, atomically replaces the old
+    # executable, and starts the installed copy.  This avoids PowerShell and
+    # works with Chinese paths.
+    helper = Path(tempfile.gettempdir()) / f"yikou-light-food-updater-{os.getpid()}.exe"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
+        shutil.copy2(temporary, helper)
         subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", encoded_command],
+            [str(helper), "--apply-update", str(temporary), str(target)],
             creationflags=flags,
             close_fds=True,
             stdin=subprocess.DEVNULL,
@@ -238,5 +235,71 @@ def download_and_install(
         )
     except OSError as exc:
         temporary.unlink(missing_ok=True)
+        helper.unlink(missing_ok=True)
         raise UpdateError(f"Unable to start update installer: {exc}") from exc
     return target
+
+
+def apply_pending_update(
+    source: str | os.PathLike[str],
+    target: str | os.PathLike[str],
+    *,
+    timeout: float = 120.0,
+    retry_interval: float = 0.5,
+    launcher: Callable[..., Any] = subprocess.Popen,
+) -> Path:
+    """Replace ``target`` with a verified downloaded exe and restart it.
+
+    This runs inside the temporary updater copy, not inside the installed
+    executable.  Retrying ``os.replace`` is both a lock check and an atomic
+    replacement once the original GUI process has fully exited.
+    """
+    source_path = Path(source).resolve()
+    target_path = Path(target).resolve()
+    if not source_path.is_file() or target_path.suffix.lower() != ".exe":
+        raise UpdateError("Pending update files are invalid")
+    deadline = time.monotonic() + timeout
+    last_error: OSError | None = None
+    while time.monotonic() < deadline:
+        try:
+            os.replace(source_path, target_path)
+            last_error = None
+            break
+        except OSError as exc:
+            last_error = exc
+            time.sleep(retry_interval)
+    if last_error is not None:
+        raise UpdateError(f"Unable to replace the running executable: {last_error}") from last_error
+    try:
+        launcher(
+            [str(target_path)],
+            cwd=str(target_path.parent),
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        raise UpdateError(f"Update installed but the application could not restart: {exc}") from exc
+    _schedule_helper_cleanup(Path(sys.executable).resolve())
+    return target_path
+
+
+def _schedule_helper_cleanup(helper: Path) -> None:
+    """Delete the temporary updater after its process has exited."""
+    if helper.name.lower().startswith("yikou-light-food-updater-"):
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        command = f'ping 127.0.0.1 -n 3 >nul & del /f /q "{helper}"'
+        try:
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", command],
+                creationflags=flags,
+                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            # The helper lives in the system temp directory; a failed cleanup
+            # does not affect the installed application or future updates.
+            pass
