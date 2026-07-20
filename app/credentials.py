@@ -56,10 +56,6 @@ def prompt_password(username: str = "") -> str:
     return getpass.getpass(f"Password{f' for {username}' if username else ''}: ")
 
 
-load_password = get_password
-save_password = set_password
-
-
 # Compatibility aliases used by the Tkinter layer.
 def load_password(username: str, service: str = SERVICE_NAME) -> Optional[str]:
     return get_password(username, service)

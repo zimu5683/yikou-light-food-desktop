@@ -25,9 +25,24 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify release tag matches application version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = python -c "from app import __version__; print(__version__)"
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match app version v$version"
+          }
+
       - name: Build executable
         shell: pwsh
         run: ./scripts/build_windows.ps1
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash "dist/yikou-light-food.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  yikou-light-food.exe" | Set-Content "dist/yikou-light-food.exe.sha256" -Encoding ascii
 
       - name: Create release notes
         shell: pwsh
@@ -46,7 +61,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: yikou-light-food-windows
-          path: dist/yikou-light-food.exe
+          path: |
+            dist/yikou-light-food.exe
+            dist/yikou-light-food.exe.sha256
           if-no-files-found: error
 
       - name: Publish GitHub Release
@@ -55,5 +72,7 @@ jobs:
         with:
           name: "${{ github.ref_name }}"
           body_path: release-notes.md
-          files: dist/yikou-light-food.exe
+          files: |
+            dist/yikou-light-food.exe
+            dist/yikou-light-food.exe.sha256
           fail_on_unmatched_files: true

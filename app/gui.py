@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import queue
+import os
+import sys
 import threading
 import tkinter as tk
 import webbrowser
-from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from .automation import BrowserNotFoundError, detect_browsers, ensure_browser, run_job
+from .automation import BrowserNotFoundError, ensure_browser, run_job
 from .config import AppConfig
 from .credentials import delete_password, get_password, set_password
 from . import __version__
@@ -118,7 +119,7 @@ class App(tk.Tk):
         config = AppConfig.load()
         self.vars["url"].set(config.target_url)
         self.vars["phone"].set(config.phone_number)
-        self.vars["excel"].set(config.excel_path)
+        self.vars["excel"].set(str(config.excel_path) if config.excel_path else "")
         self.password.set(get_password(config.phone_number) or "")
 
     def _choose_excel(self) -> None:
@@ -193,9 +194,14 @@ class App(tk.Tk):
                     release = value
                     if isinstance(release, ReleaseInfo):
                         details = release.body or "（暂无更新说明）"
-                        prompt = f"发现新版本 {release.tag_name}（当前版本 {__version__}）\n\n更新内容：\n{details}\n\n是否立即下载并安装？"
+                        can_auto_install = os.name == "nt" and getattr(sys, "frozen", False)
+                        action = "是否立即下载并安装？" if can_auto_install else "是否打开 GitHub Release 下载页面？"
+                        prompt = f"发现新版本 {release.tag_name}（当前版本 {__version__}）\n\n更新内容：\n{details}\n\n{action}"
                         if messagebox.askyesno("发现新版本", prompt):
-                            self._install_update(release)
+                            if can_auto_install:
+                                self._install_update(release)
+                            elif release.html_url:
+                                webbrowser.open(release.html_url)
                 elif kind == "update_latest":
                     messagebox.showinfo("检查更新", f"当前已是最新版本（{__version__}）。")
                 elif kind == "update_error":
@@ -241,8 +247,10 @@ class App(tk.Tk):
         try:
             config = self._config()
             count = int(self.order_count.get())
-            if not config.excel_path.exists():
+            if not config.excel_path or not config.excel_path.is_file():
                 raise ValueError("Excel 文件不存在，请重新选择")
+            if config.excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+                raise ValueError("请选择 .xlsx 或 .xlsm Excel 文件")
             if not config.url or not config.phone or not self.password.get():
                 raise ValueError("请填写网址、账号和密码")
         except ValueError as exc:

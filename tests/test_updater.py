@@ -1,8 +1,11 @@
 import io
 import base64
+import hashlib
 import os
 
-from app.updater import ReleaseInfo, check_for_update, compare_versions, download_and_install
+import pytest
+
+from app.updater import ReleaseInfo, UpdateError, check_for_update, compare_versions, download_and_install
 
 
 def test_compare_versions_handles_release_and_prerelease():
@@ -43,8 +46,10 @@ def test_release_executable_asset_is_selected():
     assert release.executable_asset["name"] == "yikou-light-food.exe"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")
 def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypatch):
     payload = b"MZ" + b"x" * 1_000_000
+    checksum = hashlib.sha256(payload).hexdigest().encode("ascii") + b"  yikou-light-food.exe\n"
 
     class Response(io.BytesIO):
         headers = {"Content-Length": str(len(payload))}
@@ -54,10 +59,16 @@ def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypa
         name="v1.3.2",
         body="",
         html_url="",
-        assets=({
-            "name": "yikou-light-food.exe",
-            "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.2/yikou-light-food.exe",
-        },),
+        assets=(
+            {
+                "name": "yikou-light-food.exe",
+                "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.2/yikou-light-food.exe",
+            },
+            {
+                "name": "yikou-light-food.exe.sha256",
+                "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.2/yikou-light-food.exe.sha256",
+            },
+        ),
     )
     target = tmp_path / "一口轻食.exe"
     progress = []
@@ -67,7 +78,7 @@ def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypa
     download_and_install(
         release,
         current_executable=target,
-        opener=lambda _request, timeout: Response(payload),
+        opener=lambda request, timeout: Response(checksum if request.full_url.endswith(".sha256") else payload),
         progress_callback=lambda downloaded, total: progress.append((downloaded, total)),
     )
 
@@ -77,3 +88,19 @@ def test_download_reports_progress_and_supports_unicode_paths(tmp_path, monkeypa
     script = base64.b64decode(encoded).decode("utf-16le")
     assert str(target.resolve()) in script
     target.with_name(f".{target.stem}.update-{os.getpid()}.tmp").unlink()
+
+
+def test_source_mode_cannot_replace_python_executable(monkeypatch):
+    release = ReleaseInfo("v1.4.0", "v1.4.0", "", "", ())
+    monkeypatch.setattr("app.updater.os.name", "nt")
+    monkeypatch.delattr("app.updater.sys.frozen", raising=False)
+    with pytest.raises(UpdateError, match="源码运行模式"):
+        download_and_install(release)
+
+
+def test_only_canonical_executable_asset_is_selected():
+    release = ReleaseInfo(
+        "v1.4.0", "v1.4.0", "", "",
+        ({"name": "helper.exe", "browser_download_url": "https://github.com/helper.exe"},),
+    )
+    assert release.executable_asset is None
