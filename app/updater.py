@@ -10,6 +10,7 @@ import json
 import re
 import os
 import base64
+import hashlib
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -46,7 +47,14 @@ class ReleaseInfo:
         """Return the Windows executable asset attached to this release."""
         for asset in self.assets:
             name = str(asset.get("name") or "").lower()
-            if name == "yikou-light-food.exe" or name.endswith(".exe"):
+            if name == "yikou-light-food.exe":
+                return asset
+        return None
+
+    @property
+    def checksum_asset(self) -> dict[str, Any] | None:
+        for asset in self.assets:
+            if str(asset.get("name") or "").lower() == "yikou-light-food.exe.sha256":
                 return asset
         return None
 
@@ -140,6 +148,10 @@ def download_and_install(
     """
     if os.name != "nt":
         raise UpdateError("Automatic installation is currently supported on Windows only")
+    if current_executable is None and not getattr(sys, "frozen", False):
+        # In source mode sys.executable is python.exe.  Replacing it would
+        # corrupt the user's Python installation.
+        raise UpdateError("源码运行模式不支持自动安装，请前往 GitHub Release 页面下载")
     asset = release.executable_asset
     url = str(asset.get("browser_download_url") if asset else "")
     parsed = urlparse(url)
@@ -180,11 +192,33 @@ def download_and_install(
         if downloaded_file.read(2) != b"MZ":
             temporary.unlink(missing_ok=True)
             raise UpdateError("Downloaded file is not a valid Windows executable")
+    checksum_asset = release.checksum_asset
+    checksum_url = str(checksum_asset.get("browser_download_url") if checksum_asset else "")
+    checksum_parsed = urlparse(checksum_url)
+    if checksum_parsed.scheme != "https" or checksum_parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+    try:
+        checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+        with (opener or urlopen)(checksum_request, timeout=timeout) as response:
+            expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError("invalid SHA-256")
+        actual_hash = hashlib.sha256(temporary.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise UpdateError("Downloaded update failed SHA-256 verification")
+    except UpdateError:
+        temporary.unlink(missing_ok=True)
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
 
     # Use an encoded PowerShell command rather than a .cmd file.  This keeps
     # paths containing Chinese characters intact and waits for the locked
     # PyInstaller executable to exit before replacing it.
-    quote = lambda value: str(value).replace("'", "''")
+    def quote(value: Any) -> str:
+        return str(value).replace("'", "''")
     powershell = (
         "$ErrorActionPreference = 'Stop'\n"
         f"Wait-Process -Id {os.getpid()} -Timeout 120 -ErrorAction SilentlyContinue\n"

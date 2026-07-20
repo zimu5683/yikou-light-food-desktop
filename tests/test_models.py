@@ -1,4 +1,5 @@
 from app.models import MealInfo, OrderInfo
+from app.config import AppConfig
 
 
 def test_meal_info_to_dict_is_serialisable():
@@ -49,3 +50,22 @@ def test_order_log_contains_order_details():
         lunch=[MealInfo(total_meals=6, grade="经济", count=2, meal_type="午餐")],
     )
     assert "午餐经济6餐 x2" in _format_order_meals(order)
+
+
+def test_new_config_has_no_implicit_current_directory_workbook():
+    assert AppConfig().excel_path is None
+
+
+def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
+    from app.automation import _load_order_workbook
+
+    calls = []
+    workbook = object()
+
+    def loader(path, **kwargs):
+        calls.append((path, kwargs))
+        return workbook
+
+    path = tmp_path / "orders.xlsm"
+    assert _load_order_workbook(path, loader) is workbook
+    assert calls == [(path, {"keep_vba": True})]

@@ -18,19 +18,26 @@ from typing import Any, Callable, Iterable
 
 try:
     from .models import MealInfo, OrderInfo
+    from .processing import (
+        get_address_base_sheet_name,
+        get_donghu_address_segment,
+        get_yijin_address_from_product_note,
+        parse_receiver_info,
+    )
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     from models import MealInfo, OrderInfo
+    from processing import (
+        get_address_base_sheet_name,
+        get_donghu_address_segment,
+        get_yijin_address_from_product_note,
+        parse_receiver_info,
+    )
 
-REG_RECEIVER_BRACKET = re.compile(r"^\s*(.+?)\s*[（(](\d+)[）)]\s*$")
-REG_NUMBERS = re.compile(r"\d+")
-REG_DAXI = re.compile(r"大西.*?([a-zA-Z]+\d+|\d+[a-zA-Z]+)", re.I)
-REG_XIAOXI = re.compile(r"小西.*?([a-zA-Z]+\d+|\d+[a-zA-Z]+)", re.I)
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
 MAX_PAGE_SEARCH = 20
 SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-ADDRESS_SHEET_MAP = {"联建": "衣锦", "衣锦": "衣锦", "医学院": "医学院", "东湖": "东湖", "农林": "东湖"}
 
 
 class BrowserNotFoundError(RuntimeError):
@@ -86,30 +93,6 @@ def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
         callback(message)
 
 
-def parse_receiver_info(text: str | None) -> tuple[str, str]:
-    if not text:
-        return "", ""
-    match = REG_RECEIVER_BRACKET.match(text)
-    if match:
-        return match.group(1).strip(), match.group(2).strip()
-    return REG_NUMBERS.sub("", text).strip(), "".join(REG_NUMBERS.findall(text))
-
-
-def get_address_base_sheet_name(address: str) -> str | None:
-    for keyword, sheet in ADDRESS_SHEET_MAP.items():
-        if keyword in (address or ""):
-            return sheet
-    return None
-
-
-def get_donghu_address_segment(address: str) -> str:
-    address = address or ""
-    match = REG_DAXI.search(address) or REG_XIAOXI.search(address)
-    if match:
-        return match.group(1)
-    return "大西" if "大西" in address else "小西" if "小西" in address else address
-
-
 def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
     result: list[MealInfo] = []
     for row in rows:
@@ -155,10 +138,6 @@ def extract_product_note_text(page: Any) -> str:
     return " ".join(lines)
 
 
-def get_yijin_address_from_product_note(note: str) -> str:
-    return "外卖柜" if "联建门口外卖柜" in (note or "") else "校门口"
-
-
 def ensure_browser(mode: str = "auto", allow_install: bool = True) -> str:
     """Return a usable browser, installing Playwright Chromium when needed."""
     mode = (mode or "auto").lower()
@@ -191,10 +170,24 @@ def ensure_browser(mode: str = "auto", allow_install: bool = True) -> str:
 
 
 def _install_chromium() -> None:
-    if getattr(sys, "frozen", False):
-        raise BrowserNotFoundError()
-    command = [sys.executable, "-m", "playwright", "install", "chromium"]
-    subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    """Install Chromium using Playwright's bundled Node driver.
+
+    Calling ``sys.executable -m playwright`` does not work from a PyInstaller
+    executable because ``sys.executable`` points back to the application.  The
+    driver and CLI are included by the PyInstaller Playwright hook, so invoking
+    them directly works in both source and packaged builds.
+    """
+    from playwright._impl._driver import compute_driver_executable, get_driver_env
+
+    driver, cli = compute_driver_executable()
+    subprocess.run(
+        [driver, cli, "install", "chromium"],
+        check=True,
+        env=get_driver_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 
 def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
@@ -238,27 +231,39 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> N
         target.cell(row2, idx).value = value
 
 
+def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = None) -> Any:
+    if loader is None:
+        from openpyxl import load_workbook
+        loader = load_workbook
+    return loader(excel_path, keep_vba=excel_path.suffix.lower() == ".xlsm")
+
+
 def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
             order_decision_callback: Callable[[str, str], str] | None = None,
             save_decision_callback: Callable[[str], str] | None = None) -> dict[str, int]:
     """Process the newest W orders and append their meals to the workbook."""
-    excel_path = Path(getattr(config, "excel_path", ""))
-    if not excel_path.exists():
+    configured_excel = getattr(config, "excel_path", None)
+    if not configured_excel:
+        raise FileNotFoundError("尚未选择 Excel 文件")
+    excel_path = Path(configured_excel)
+    if not excel_path.is_file():
         raise FileNotFoundError(f"Excel 文件不存在: {excel_path}")
+    if excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise ValueError("仅支持 .xlsx 和 .xlsm Excel 文件")
     if order_count < 1:
         raise ValueError("order_count 必须大于等于 1")
     if password is None:
         password = getattr(config, "password", "")
-    from openpyxl import load_workbook
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+        from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
     backup_dir = excel_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     shutil.copy2(excel_path, backup_dir / f"{excel_path.stem}_{stamp}{excel_path.suffix}")
-    wb = load_workbook(excel_path)
+    # Preserve embedded VBA when the user explicitly selects an .xlsm file.
+    wb = _load_order_workbook(excel_path)
     processed = 0
     found = 0
     timeout = int(getattr(config, "element_timeout_ms", 8000))
@@ -273,50 +278,74 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 page.locator('input[placeholder="登录密码"]').fill(password or "")
                 page.locator("text=立即登录").click()
                 page.wait_for_url("**/workbench/store", timeout=timeout)
-                page.locator('div.detail:has-text("门店地址")').dblclick(); page.wait_for_url("**/home", timeout=timeout)
-                page.locator('div.navBarItem:has-text("订单")').click(); page.wait_for_url("**/order/**", timeout=timeout)
-                page.locator("text=外送订单").click(); page.wait_for_load_state("networkidle")
+                page.locator('div.detail:has-text("门店地址")').dblclick()
+                page.wait_for_url("**/home", timeout=timeout)
+                page.locator('div.navBarItem:has-text("订单")').click()
+                page.wait_for_url("**/order/**", timeout=timeout)
+                page.locator("text=外送订单").click()
+                page.wait_for_load_state("networkidle")
                 _wait_for_order_table(page, timeout)
                 _emit(progress_callback, "登录成功，开始搜索订单")
                 for number in range(order_count, 0, -1):
-                    if stop_event.is_set(): break
-                    code = f"W{number}"; _emit(progress_callback, f"搜索 {code}")
-                    try:
-                        cell = _find_order_cell(page, code, config, progress_callback)
-                        cell.locator("xpath=ancestor::tr").locator("text=详情").first.click()
-                        page.wait_for_timeout(300)
-                        receiver = _label(page, "收货人", timeout)
-                        name, phone = parse_receiver_info(receiver)
-                        address = _label(page, "配送地址", timeout)
-                        base = get_address_base_sheet_name(address)
-                        if base == "东湖": address = get_donghu_address_segment(address)
-                        elif base == "衣锦": address = get_yijin_address_from_product_note(extract_product_note_text(page))
-                        order = OrderInfo(code, name, phone, address, base, delivery_address=address)
-                        for typ, attr in (("午餐", "lunch"), ("晚餐", "dinner")):
-                            meals = extract_meal_info(page, typ)
-                            setattr(order, attr, meals)
-                            for meal in meals:
-                                for _ in range(max(1, meal.count)): _write_order(wb, order, meal, typ)
-                        meal_text = _format_order_meals(order)
-                        _emit(progress_callback, (
-                            f"订单详情：订单号={order.order_no}，姓名={order.name or '未填写'}，"
-                            f"电话={order.phone or '未填写'}，地址={order.address or '未填写'}，餐品={meal_text}"
-                        ))
-                        found += 1
-                        page.go_back(); page.wait_for_load_state("networkidle")
-                        _wait_for_order_table(page, timeout)
-                    except Exception as exc:
-                        decision = "skip"
-                        if order_decision_callback:
-                            decision = order_decision_callback(code, str(exc)).lower()
-                        if decision == "retry":
-                            _emit(progress_callback, f"重试 {code}")
-                            continue
-                        if decision == "stop":
-                            stop_event.set()
+                    if stop_event.is_set():
+                        break
+                    code = f"W{number}"
+                    order: OrderInfo | None = None
+                    while not stop_event.is_set():
+                        _emit(progress_callback, f"搜索 {code}")
+                        try:
+                            cell = _find_order_cell(page, code, config, progress_callback)
+                            cell.locator("xpath=ancestor::tr").locator("text=详情").first.click()
+                            page.wait_for_timeout(300)
+                            receiver = _label(page, "收货人", timeout)
+                            name, phone = parse_receiver_info(receiver)
+                            address = _label(page, "配送地址", timeout)
+                            base = get_address_base_sheet_name(address)
+                            if base == "东湖":
+                                address = get_donghu_address_segment(address)
+                            elif base == "衣锦":
+                                address = get_yijin_address_from_product_note(extract_product_note_text(page))
+                            candidate = OrderInfo(code, name, phone, address, base, delivery_address=address)
+                            for typ, attr in (("午餐", "lunch"), ("晚餐", "dinner")):
+                                setattr(candidate, attr, extract_meal_info(page, typ))
+
+                            # Do not mutate the workbook until the browser has
+                            # safely returned to the order list.  A retry can
+                            # therefore never duplicate partially written rows.
+                            page.go_back()
+                            page.wait_for_load_state("networkidle")
+                            _wait_for_order_table(page, timeout)
+                            order = candidate
                             break
-                        _emit(progress_callback, f"{code} 未找到，跳过")
+                        except Exception as exc:
+                            _recover_order_table(page, timeout)
+                            decision = "skip"
+                            if order_decision_callback:
+                                decision = order_decision_callback(code, str(exc)).lower()
+                            if decision == "retry":
+                                _emit(progress_callback, f"重试 {code}")
+                                continue
+                            if decision == "stop":
+                                stop_event.set()
+                                break
+                            _emit(progress_callback, f"{code} 未找到，跳过：{exc}")
+                            break
+
+                    if stop_event.is_set():
+                        break
                     processed += 1
+                    if order is None:
+                        continue
+                    for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
+                        for meal in meals:
+                            for _ in range(max(1, meal.count)):
+                                _write_order(wb, order, meal, typ)
+                    meal_text = _format_order_meals(order)
+                    _emit(progress_callback, (
+                        f"订单详情：订单号={order.order_no}，姓名={order.name or '未填写'}，"
+                        f"电话={order.phone or '未填写'}，地址={order.address or '未填写'}，餐品={meal_text}"
+                    ))
+                    found += 1
             finally:
                 browser.close()
         _save_workbook_with_retry(wb, excel_path, save_decision_callback)
@@ -359,24 +388,70 @@ def _wait_for_order_table(page: Any, timeout: int) -> None:
     )
 
 
+def _recover_order_table(page: Any, timeout: int) -> bool:
+    """Best-effort recovery after a detail-page or rendering failure."""
+    try:
+        _wait_for_order_table(page, min(timeout, 1200))
+        return True
+    except Exception:
+        try:
+            page.go_back()
+            page.wait_for_load_state("domcontentloaded", timeout=timeout)
+            _wait_for_order_table(page, timeout)
+            return True
+        except Exception:
+            return False
+
+
 def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None) -> Any:
-    """Retry while the table is being replaced after navigation or back."""
+    """Find an exact order number, retrying renders and traversing pages."""
     timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
     pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
     attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
-    cell = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
-        has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
-    ).first
+    max_pages = max(1, int(getattr(config, "max_page_search", MAX_PAGE_SEARCH)))
+
+    # Searches should always start from page one; after returning from details
+    # the SPA may otherwise leave the pagination on the previous order's page.
+    first_page = page.locator('.el-pagination li.number').filter(has_text=re.compile(r'^\s*1\s*$')).first
+    try:
+        if first_page.is_visible() and "active" not in (first_page.get_attribute("class") or ""):
+            first_page.click()
+            page.wait_for_timeout(pause)
+    except Exception:
+        pass
+
     last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
+    for page_number in range(1, max_pages + 1):
+        cell = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
+            has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
+        ).first
+        for attempt in range(1, attempts + 1):
+            try:
+                if cell.count() > 0:
+                    cell.wait_for(state="visible", timeout=timeout)
+                    return cell
+                raise LookupError(f"订单 {code} 不在第 {page_number} 页")
+            except Exception as exc:
+                last_error = exc
+                if attempt < attempts:
+                    _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
+                    page.wait_for_timeout(pause)
+
+        if page_number >= max_pages:
+            break
+        next_button = page.locator('.el-pagination button.btn-next, button.btn-next').first
         try:
-            cell.wait_for(state="visible", timeout=timeout)
-            return cell
+            disabled = next_button.is_disabled() or next_button.get_attribute("disabled") is not None
+            disabled = disabled or "disabled" in (next_button.get_attribute("class") or "").lower()
+            if disabled:
+                break
+            _emit(callback, f"{code} 当前页未找到，继续搜索第 {page_number + 1} 页")
+            next_button.click()
+            page.wait_for_timeout(pause)
+            _wait_for_order_table(page, timeout)
         except Exception as exc:
             last_error = exc
-            if attempt < attempts:
-                _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
-                page.wait_for_timeout(pause)
+            break
     raise last_error or TimeoutError(f"订单 {code} 未找到")
 
 

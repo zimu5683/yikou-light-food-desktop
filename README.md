@@ -20,7 +20,7 @@ python run.py
 .\scripts\build_windows.ps1
 ```
 
-生成的程序位于 `dist/一口轻食/`。首次运行点击“安装/检查浏览器”，或执行 `一口轻食.exe --install-browser`。需要联网下载 Playwright Chromium；若系统存在 Edge，运行时会优先使用 Edge。
+生成的程序位于 `dist/yikou-light-food.exe`。首次运行可点击“安装 / 检查浏览器”，或执行 `yikou-light-food.exe --install-browser`。需要联网下载 Playwright Chromium；若系统存在 Edge 或 Chrome，运行时会优先使用系统浏览器。浏览器文件安装在当前用户的 Playwright 缓存目录中，不会写入程序目录。
 
 ## macOS 构建
 
@@ -45,4 +45,4 @@ git tag v1.1.0
 git push origin main --tags
 ```
 
-推送 `vX.Y.Z` 标签会触发 Windows 工作流构建并发布 `yikou-light-food.exe`。应用启动时会在后台检查 GitHub Release；发现新版本后显示 Release 描述（更新内容），并可打开下载页面。
+推送 `vX.Y.Z` 标签会触发 Windows 工作流构建并发布 `yikou-light-food.exe` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；打包版发现新版本后可校验、下载并自动安装，源码运行模式只提示用户前往 Release 页面下载，避免误覆盖 Python 解释器。

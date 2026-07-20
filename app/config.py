@@ -26,7 +26,7 @@ def user_data_dir() -> Path:
 class AppConfig:
     target_url: str = "https://m.icall.me/admin/#/login"
     phone_number: str = ""
-    excel_path: str = ""
+    excel_path: Path | None = None
     browser_mode: str = "auto"  # auto, msedge, chromium
     headless: bool = False
     max_page_search: int = 20
@@ -49,7 +49,10 @@ class AppConfig:
         # url/phone/browser are compatibility aliases used by the GUI.
         self.target_url = url if url is not None else target_url
         self.phone_number = phone if phone is not None else phone_number
-        self.excel_path = Path(excel_path) if excel_path else Path("")
+        # ``Path("")`` resolves to the current directory and used to pass the
+        # GUI's existence check on a fresh install.  ``None`` is an unambiguous
+        # representation of "no workbook selected".
+        self.excel_path = Path(excel_path) if excel_path else None
         self.browser_mode = browser if browser is not None else browser_mode
         self.headless = headless
         self.max_page_search = max_page_search
@@ -112,14 +115,6 @@ class AppConfig:
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.config_path = str(target)
         return target
-
-
-def load_config(path: Optional[os.PathLike[str] | str] = None) -> AppConfig:
-    return AppConfig.load(path)
-
-
-def save_config(config: AppConfig, path: Optional[os.PathLike[str] | str] = None) -> Path:
-    return config.save(path)
 
 
 def load_config(path: Optional[os.PathLike[str] | str] = None) -> AppConfig:

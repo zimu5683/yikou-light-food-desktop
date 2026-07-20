@@ -6,3 +6,4 @@ keyring>=24,<26
 # Build/test dependencies (install these when developing or packaging)
 pyinstaller>=6.0,<7
 pytest>=8,<9
+ruff>=0.12,<1

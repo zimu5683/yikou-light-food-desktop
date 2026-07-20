@@ -9,7 +9,7 @@ import datetime as _dt
 import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from .models import MealInfo, OrderInfo
 
