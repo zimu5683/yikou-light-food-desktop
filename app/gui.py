@@ -12,9 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 from .automation import BrowserNotFoundError, ensure_browser, run_job
 from .config import AppConfig, clamp_split_ratio
 from .credentials import delete_password, get_password, set_password
-from .design_system import (FONT_FAMILY, FONT_MONO, PillButton, RoundedCard,
-                            ScrollableRoundedCard, StatusBadge, TOKENS, FormField, apply_tk_scaling,
-                            form_layout_mode, layout_mode)
+from .design_system import (FONT_FAMILY, FONT_MONO, PillButton, ResponsiveSplitPane,
+                            RoundedCard, ScrollableRoundedCard, StatusBadge, TOKENS, FormField,
+                            apply_tk_scaling, form_layout_mode, layout_mode)
 from . import __version__
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
@@ -38,11 +38,9 @@ class App(tk.Tk):
         self._search_var = tk.StringVar()
         self._saved_config = AppConfig.load()
         self._split_ratio = clamp_split_ratio(self._saved_config.split_ratio)
-        self._sash_dragging = False
-        self._applying_sash = False
         self._resize_job: str | None = None
         self._config_layout_job: str | None = None
-        self._config_compact = False
+        self._config_compact: bool | None = None
         self.configure(bg=TOKENS.canvas)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
@@ -84,16 +82,17 @@ class App(tk.Tk):
         self.content.rowconfigure(0, weight=1)
         self.content.columnconfigure(0, weight=1)
 
-        self.paned = tk.PanedWindow(self.content, orient=tk.HORIZONTAL, bd=0, sashwidth=8,
-                                    sashrelief="flat", bg=TOKENS.canvas, showhandle=False,
-                                    opaqueresize=True)
-        self.paned.grid(row=0, column=0, sticky="nsew")
-        self.config_card = ScrollableRoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
-        self.log_card = RoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
-        self.paned.add(self.config_card, minsize=380, stretch="always")
-        self.paned.add(self.log_card, minsize=500, stretch="always")
-        self.paned.bind("<B1-Motion>", lambda _event: setattr(self, "_sash_dragging", True), add="+")
-        self.paned.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
+        self.split_pane = ResponsiveSplitPane(
+            self.content, ratio=self._split_ratio,
+            on_ratio_committed=self._on_split_ratio_committed,
+        )
+        self.split_pane.grid(row=0, column=0, sticky="nsew")
+        self.config_card = ScrollableRoundedCard(self.split_pane.left_host,
+                                                 parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.log_card = RoundedCard(self.split_pane.right_host,
+                                    parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.config_card.pack(fill="both", expand=True)
+        self.log_card.pack(fill="both", expand=True)
         self._build_config_card()
         self._build_log_card()
         self._layout_mode = ""
@@ -202,6 +201,8 @@ class App(tk.Tk):
     def _apply_config_layout(self, width: int) -> None:
         """Reflow the left form before its controls become too narrow."""
         compact = form_layout_mode(width) == "compact"
+        if self._config_compact is not None and compact == self._config_compact:
+            return
         self._config_compact = compact
 
         self.excel_row.columnconfigure(0, weight=1)
@@ -281,8 +282,6 @@ class App(tk.Tk):
     def _on_resize(self, event: tk.Event[tk.Misc] | None = None) -> None:
         if event is not None and getattr(event, "widget", self) is not self:
             return
-        if self._applying_sash:
-            return
         if self._resize_job is not None:
             try:
                 self.after_cancel(self._resize_job)
@@ -293,50 +292,15 @@ class App(tk.Tk):
     def _reflow_window(self) -> None:
         self._resize_job = None
         mode = layout_mode(self.winfo_width())
-        if mode == self._layout_mode and mode != "split":
+        if mode == self._layout_mode:
             return
-        if mode != self._layout_mode:
-            self._layout_mode = mode
-            if mode == "split":
-                self.paned.configure(orient=tk.HORIZONTAL)
-                self.paned.paneconfigure(self.config_card, minsize=380, stretch="always")
-                self.paned.paneconfigure(self.log_card, minsize=500, stretch="always")
-            else:
-                self.paned.configure(orient=tk.VERTICAL)
-                self.paned.paneconfigure(self.config_card, minsize=260, stretch="always")
-                self.paned.paneconfigure(self.log_card, minsize=300, stretch="always")
-        if mode == "split" and not self._sash_dragging:
-            self._apply_split_ratio()
+        self._layout_mode = mode
+        self.split_pane.set_mode(mode)
+        if mode == "split":
+            self.split_pane.set_ratio(self._split_ratio)
 
-    def _apply_split_ratio(self) -> None:
-        if self._layout_mode != "split" or not self.paned.winfo_ismapped():
-            return
-        width = self.paned.winfo_width()
-        if width <= 0:
-            return
-        ratio = clamp_split_ratio(self._split_ratio)
-        left = int(width * ratio)
-        left = max(380, min(width - 500, left))
-        try:
-            self._applying_sash = True
-            self.paned.sash_place(0, left, 0)
-        except tk.TclError:
-            pass
-        finally:
-            self._applying_sash = False
-
-    def _on_sash_release(self, _event: tk.Event[tk.Misc]) -> None:
-        if self._layout_mode != "split":
-            return
-        try:
-            width = self.paned.winfo_width()
-            left, _ = self.paned.sash_coord(0)
-        except tk.TclError:
-            return
-        if width <= 0:
-            return
-        self._split_ratio = clamp_split_ratio(left / width)
-        self._sash_dragging = False
+    def _on_split_ratio_committed(self, ratio: float) -> None:
+        self._split_ratio = clamp_split_ratio(ratio)
         self._saved_config.split_ratio = self._split_ratio
         try:
             self._saved_config.save()

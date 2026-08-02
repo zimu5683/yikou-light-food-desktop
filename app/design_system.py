@@ -265,6 +265,89 @@ def _draw_scalable_surface(canvas: tk.Canvas, width: int, height: int, *,
     canvas.tag_lower("card-shape")
     return photos
 
+
+def _create_surface_parts(canvas: tk.Canvas, *, fill: str, outline: str,
+                          shadow: str, dpi_scale: float) -> tuple[dict[str, int], list[ImageTk.PhotoImage]]:
+    """Create reusable Canvas items for a scalable rounded surface."""
+    tiles = render_rounded_corner_tiles(TOKENS.radius_card, fill, outline=outline,
+                                        shadow=shadow, dpi_scale=dpi_scale)
+    photos = [ImageTk.PhotoImage(tiles[name]) for name in
+              ("top_left", "top_right", "bottom_left", "bottom_right")]
+    parts: dict[str, int] = {}
+    parts["shadow_h"] = canvas.create_rectangle(0, 0, 0, 0, fill=shadow, outline="", tags="card-shape")
+    parts["shadow_v"] = canvas.create_rectangle(0, 0, 0, 0, fill=shadow, outline="", tags="card-shape")
+    parts["fill_h"] = canvas.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="card-shape")
+    parts["fill_v"] = canvas.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="card-shape")
+    if outline:
+        parts["outline_top"] = canvas.create_line(0, 0, 0, 0, fill=outline, width=1, tags="card-shape")
+        parts["outline_left"] = canvas.create_line(0, 0, 0, 0, fill=outline, width=1, tags="card-shape")
+        parts["outline_bottom"] = canvas.create_line(0, 0, 0, 0, fill=outline, width=1, tags="card-shape")
+        parts["outline_right"] = canvas.create_line(0, 0, 0, 0, fill=outline, width=1, tags="card-shape")
+    for name, photo in zip(("top_left", "top_right", "bottom_left", "bottom_right"), photos):
+        parts[name] = canvas.create_image(0, 0, anchor="nw", image=photo, tags="card-shape")
+    canvas.tag_lower("card-shape")
+    return parts, photos
+
+
+def _update_surface_parts(canvas: tk.Canvas, parts: dict[str, int], width: int, height: int,
+                          photos: list[ImageTk.PhotoImage], dpi_scale: float) -> None:
+    """Move existing surface items instead of rebuilding them per frame."""
+    if width < 2 or height < 2 or not photos:
+        return
+    corner = photos[0].width()
+    shadow_offset = max(1, int(round(2 * dpi_scale)))
+    canvas.coords(parts["shadow_h"], corner, shadow_offset, max(corner, width - corner), height)
+    canvas.coords(parts["shadow_v"], shadow_offset, corner, width, max(corner, height - corner))
+    canvas.coords(parts["fill_h"], corner, 0, max(corner, width - corner), max(1, height - shadow_offset))
+    canvas.coords(parts["fill_v"], 0, corner, max(1, width - shadow_offset), max(corner, height - corner))
+    if "outline_top" in parts:
+        canvas.coords(parts["outline_top"], corner, 0, max(corner, width - corner), 0)
+        canvas.coords(parts["outline_left"], 0, corner, 0, max(corner, height - corner))
+        canvas.coords(parts["outline_bottom"], corner, max(1, height - 1),
+                      max(corner, width - corner), max(1, height - 1))
+        canvas.coords(parts["outline_right"], max(1, width - 1), corner,
+                      max(1, width - 1), max(corner, height - corner))
+    positions = ((0, 0), (width - corner, 0), (0, height - corner),
+                 (width - corner, height - corner))
+    for name, (x, y) in zip(("top_left", "top_right", "bottom_left", "bottom_right"), positions):
+        canvas.coords(parts[name], max(0, x), max(0, y))
+
+
+def split_ratio_for_width(ratio: float, width: int, *, divider_width: int = 8,
+                          min_left: int = 380, min_right: int = 500,
+                          min_ratio: float = 0.30, max_ratio: float = 0.55) -> float:
+    """Clamp a split ratio while preserving usable minimum pane widths."""
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        value = 0.38
+    available = max(1, int(width) - max(0, int(divider_width)))
+    lower = max(float(min_ratio), min(1.0, min_left / available))
+    upper = min(float(max_ratio), max(0.0, 1.0 - min_right / available))
+    if lower > upper:
+        # At very small sizes the stacked mode should be selected by the app,
+        # but keep this helper deterministic for callers and tests.
+        return max(float(min_ratio), min(float(max_ratio), value))
+    return max(lower, min(upper, value))
+
+
+def split_pane_sizes(width: int, ratio: float, *, divider_width: int = 8,
+                     min_left: int = 380, min_right: int = 500,
+                     min_ratio: float = 0.30, max_ratio: float = 0.55) -> tuple[int, int, int]:
+    """Return pixel widths for the left pane, divider and right pane."""
+    total = max(0, int(width))
+    divider = max(0, min(total, int(divider_width)))
+    available = max(0, total - divider)
+    effective = split_ratio_for_width(
+        ratio, total, divider_width=divider, min_left=min_left,
+        min_right=min_right, min_ratio=min_ratio, max_ratio=max_ratio,
+    )
+    left = int(round(available * effective))
+    left = max(0, min(available, left))
+    if available >= min_left + min_right:
+        left = max(min_left, min(available - min_right, left))
+    return left, divider, available - left
+
 STATUS_STYLES: dict[str, tuple[str, str]] = {
     "ready": ("就绪", TOKENS.green_light),
     "running": ("处理中", TOKENS.accent),
@@ -317,6 +400,138 @@ def _rounded_rectangle(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: f
     return ids
 
 
+class ResponsiveSplitPane(tk.Frame):
+    """A resize-friendly two-pane container without sash repositioning.
+
+    Tk's grid geometry manager owns the continuous resize.  The two pane
+    columns share a uniform group, so changing the weights updates the saved
+    ratio without a second ``sash_place`` pass during a native window
+    maximize/restore animation.
+    """
+
+    def __init__(self, master: tk.Misc, *, ratio: float = 0.38,
+                 min_ratio: float = 0.30, max_ratio: float = 0.55,
+                 divider_width: int = 8,
+                 on_ratio_committed: Callable[[float], None] | None = None,
+                 **kwargs: object) -> None:
+        super().__init__(master, bg=kwargs.pop("bg", TOKENS.canvas),
+                         highlightthickness=0, bd=0, **kwargs)
+        # The parent owns the available size.  Without disabling propagation,
+        # the split-mode minimum column requests can prevent a stacked layout
+        # from shrinking when the window is restored.
+        self.grid_propagate(False)
+        self._min_ratio = float(min_ratio)
+        self._max_ratio = float(max_ratio)
+        self._divider_width = max(4, int(divider_width))
+        self._ratio = max(self._min_ratio, min(self._max_ratio, float(ratio)))
+        self._mode = "split"
+        self._dragging = False
+        self._on_ratio_committed = on_ratio_committed
+
+        self.left_host = tk.Frame(self, bg=TOKENS.canvas, bd=0, highlightthickness=0)
+        self.right_host = tk.Frame(self, bg=TOKENS.canvas, bd=0, highlightthickness=0)
+        self.divider = tk.Frame(self, bg=TOKENS.canvas, bd=0, highlightthickness=0,
+                                width=self._divider_width, cursor="sb_h_double_arrow",
+                                takefocus=True)
+        self.left_host.grid(row=0, column=0, sticky="nsew")
+        self.divider.grid(row=0, column=1, sticky="ns")
+        self.right_host.grid(row=0, column=2, sticky="nsew")
+        self.rowconfigure(0, weight=1)
+        self._apply_split_weights()
+
+        self.divider.bind("<ButtonPress-1>", self._on_divider_press, add="+")
+        self.divider.bind("<B1-Motion>", self._on_divider_motion, add="+")
+        self.divider.bind("<ButtonRelease-1>", self._on_divider_release, add="+")
+        self.divider.bind("<Left>", lambda _event: self._nudge(-0.01), add="+")
+        self.divider.bind("<Right>", lambda _event: self._nudge(0.01), add="+")
+        self.divider.bind("<Up>", lambda _event: self._nudge(-0.01), add="+")
+        self.divider.bind("<Down>", lambda _event: self._nudge(0.01), add="+")
+
+    @property
+    def ratio(self) -> float:
+        return self._ratio
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def _apply_split_weights(self) -> None:
+        left_weight = max(1, int(round(self._ratio * 1000)))
+        right_weight = max(1, 1000 - left_weight)
+        self.columnconfigure(0, weight=left_weight, uniform="responsive-split", minsize=380)
+        self.columnconfigure(1, weight=0, minsize=self._divider_width)
+        self.columnconfigure(2, weight=right_weight, uniform="responsive-split", minsize=500)
+        self.rowconfigure(0, weight=1)
+        self.rowconfigure(1, weight=0, minsize=0)
+        self.rowconfigure(2, weight=0, minsize=0)
+        self.left_host.grid_configure(row=0, column=0, columnspan=1, sticky="nsew")
+        self.divider.grid_configure(row=0, column=1, columnspan=1, sticky="ns")
+        self.right_host.grid_configure(row=0, column=2, columnspan=1, sticky="nsew")
+        self.divider.configure(cursor="sb_h_double_arrow")
+
+    def set_mode(self, mode: str) -> None:
+        mode = "split" if mode == "split" else "stacked"
+        if mode == self._mode:
+            return
+        self._mode = mode
+        if mode == "split":
+            self._apply_split_weights()
+            return
+        for column in range(3):
+            self.columnconfigure(column, weight=0, minsize=0)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1, minsize=0)
+        self.rowconfigure(1, weight=0, minsize=self._divider_width)
+        self.rowconfigure(2, weight=1, minsize=0)
+        self.left_host.grid_configure(row=0, column=0, columnspan=3, sticky="nsew")
+        self.divider.grid_configure(row=1, column=0, columnspan=3, sticky="ew")
+        self.right_host.grid_configure(row=2, column=0, columnspan=3, sticky="nsew")
+        self.divider.configure(cursor="sb_v_double_arrow")
+
+    def set_ratio(self, ratio: float) -> float:
+        try:
+            value = float(ratio)
+        except (TypeError, ValueError):
+            value = self._ratio
+        self._ratio = max(self._min_ratio, min(self._max_ratio, value))
+        if self._mode == "split":
+            self._apply_split_weights()
+        return self._ratio
+
+    def _ratio_from_event(self, event: tk.Event[tk.Misc]) -> float:
+        width = max(1, self.winfo_width())
+        origin = event.x_root - self.winfo_rootx() - self._divider_width / 2
+        return split_ratio_for_width(
+            origin / max(1, width - self._divider_width), width,
+            divider_width=self._divider_width, min_ratio=self._min_ratio,
+            max_ratio=self._max_ratio,
+        )
+
+    def _on_divider_press(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._mode == "split":
+            self._dragging = True
+            self.divider.focus_set()
+
+    def _on_divider_motion(self, event: tk.Event[tk.Misc]) -> None:
+        if self._dragging and self._mode == "split":
+            self.set_ratio(self._ratio_from_event(event))
+
+    def _on_divider_release(self, _event: tk.Event[tk.Misc]) -> None:
+        if not self._dragging:
+            return
+        self._dragging = False
+        if self._on_ratio_committed is not None:
+            self._on_ratio_committed(self._ratio)
+
+    def _nudge(self, delta: float) -> str:
+        if self._mode != "split":
+            return "break"
+        self.set_ratio(self._ratio + delta)
+        if self._on_ratio_committed is not None:
+            self._on_ratio_committed(self._ratio)
+        return "break"
+
+
 class RoundedCard(tk.Frame):
     """A rounded white surface with two restrained shadow layers."""
 
@@ -330,6 +545,8 @@ class RoundedCard(tk.Frame):
         self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
         self.body_window = self.canvas.create_window(0, 0, anchor="nw", window=self.body)
         self._surface_photos: list[ImageTk.PhotoImage] = []
+        self._surface_parts: dict[str, int] | None = None
+        self._surface_style_key: tuple[float, str, str, str] | None = None
         self._redraw_job: str | None = None
         self._last_surface_size: tuple[int, int, float] | None = None
         self.canvas.bind("<Configure>", self._redraw)
@@ -347,10 +564,16 @@ class RoundedCard(tk.Frame):
         if size_key == self._last_surface_size:
             return
         self._last_surface_size = size_key
-        self._surface_photos = _draw_scalable_surface(
-            self.canvas, width, height, fill=TOKENS.surface,
-            outline=TOKENS.border_soft, shadow=TOKENS.shadow, dpi_scale=scale,
-        )
+        style_key = (round(scale, 2), TOKENS.surface, TOKENS.border_soft, TOKENS.shadow)
+        if self._surface_parts is None or style_key != self._surface_style_key:
+            self.canvas.delete("card-shape")
+            self._surface_parts, self._surface_photos = _create_surface_parts(
+                self.canvas, fill=TOKENS.surface, outline=TOKENS.border_soft,
+                shadow=TOKENS.shadow, dpi_scale=scale,
+            )
+            self._surface_style_key = style_key
+        _update_surface_parts(self.canvas, self._surface_parts, width, height,
+                              self._surface_photos, scale)
         self.canvas.itemconfigure(self.body_window, width=max(1, width - self._padding * 2 - 4),
                                   height=max(1, height - self._padding * 2 - 5))
         self.canvas.coords(self.body_window, self._padding, self._padding)
@@ -383,6 +606,8 @@ class ScrollableRoundedCard(tk.Frame):
         self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
         self.body_window = self.canvas.create_window(padding, padding, anchor="nw", window=self.body)
         self._surface_photos: list[ImageTk.PhotoImage] = []
+        self._surface_parts: dict[str, int] | None = None
+        self._surface_style_key: tuple[float, str, str, str] | None = None
         self._redraw_job: str | None = None
         self._last_surface_size: tuple[int, int, float] | None = None
         self._active = False
@@ -483,10 +708,16 @@ class ScrollableRoundedCard(tk.Frame):
         if size_key == self._last_surface_size:
             return
         self._last_surface_size = size_key
-        self._surface_photos = _draw_scalable_surface(
-            self.canvas, width, height, fill=TOKENS.surface,
-            outline=TOKENS.border_soft, shadow=TOKENS.shadow, dpi_scale=scale,
-        )
+        style_key = (round(scale, 2), TOKENS.surface, TOKENS.border_soft, TOKENS.shadow)
+        if self._surface_parts is None or style_key != self._surface_style_key:
+            self.canvas.delete("card-shape")
+            self._surface_parts, self._surface_photos = _create_surface_parts(
+                self.canvas, fill=TOKENS.surface, outline=TOKENS.border_soft,
+                shadow=TOKENS.shadow, dpi_scale=scale,
+            )
+            self._surface_style_key = style_key
+        _update_surface_parts(self.canvas, self._surface_parts, width, height,
+                              self._surface_photos, scale)
         self._set_scrollregion()
 
     def destroy(self) -> None:
@@ -523,9 +754,12 @@ class PillButton(tk.Canvas):
         self._requested_height = 40
         super().__init__(master, width=button_width, height=40, highlightthickness=0, bd=0,
                          bg=kwargs.pop("bg", TOKENS.surface), takefocus=True, **kwargs)
-        self._photo: ImageTk.PhotoImage | None = None
+        self._corner_photos: list[ImageTk.PhotoImage] = []
+        self._surface_parts: dict[str, int] | None = None
+        self._surface_key: tuple[int, str, str, float] | None = None
         self._draw_job: str | None = None
         self._last_draw_size: tuple[int, int, str, bool] | None = None
+        self._surface_item_ids: tuple[int, ...] | None = None
         self._draw_now()
         self.bind("<Configure>", self._on_configure, add="+")
         self.bind("<Enter>", self._on_enter)
@@ -568,20 +802,51 @@ class PillButton(tk.Canvas):
     def _draw_now(self) -> None:
         self._draw_job = None
         width, height = self._current_size()
-        self.delete("all")
         fill, foreground, outline = self._colors()
         draw_key = (width, height, self._button_state, self._pressed)
         self._last_draw_size = draw_key
         inset = 2 if self._pressed else 0
-        image = render_rounded_image(max(1, width - inset * 2), max(1, height - inset * 2),
-                                     height // 2, fill, outline=outline,
-                                     dpi_scale=_tk_dpi_scale(self))
-        self._photo = ImageTk.PhotoImage(image)
-        self.create_image(inset, inset, anchor="nw", image=self._photo, tags="surface")
-        self.create_text(width / 2, height / 2, text=self._label, fill=foreground,
-                         font=self._font, tags="label")
+        scale = _tk_dpi_scale(self)
+        surface_key = (max(12, height - inset * 2), fill, outline, round(scale, 2))
+        if self._surface_parts is None or surface_key != self._surface_key:
+            self.delete("all")
+            tiles = render_rounded_corner_tiles(max(2, surface_key[0] // 2), fill,
+                                                outline=outline, dpi_scale=scale)
+            self._corner_photos = [ImageTk.PhotoImage(tiles[name]) for name in
+                                   ("top_left", "top_right", "bottom_left", "bottom_right")]
+            parts: dict[str, int] = {}
+            parts["fill_h"] = self.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="surface")
+            parts["fill_v"] = self.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="surface")
+            for name, photo in zip(("top_left", "top_right", "bottom_left", "bottom_right"), self._corner_photos):
+                parts[name] = self.create_image(0, 0, anchor="nw", image=photo, tags="surface")
+            parts["label"] = self.create_text(0, 0, text=self._label, fill=foreground,
+                                               font=self._font, tags="label")
+            parts["focus"] = self.create_line(0, 0, 0, 0, fill=TOKENS.primary, width=2, tags="focus")
+            self._surface_parts = parts
+            self._surface_key = surface_key
+
+        parts = self._surface_parts
+        corner = self._corner_photos[0].width() if self._corner_photos else 0
+        inner_width = max(1, width - inset * 2)
+        inner_height = max(1, height - inset * 2)
+        x0, y0 = inset, inset
+        x1, y1 = inset + inner_width, inset + inner_height
+        self.coords(parts["fill_h"], x0 + corner, y0, max(x0 + corner, x1 - corner), y1)
+        self.coords(parts["fill_v"], x0, y0 + corner, x1, max(y0 + corner, y1 - corner))
+        positions = (("top_left", x0, y0), ("top_right", x1 - corner, y0),
+                     ("bottom_left", x0, y1 - corner), ("bottom_right", x1 - corner, y1 - corner))
+        for name, x, y in positions:
+            self.coords(parts[name], max(0, x), max(0, y))
+        self.itemconfigure(parts["fill_h"], fill=fill)
+        self.itemconfigure(parts["fill_v"], fill=fill)
+        self.coords(parts["label"], width / 2, height / 2)
+        self.itemconfigure(parts["label"], fill=foreground)
         if self.focus_get() is self and self._button_state != "disabled":
-            self.create_line(16, height - 5, width - 16, height - 5, fill=TOKENS.primary, width=2)
+            self.coords(parts["focus"], 16, height - 5, max(16, width - 16), height - 5)
+            self.itemconfigure(parts["focus"], state="normal")
+        else:
+            self.itemconfigure(parts["focus"], state="hidden")
+        self.tag_lower("surface")
 
     def _invoke(self) -> None:
         if self._button_state != "disabled":

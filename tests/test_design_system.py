@@ -1,6 +1,6 @@
 from app.design_system import (IMAGE_CACHE_LIMIT, STATUS_STYLES, TOKENS, calculate_scrollregion,
                                form_layout_mode, layout_mode, render_rounded_corner_tiles,
-                               render_rounded_image)
+                               render_rounded_image, split_pane_sizes, split_ratio_for_width)
 
 
 def test_design_tokens_follow_project_design_doc():
@@ -47,3 +47,19 @@ def test_status_styles_cover_lifecycle_states():
     assert set(("ready", "running", "stopping", "success", "error", "updating")) <= set(STATUS_STYLES)
     assert STATUS_STYLES["running"][0] == "处理中"
     assert STATUS_STYLES["error"][1] == TOKENS.error_tint
+
+
+def test_split_ratio_preserves_minimum_pane_widths():
+    assert split_ratio_for_width(0.38, 1000) == 380 / (1000 - 8)
+    assert split_ratio_for_width(0.30, 900) >= 380 / (900 - 8)
+    assert split_ratio_for_width(0.55, 900) <= 1 - 500 / (900 - 8)
+
+
+def test_split_pane_sizes_are_continuous_and_sum_to_container_width():
+    left, divider, right = split_pane_sizes(1400, 0.38)
+    assert (left, divider, right) == (529, 8, 863)
+    assert left + divider + right == 1400
+    left2, divider2, right2 = split_pane_sizes(1600, 0.38)
+    assert divider2 == 8
+    assert left2 + divider2 + right2 == 1600
+    assert abs(left2 / (1600 - 8) - 0.38) < 0.001
