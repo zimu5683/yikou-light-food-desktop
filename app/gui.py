@@ -23,6 +23,10 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         apply_tk_scaling(self)
+        try:
+            self._dpi_value = float(self.winfo_fpixels("1i"))
+        except (tk.TclError, ValueError):
+            self._dpi_value = 72.0
         self.title("一口轻食 - 订单处理")
         self.geometry("1080x720")
         self.minsize(820, 620)
@@ -90,10 +94,21 @@ class App(tk.Tk):
         self._build_log_card()
         self._layout_mode = ""
         self.bind("<Configure>", self._on_resize)
+        self.bind("<Configure>", self._refresh_dpi_scaling, add="+")
         self.after_idle(self._on_resize)
         # Geometry negotiation can finish after the first idle callback on
         # high-DPI Windows; run one more pass once the window is mapped.
         self.after(80, self._on_resize)
+
+    def _refresh_dpi_scaling(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        """Re-read monitor DPI when a window is moved between displays."""
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+        except (tk.TclError, ValueError):
+            return
+        if abs(dpi - self._dpi_value) >= 1.0:
+            self._dpi_value = dpi
+            apply_tk_scaling(self)
 
     def _build_config_card(self) -> None:
         body = self.config_card.body
