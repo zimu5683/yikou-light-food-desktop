@@ -1,6 +1,7 @@
 from app.design_system import (IMAGE_CACHE_LIMIT, STATUS_STYLES, TOKENS, calculate_scrollregion,
                                form_layout_mode, layout_mode, render_rounded_corner_tiles,
-                               render_rounded_image, split_pane_sizes, split_ratio_for_width)
+                               render_pill_caps, render_rounded_image, pill_cap_geometry,
+                               split_pane_sizes, split_ratio_for_width)
 
 
 def test_design_tokens_follow_project_design_doc():
@@ -63,3 +64,22 @@ def test_split_pane_sizes_are_continuous_and_sum_to_container_width():
     assert divider2 == 8
     assert left2 + divider2 + right2 == 1600
     assert abs(left2 / (1600 - 8) - 0.38) < 0.001
+
+
+def test_pill_caps_match_button_height_without_overlapping():
+    left, right = render_pill_caps(40, TOKENS.surface, outline=TOKENS.accent, dpi_scale=1.0)
+    assert left.size == (20, 40)
+    assert right.size == (20, 40)
+    x0, y0, x1, y1, cap = pill_cap_geometry(40, 40)
+    assert (x0, y0, x1, y1, cap) == (0, 0, 40, 40, 20)
+    assert x0 + cap <= x1 - cap
+
+
+def test_pill_cache_key_is_independent_of_button_width():
+    import app.design_system as design_system
+
+    design_system.render_pill_caps(40, TOKENS.surface, outline=TOKENS.accent, dpi_scale=1.0)
+    keys = [key for key in design_system._IMAGE_CACHE if key[0] == "pill-caps"]
+    assert len(keys) == 1
+    assert 40 in keys[0]
+    assert 112 not in keys[0]

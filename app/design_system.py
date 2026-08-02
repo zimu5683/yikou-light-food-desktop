@@ -213,6 +213,58 @@ def render_rounded_corner_tiles(radius: int, fill: str, *, outline: str = "",
     }
 
 
+def render_pill_caps(height: int, fill: str, *, outline: str = "",
+                     dpi_scale: float = 1.0, scale: int = 4) -> tuple[Image.Image, Image.Image]:
+    """Render non-overlapping antialiased left and right pill end caps.
+
+    Unlike the card corner tiles, a pill has no separate top/bottom corners.
+    The cap is exactly half of the button's content height, so the center
+    rectangle can stretch to any width without ever stacking two circles.
+    """
+    height = max(4, int(height))
+    scale = max(1, int(scale))
+    dpi = max(0.75, float(dpi_scale))
+    key = ("pill-caps", height, fill, outline, scale, round(dpi, 2))
+    cached = _IMAGE_CACHE.get(key)
+    if cached is None:
+        supersampled = height * scale
+        image = Image.new("RGBA", (supersampled, supersampled), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        # Keep the geometry a true pill at every monitor scale; DPI affects
+        # cache identity and antialiasing policy, not the logical radius.
+        radius = max(1, supersampled // 2)
+        draw.rounded_rectangle(
+            (0, 0, supersampled - 1, supersampled - 1),
+            radius=radius,
+            fill=_color_rgb(fill) + (255,),
+            outline=_color_rgb(outline) + (255,) if outline else None,
+            width=max(1, scale) if outline else 1,
+        )
+        image = image.resize((height, height), Image.Resampling.LANCZOS)
+        cap_width = max(1, height // 2)
+        strip = Image.new("RGBA", (cap_width * 2, height), (0, 0, 0, 0))
+        strip.alpha_composite(image.crop((0, 0, cap_width, height)), (0, 0))
+        strip.alpha_composite(image.crop((height - cap_width, 0, height, height)),
+                              (cap_width, 0))
+        cached = strip
+        _IMAGE_CACHE[key] = strip.copy()
+        _IMAGE_CACHE.move_to_end(key)
+        while len(_IMAGE_CACHE) > IMAGE_CACHE_LIMIT:
+            _IMAGE_CACHE.popitem(last=False)
+    cap_width = cached.width // 2
+    return cached.crop((0, 0, cap_width, height)), cached.crop((cap_width, 0, cap_width * 2, height))
+
+
+def pill_cap_geometry(width: int, height: int, inset: int = 0) -> tuple[int, int, int, int, int]:
+    """Return ``x0, y0, x1, y1, cap_width`` for a pill button."""
+    width = max(40, int(width))
+    height = max(32, int(height))
+    inset = max(0, int(inset))
+    inner_height = max(4, height - inset * 2)
+    cap_width = max(1, inner_height // 2)
+    return inset, inset, width - inset, height - inset, cap_width
+
+
 def image_cache_key(width: int, height: int, radius: int, fill: str, outline: str = "") -> str:
     """Return a stable debug key for a rendered component image."""
     return hashlib.sha1(f"{width}:{height}:{radius}:{fill}:{outline}".encode()).hexdigest()
@@ -754,12 +806,11 @@ class PillButton(tk.Canvas):
         self._requested_height = 40
         super().__init__(master, width=button_width, height=40, highlightthickness=0, bd=0,
                          bg=kwargs.pop("bg", TOKENS.surface), takefocus=True, **kwargs)
-        self._corner_photos: list[ImageTk.PhotoImage] = []
+        self._cap_photos: list[ImageTk.PhotoImage] = []
         self._surface_parts: dict[str, int] | None = None
         self._surface_key: tuple[int, str, str, float] | None = None
         self._draw_job: str | None = None
         self._last_draw_size: tuple[int, int, str, bool] | None = None
-        self._surface_item_ids: tuple[int, ...] | None = None
         self._draw_now()
         self.bind("<Configure>", self._on_configure, add="+")
         self.bind("<Enter>", self._on_enter)
@@ -807,18 +858,19 @@ class PillButton(tk.Canvas):
         self._last_draw_size = draw_key
         inset = 2 if self._pressed else 0
         scale = _tk_dpi_scale(self)
-        surface_key = (max(12, height - inset * 2), fill, outline, round(scale, 2))
+        surface_height = max(4, height - inset * 2)
+        surface_key = (surface_height, fill, outline, round(scale, 2))
         if self._surface_parts is None or surface_key != self._surface_key:
             self.delete("all")
-            tiles = render_rounded_corner_tiles(max(2, surface_key[0] // 2), fill,
-                                                outline=outline, dpi_scale=scale)
-            self._corner_photos = [ImageTk.PhotoImage(tiles[name]) for name in
-                                   ("top_left", "top_right", "bottom_left", "bottom_right")]
+            left_cap, right_cap = render_pill_caps(surface_height, fill, outline=outline,
+                                                   dpi_scale=scale)
+            self._cap_photos = [ImageTk.PhotoImage(left_cap), ImageTk.PhotoImage(right_cap)]
             parts: dict[str, int] = {}
-            parts["fill_h"] = self.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="surface")
-            parts["fill_v"] = self.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="surface")
-            for name, photo in zip(("top_left", "top_right", "bottom_left", "bottom_right"), self._corner_photos):
-                parts[name] = self.create_image(0, 0, anchor="nw", image=photo, tags="surface")
+            parts["fill"] = self.create_rectangle(0, 0, 0, 0, fill=fill, outline="", tags="surface")
+            parts["top"] = self.create_line(0, 0, 0, 0, fill=outline, width=1, tags="surface")
+            parts["bottom"] = self.create_line(0, 0, 0, 0, fill=outline, width=1, tags="surface")
+            parts["left"] = self.create_image(0, 0, anchor="nw", image=self._cap_photos[0], tags="surface")
+            parts["right"] = self.create_image(0, 0, anchor="nw", image=self._cap_photos[1], tags="surface")
             parts["label"] = self.create_text(0, 0, text=self._label, fill=foreground,
                                                font=self._font, tags="label")
             parts["focus"] = self.create_line(0, 0, 0, 0, fill=TOKENS.primary, width=2, tags="focus")
@@ -826,19 +878,16 @@ class PillButton(tk.Canvas):
             self._surface_key = surface_key
 
         parts = self._surface_parts
-        corner = self._corner_photos[0].width() if self._corner_photos else 0
-        inner_width = max(1, width - inset * 2)
-        inner_height = max(1, height - inset * 2)
-        x0, y0 = inset, inset
-        x1, y1 = inset + inner_width, inset + inner_height
-        self.coords(parts["fill_h"], x0 + corner, y0, max(x0 + corner, x1 - corner), y1)
-        self.coords(parts["fill_v"], x0, y0 + corner, x1, max(y0 + corner, y1 - corner))
-        positions = (("top_left", x0, y0), ("top_right", x1 - corner, y0),
-                     ("bottom_left", x0, y1 - corner), ("bottom_right", x1 - corner, y1 - corner))
-        for name, x, y in positions:
-            self.coords(parts[name], max(0, x), max(0, y))
-        self.itemconfigure(parts["fill_h"], fill=fill)
-        self.itemconfigure(parts["fill_v"], fill=fill)
+        x0, y0, x1, y1, cap_width = pill_cap_geometry(width, height, inset)
+        self.coords(parts["fill"], x0 + cap_width, y0, max(x0 + cap_width, x1 - cap_width), y1)
+        self.coords(parts["top"], x0 + cap_width, y0, max(x0 + cap_width, x1 - cap_width), y0)
+        self.coords(parts["bottom"], x0 + cap_width, max(y0, y1 - 1),
+                    max(x0 + cap_width, x1 - cap_width), max(y0, y1 - 1))
+        self.coords(parts["left"], x0, y0)
+        self.coords(parts["right"], x1 - cap_width, y0)
+        self.itemconfigure(parts["fill"], fill=fill)
+        self.itemconfigure(parts["top"], fill=outline)
+        self.itemconfigure(parts["bottom"], fill=outline)
         self.coords(parts["label"], width / 2, height / 2)
         self.itemconfigure(parts["label"], fill=foreground)
         if self.focus_get() is self and self._button_state != "disabled":
