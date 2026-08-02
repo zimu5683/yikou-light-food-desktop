@@ -36,6 +36,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,
+    manifest=str(project / "windows-app.manifest"),
 )
 
 if sys.platform == "darwin":

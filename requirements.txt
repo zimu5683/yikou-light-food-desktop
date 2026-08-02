@@ -2,6 +2,7 @@
 playwright>=1.40,<2
 openpyxl>=3.1,<4
 keyring>=24,<26
+Pillow>=10,<13
 
 # Build/test dependencies (install these when developing or packaging)
 pyinstaller>=6.0,<7

@@ -10,10 +10,11 @@ import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
 from .automation import BrowserNotFoundError, ensure_browser, run_job
-from .config import AppConfig
+from .config import AppConfig, clamp_split_ratio
 from .credentials import delete_password, get_password, set_password
-from .design_system import (FONT_FAMILY, FONT_MONO, FONT_FALLBACK, PillButton, RoundedCard, StatusBadge,
-                            TOKENS, FormField, layout_mode)
+from .design_system import (FONT_FAMILY, FONT_MONO, PillButton, RoundedCard,
+                            ScrollableRoundedCard, StatusBadge, TOKENS, FormField, apply_tk_scaling,
+                            layout_mode)
 from . import __version__
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
@@ -21,6 +22,7 @@ from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_in
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
+        apply_tk_scaling(self)
         self.title("一口轻食 - 订单处理")
         self.geometry("1080x720")
         self.minsize(820, 620)
@@ -30,6 +32,9 @@ class App(tk.Tk):
         self._closing = False
         self._log_lines: list[str] = []
         self._search_var = tk.StringVar()
+        self._saved_config = AppConfig.load()
+        self._split_ratio = clamp_split_ratio(self._saved_config.split_ratio)
+        self._sash_dragging = False
         self.configure(bg=TOKENS.canvas)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
@@ -68,17 +73,27 @@ class App(tk.Tk):
 
         self.content = tk.Frame(outer, bg=TOKENS.canvas, padx=TOKENS.space_6, pady=TOKENS.space_5)
         self.content.grid(row=1, column=0, sticky="nsew")
-        self.content.columnconfigure(0, weight=1)
-        self.content.columnconfigure(1, weight=1)
         self.content.rowconfigure(0, weight=1)
+        self.content.columnconfigure(0, weight=1)
 
-        self.config_card = RoundedCard(self.content, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
-        self.log_card = RoundedCard(self.content, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.paned = tk.PanedWindow(self.content, orient=tk.HORIZONTAL, bd=0, sashwidth=8,
+                                    sashrelief="flat", bg=TOKENS.canvas, showhandle=False,
+                                    opaqueresize=True)
+        self.paned.grid(row=0, column=0, sticky="nsew")
+        self.config_card = ScrollableRoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.log_card = RoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.paned.add(self.config_card, minsize=300, stretch="always")
+        self.paned.add(self.log_card, minsize=420, stretch="always")
+        self.paned.bind("<B1-Motion>", lambda _event: setattr(self, "_sash_dragging", True), add="+")
+        self.paned.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
         self._build_config_card()
         self._build_log_card()
         self._layout_mode = ""
         self.bind("<Configure>", self._on_resize)
         self.after_idle(self._on_resize)
+        # Geometry negotiation can finish after the first idle callback on
+        # high-DPI Windows; run one more pass once the window is mapped.
+        self.after(80, self._on_resize)
 
     def _build_config_card(self) -> None:
         body = self.config_card.body
@@ -199,33 +214,63 @@ class App(tk.Tk):
     def _on_resize(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         mode = layout_mode(self.winfo_width())
         if mode == self._layout_mode:
+            if mode == "split" and not self._sash_dragging:
+                self.after_idle(self._apply_split_ratio)
             return
         self._layout_mode = mode
-        self.config_card.grid_forget()
-        self.log_card.grid_forget()
         if mode == "split":
-            self.content.columnconfigure(0, weight=5)
-            self.content.columnconfigure(1, weight=7)
-            self.content.rowconfigure(0, weight=1)
-            self.config_card.grid(row=0, column=0, sticky="nsew", padx=(0, TOKENS.space_2))
-            self.log_card.grid(row=0, column=1, sticky="nsew", padx=(TOKENS.space_2, 0))
+            self.paned.configure(orient=tk.HORIZONTAL)
+            self.paned.paneconfigure(self.config_card, minsize=300, stretch="always")
+            self.paned.paneconfigure(self.log_card, minsize=420, stretch="always")
+            self.after_idle(self._apply_split_ratio)
         else:
-            self.content.columnconfigure(0, weight=1)
-            self.content.columnconfigure(1, weight=0)
-            self.content.rowconfigure(0, weight=0)
-            self.content.rowconfigure(1, weight=1)
-            self.config_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, TOKENS.space_3))
-            self.log_card.grid(row=1, column=0, columnspan=2, sticky="nsew")
+            self.paned.configure(orient=tk.VERTICAL)
+            self.paned.paneconfigure(self.config_card, minsize=260, stretch="always")
+            self.paned.paneconfigure(self.log_card, minsize=300, stretch="always")
+
+    def _apply_split_ratio(self) -> None:
+        if self._layout_mode != "split" or not self.paned.winfo_ismapped():
+            return
+        width = self.paned.winfo_width()
+        if width <= 0:
+            return
+        ratio = clamp_split_ratio(self._split_ratio)
+        left = int(width * ratio)
+        left = max(300, min(width - 420, left))
+        try:
+            self.paned.sash_place(0, left, 0)
+        except tk.TclError:
+            pass
+
+    def _on_sash_release(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._layout_mode != "split":
+            return
+        try:
+            width = self.paned.winfo_width()
+            left, _ = self.paned.sash_coord(0)
+        except tk.TclError:
+            return
+        if width <= 0:
+            return
+        self._split_ratio = clamp_split_ratio(left / width)
+        self._sash_dragging = False
+        self._saved_config.split_ratio = self._split_ratio
+        try:
+            self._saved_config.save()
+        except OSError:
+            # A read-only profile must not make dragging fail.
+            pass
 
     def _set_status(self, state: str) -> None:
         self.status_badge.set(state)
 
     def _load_saved_values(self) -> None:
-        config = AppConfig.load()
+        config = self._saved_config
         self.vars["url"].set(config.target_url)
         self.vars["phone"].set(config.phone_number)
         self.vars["excel"].set(str(config.excel_path) if config.excel_path else "")
         self.password.set(get_password(config.phone_number) or "")
+        self._split_ratio = clamp_split_ratio(config.split_ratio)
         if config.excel_path and config.excel_path.is_file():
             self.form_fields["excel"].set_state("valid")
 
@@ -371,13 +416,19 @@ class App(tk.Tk):
                 elif kind == "update_progress":
                     downloaded, total = value
                     self._set_update_progress(downloaded, total)
+                elif kind == "update_stage":
+                    self._set_update_stage(str(value))
                 elif kind == "update_install_error":
                     self._close_update_progress()
                     self._append("更新失败：" + value)
-                    messagebox.showerror("更新失败", value)
                     self._set_status("error")
+                    if messagebox.askyesno("更新失败", f"{value}\n\n是否打开 GitHub Release 页面手动下载？"):
+                        release = getattr(self, "_pending_release", None)
+                        if isinstance(release, ReleaseInfo) and release.html_url:
+                            webbrowser.open(release.html_url)
                 elif kind == "update_installed":
                     self._append(value)
+                    self._set_update_stage("正在重启")
                     self._set_status("success")
                     self._set_update_progress(1, 1)
                     messagebox.showinfo("更新完成", "更新已下载，点击确定后程序将关闭并自动重启。")
@@ -496,7 +547,8 @@ class App(tk.Tk):
             self._update_checking = False
 
     def _install_update(self, release: ReleaseInfo) -> None:
-        self._append(f"正在下载版本 {release.version}...")
+        self._pending_release = release
+        self._append(f"获取更新清单完成，正在下载版本 {release.version}...")
         self._show_update_progress(release)
         threading.Thread(target=self._install_update_worker, args=(release,), daemon=True).start()
 
@@ -505,6 +557,7 @@ class App(tk.Tk):
             download_and_install(
                 release,
                 progress_callback=lambda downloaded, total: self.events.put(("update_progress", (downloaded, total))),
+                stage_callback=lambda stage: self.events.put(("update_stage", stage)),
             )
             self.events.put(("update_installed", "更新已下载，程序将重启"))
         except Exception as exc:
@@ -529,7 +582,7 @@ class App(tk.Tk):
         content.columnconfigure(0, weight=1)
         tk.Label(content, text=f"正在下载一口轻食 {release.tag_name}", bg=TOKENS.surface,
                  fg=TOKENS.primary, font=(FONT_FAMILY, 16, "bold"), anchor="w").pack(anchor="w")
-        self._update_progress_text = tk.StringVar(value="正在连接 GitHub...")
+        self._update_progress_text = tk.StringVar(value="获取更新清单…")
         tk.Label(content, textvariable=self._update_progress_text, bg=TOKENS.surface,
                  fg=TOKENS.text_soft, font=(FONT_FAMILY, 10), anchor="w").pack(anchor="w", pady=(TOKENS.space_2, TOKENS.space_2))
         self._update_progressbar = ttk.Progressbar(content, maximum=100, mode="indeterminate")
@@ -544,12 +597,21 @@ class App(tk.Tk):
         if not dialog or not dialog.winfo_exists():
             return
         downloaded_mb = downloaded / (1024 * 1024)
+        if downloaded == 0:
+            self._update_progress_text.set("下载更新…")
+            return
         if total:
             self._update_progressbar.stop()
             self._update_progressbar.configure(mode="determinate", value=min(downloaded * 100 / total, 100))
-            self._update_progress_text.set(f"已下载 {downloaded_mb:.1f} MB / {total / (1024 * 1024):.1f} MB（{min(downloaded * 100 / total, 100):.0f}%）")
+            percent = min(downloaded * 100 / total, 100)
+            self._update_progress_text.set(f"下载更新… 已下载 {downloaded_mb:.1f} MB / {total / (1024 * 1024):.1f} MB（{percent:.0f}%）")
         else:
-            self._update_progress_text.set(f"已下载 {downloaded_mb:.1f} MB")
+            self._update_progress_text.set(f"下载更新… 已下载 {downloaded_mb:.1f} MB")
+
+    def _set_update_stage(self, stage: str) -> None:
+        dialog = getattr(self, "_update_progress_window", None)
+        if dialog and dialog.winfo_exists() and hasattr(self, "_update_progress_text"):
+            self._update_progress_text.set(stage + "…")
 
     def _close_update_progress(self) -> None:
         dialog = getattr(self, "_update_progress_window", None)

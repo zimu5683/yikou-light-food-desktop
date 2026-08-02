@@ -26,6 +26,14 @@ from . import __version__
 
 REPOSITORY = "zimu5683/yikou-light-food-desktop"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/latest.json"
+TRUSTED_DOWNLOAD_HOSTS = {
+    "github.com",
+    "objects.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+}
+MAX_UPDATE_SIZE = 512 * 1024 * 1024
 
 
 class UpdateError(RuntimeError):
@@ -39,6 +47,8 @@ class ReleaseInfo:
     body: str
     html_url: str
     assets: tuple[dict[str, Any], ...] = ()
+    manifest_source: str = "api"
+    manifest_url: str = ""
 
     @property
     def version(self) -> str:
@@ -49,16 +59,71 @@ class ReleaseInfo:
         """Return the Windows executable asset attached to this release."""
         for asset in self.assets:
             name = str(asset.get("name") or "").lower()
-            if name == "yikou-light-food.exe":
+            if name == "yikou-light-food.exe" and safe_asset_name(name):
                 return asset
         return None
 
     @property
     def checksum_asset(self) -> dict[str, Any] | None:
         for asset in self.assets:
-            if str(asset.get("name") or "").lower() == "yikou-light-food.exe.sha256":
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food.exe.sha256" and safe_asset_name(name):
                 return asset
+        executable = self.executable_asset
+        checksum_url = str((executable or {}).get("sha256_url") or "")
+        if checksum_url:
+            return {"name": "yikou-light-food.exe.sha256", "browser_download_url": checksum_url}
         return None
+
+    @property
+    def executable_size(self) -> int | None:
+        asset = self.executable_asset
+        try:
+            size = int(asset.get("size")) if asset and asset.get("size") is not None else None
+            return size if size and size > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+
+def safe_asset_name(name: str) -> bool:
+    """Reject path traversal and unexpected release asset names."""
+    value = str(name or "")
+    if not value or value in {".", ".."} or "/" in value or "\\" in value:
+        return False
+    if ".." in value or any(ord(char) < 32 for char in value):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value))
+
+
+def _trusted_url(value: str) -> bool:
+    parsed = urlparse(str(value or ""))
+    return parsed.scheme == "https" and (parsed.hostname or "").lower() in TRUSTED_DOWNLOAD_HOSTS
+
+
+def _asset_url(asset: dict[str, Any] | None) -> str:
+    if not asset:
+        return ""
+    return str(asset.get("browser_download_url") or asset.get("download_url") or asset.get("url") or "")
+
+
+def select_platform_assets(assets: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+                           *, platform: str | None = None, architecture: str | None = None) -> tuple[dict[str, Any], ...]:
+    """Filter release assets by platform/architecture and safe file names."""
+    platform = (platform or ("windows" if os.name == "nt" else "macos" if sys.platform == "darwin" else "linux")).lower()
+    architecture = (architecture or ("arm64" if (platform == "macos" and sys.platform == "darwin" and os.uname().machine.lower() in {"arm64", "aarch64"}) else "x64")).lower()
+    result: list[dict[str, Any]] = []
+    for asset in assets:
+        name = str(asset.get("name") or "")
+        lower = name.lower()
+        if not safe_asset_name(name):
+            continue
+        if platform == "windows" and lower.endswith(".exe") and "macos" not in lower and "linux" not in lower:
+            result.append(asset)
+        elif platform == "macos" and lower.endswith(".zip") and "macos" in lower and (architecture in lower or "arm64" not in lower and "x64" not in lower):
+            result.append(asset)
+        elif platform == "linux" and lower.endswith((".appimage", ".tar.gz", ".deb")) and "linux" in lower:
+            result.append(asset)
+    return tuple(result)
 
 
 def normalize_version(value: str) -> str:
@@ -108,13 +173,64 @@ def _decode_release(payload: Any) -> ReleaseInfo:
     assets = payload.get("assets") or []
     if not isinstance(assets, list):
         assets = []
+    normalized_assets = []
+    for item in assets:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        if not copied.get("browser_download_url") and copied.get("url"):
+            copied["browser_download_url"] = copied["url"]
+        normalized_assets.append(copied)
     return ReleaseInfo(
         tag_name=str(payload["tag_name"]),
         name=str(payload.get("name") or payload["tag_name"]),
         body=str(payload.get("body") or "").strip(),
         html_url=str(payload.get("html_url") or ""),
-        assets=tuple(item for item in assets if isinstance(item, dict)),
+        assets=tuple(normalized_assets),
+        manifest_source="api",
     )
+
+
+def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> ReleaseInfo:
+    if not isinstance(payload, dict):
+        raise UpdateError("latest.json 格式无效")
+    schema = payload.get("schema_version", 1)
+    if str(schema) not in {"1", "1.0"}:
+        raise UpdateError("latest.json schema_version 不受支持")
+    version = str(payload.get("version") or payload.get("tag_name") or "").strip()
+    if not version:
+        raise UpdateError("latest.json 缺少 version")
+    assets: list[dict[str, Any]] = []
+    raw_assets = payload.get("assets") or []
+    if not isinstance(raw_assets, list):
+        raise UpdateError("latest.json assets 格式无效")
+    for item in raw_assets:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        if not safe_asset_name(name):
+            continue
+        copied = dict(item)
+        if item.get("url"):
+            copied["browser_download_url"] = item["url"]
+        if item.get("sha256_url"):
+            copied["sha256_url"] = item["sha256_url"]
+        assets.append(copied)
+    return ReleaseInfo(
+        tag_name=version if version.lower().startswith("v") else f"v{version}",
+        name=str(payload.get("name") or version),
+        body=str(payload.get("body") or payload.get("release_summary") or payload.get("notes") or "").strip(),
+        html_url=str(payload.get("url") or payload.get("html_url") or ""),
+        assets=tuple(assets),
+        manifest_source="manifest",
+        manifest_url=source_url,
+    )
+
+
+def _fetch_json(url: str, *, timeout: float, opener: Callable[..., Any]) -> Any:
+    request = Request(url, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
+    with opener(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def check_for_update(
@@ -124,14 +240,19 @@ def check_for_update(
     opener: Callable[..., Any] | None = None,
 ) -> ReleaseInfo | None:
     """Fetch the latest GitHub release and return it when it is newer."""
-    request = Request(RELEASES_URL, headers={"Accept": "application/vnd.github+json", "User-Agent": "yikou-light-food"})
     open_func = opener or urlopen
+    errors: list[str] = []
+    release: ReleaseInfo | None = None
     try:
-        with open_func(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
-        raise UpdateError(f"Unable to check for updates: {exc}") from exc
-    release = _decode_release(payload)
+        release = _decode_manifest(_fetch_json(LATEST_MANIFEST_URL, timeout=timeout, opener=open_func))
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+        errors.append(f"manifest: {exc}")
+    if release is None:
+        try:
+            release = _decode_release(_fetch_json(RELEASES_URL, timeout=timeout, opener=open_func))
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+            errors.append(f"api: {exc}")
+            raise UpdateError("Unable to check for updates: " + "; ".join(errors)) from exc
     return release if compare_versions(release.version, current_version) > 0 else None
 
 
@@ -142,6 +263,7 @@ def download_and_install(
     timeout: float = 60.0,
     opener: Callable[..., Any] | None = None,
     progress_callback: Callable[[int, int | None], None] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
 ) -> Path:
     """Download a release exe and schedule replacement after this process exits.
 
@@ -155,15 +277,28 @@ def download_and_install(
         # corrupt the user's Python installation.
         raise UpdateError("源码运行模式不支持自动安装，请前往 GitHub Release 页面下载")
     asset = release.executable_asset
-    url = str(asset.get("browser_download_url") if asset else "")
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+    asset_name = str(asset.get("name") if asset else "")
+    url = _asset_url(asset)
+    if not safe_asset_name(asset_name) or asset_name.lower() != "yikou-light-food.exe" or not _trusted_url(url):
         raise UpdateError("Release does not contain a trusted Windows executable download")
     target = Path(current_executable or sys.executable).resolve()
     if target.suffix.lower() != ".exe":
         raise UpdateError("Automatic installation is only available from the packaged exe")
+    if not target.parent.exists() or not os.access(target.parent, os.W_OK):
+        raise UpdateError("安装目录不可写，请将程序移动到可写目录后重试")
+    expected_size = release.executable_size
+    if expected_size and expected_size > MAX_UPDATE_SIZE:
+        raise UpdateError("更新资源大小异常")
+    try:
+        required_space = (expected_size or 1_000_000) + 1_048_576
+        if shutil.disk_usage(target.parent).free < required_space:
+            raise UpdateError("磁盘剩余空间不足，无法安装更新")
+    except OSError as exc:
+        raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
     temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
     request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
+    if stage_callback:
+        stage_callback("下载更新")
     try:
         with (opener or urlopen)(request, timeout=timeout) as response, temporary.open("wb") as output:
             content_length = None
@@ -173,6 +308,8 @@ def download_and_install(
                     content_length = int(headers.get("Content-Length") or 0) or None
                 except (TypeError, ValueError):
                     content_length = None
+            if content_length and content_length > MAX_UPDATE_SIZE:
+                raise UpdateError("更新资源大小异常")
             downloaded = 0
             if progress_callback:
                 progress_callback(downloaded, content_length)
@@ -184,7 +321,11 @@ def download_and_install(
                 downloaded += len(chunk)
                 if progress_callback:
                     progress_callback(downloaded, content_length)
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            if expected_size and downloaded != expected_size:
+                raise UpdateError("下载文件大小与清单不一致")
+            if downloaded > MAX_UPDATE_SIZE:
+                raise UpdateError("更新资源大小异常")
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
         temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to download update: {exc}") from exc
     if temporary.stat().st_size < 1_000_000:
@@ -195,12 +336,13 @@ def download_and_install(
             temporary.unlink(missing_ok=True)
             raise UpdateError("Downloaded file is not a valid Windows executable")
     checksum_asset = release.checksum_asset
-    checksum_url = str(checksum_asset.get("browser_download_url") if checksum_asset else "")
-    checksum_parsed = urlparse(checksum_url)
-    if checksum_parsed.scheme != "https" or checksum_parsed.hostname not in {"github.com", "objects.githubusercontent.com"}:
+    checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
+    if not _trusted_url(checksum_url):
         temporary.unlink(missing_ok=True)
         raise UpdateError("Release does not contain a trusted SHA-256 checksum")
     try:
+        if stage_callback:
+            stage_callback("校验安装包")
         checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
         with (opener or urlopen)(checksum_request, timeout=timeout) as response:
             expected_hash = response.read().decode("ascii").strip().split()[0].lower()
@@ -224,6 +366,8 @@ def download_and_install(
     helper = Path(tempfile.gettempdir()) / f"yikou-light-food-updater-{os.getpid()}.exe"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
+        if stage_callback:
+            stage_callback("准备替换")
         shutil.copy2(temporary, helper)
         subprocess.Popen(
             [str(helper), "--apply-update", str(temporary), str(target)],

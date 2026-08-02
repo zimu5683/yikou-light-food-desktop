@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sys
 
+from .design_system import enable_high_dpi_awareness
+
 
 def main() -> None:
     if "--apply-update" in sys.argv:
@@ -26,6 +28,7 @@ def main() -> None:
         from .automation import ensure_browser
         print(ensure_browser("auto"))
         return
+    enable_high_dpi_awareness()
     from .gui import main as gui_main
     gui_main()
 

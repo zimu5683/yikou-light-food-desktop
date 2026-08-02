@@ -76,3 +76,10 @@ jobs:
             dist/yikou-light-food.exe
             dist/yikou-light-food.exe.sha256
           fail_on_unmatched_files: true
+
+      - name: Generate latest.json manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/generate_latest_manifest.py

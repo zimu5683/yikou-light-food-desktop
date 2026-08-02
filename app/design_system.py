@@ -6,9 +6,14 @@ workflow so the visual system can be tested without creating a Tk root window.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import ctypes
+import hashlib
+import os
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable
+
+from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,92 @@ TOKENS = DesignTokens()
 FONT_FAMILY = "Segoe UI"
 FONT_FALLBACK = ("Segoe UI", "Helvetica Neue", "Arial", "sans-serif")
 FONT_MONO = ("Consolas", 10)
+
+
+def enable_high_dpi_awareness() -> str:
+    """Enable per-monitor DPI awareness before a Tk root is created.
+
+    The calls are deliberately best-effort: older Windows versions expose only
+    one of the legacy APIs, while non-Windows platforms simply use Tk's native
+    scaling.  The return value is useful for diagnostics and unit tests.
+    """
+    if os.name != "nt":
+        return "unsupported"
+    try:
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4.
+        if ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4)):
+            return "per-monitor-v2"
+    except (AttributeError, OSError, TypeError):
+        pass
+    try:
+        # PROCESS_PER_MONITOR_DPI_AWARE == 2.
+        if ctypes.windll.shcore.SetProcessDpiAwareness(2) == 0:
+            return "per-monitor"
+    except (AttributeError, OSError, TypeError):
+        pass
+    try:
+        if ctypes.windll.user32.SetProcessDPIAware():
+            return "system"
+    except (AttributeError, OSError, TypeError):
+        pass
+    return "unavailable"
+
+
+def apply_tk_scaling(root: tk.Misc) -> float:
+    """Set Tk's point scaling from the monitor DPI and return the scale."""
+    scale = 1.0
+    try:
+        dpi = float(root.winfo_fpixels("1i"))
+        if dpi > 0:
+            scale = max(0.75, min(3.0, dpi / 72.0))
+            root.tk.call("tk", "scaling", scale)
+    except (tk.TclError, AttributeError, TypeError, ValueError):
+        pass
+    return scale
+
+
+_IMAGE_CACHE: dict[tuple[object, ...], Image.Image] = {}
+
+
+def _color_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    if len(value) == 3:
+        value = "".join(part * 2 for part in value)
+    return tuple(int(value[index:index + 2], 16) for index in (0, 2, 4))  # type: ignore[return-value]
+
+
+def render_rounded_image(width: int, height: int, radius: int, fill: str,
+                         *, outline: str = "", shadow: str = "",
+                         scale: int = 4) -> Image.Image:
+    """Render a cached, supersampled rounded surface with antialiased edges."""
+    width, height = max(1, int(width)), max(1, int(height))
+    scale = max(1, int(scale))
+    key = (width, height, int(radius), fill, outline, shadow, scale)
+    cached = _IMAGE_CACHE.get(key)
+    if cached is not None:
+        return cached.copy()
+    size = (width * scale, height * scale)
+    image = Image.new("RGBA", size, (0, 0, 0, 0))
+    if shadow:
+        shadow_layer = Image.new("RGBA", size, (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow_layer)
+        shadow_draw.rounded_rectangle((2 * scale, 3 * scale, (width - 1) * scale, (height - 1) * scale),
+                                      radius=max(1, int(radius * scale)), fill=_color_rgb(shadow) + (150,))
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(max(1, scale)))
+        image.alpha_composite(shadow_layer)
+    draw = ImageDraw.Draw(image)
+    box = (0, 0, max(1, width * scale - 1), max(1, height * scale - 1))
+    draw.rounded_rectangle(box, radius=max(1, int(radius * scale)), fill=_color_rgb(fill) + (255,),
+                           outline=_color_rgb(outline) + (255,) if outline else None,
+                           width=max(1, scale) if outline else 1)
+    result = image.resize((width, height), Image.Resampling.LANCZOS)
+    _IMAGE_CACHE[key] = result.copy()
+    return result
+
+
+def image_cache_key(width: int, height: int, radius: int, fill: str, outline: str = "") -> str:
+    """Return a stable debug key for a rendered component image."""
+    return hashlib.sha1(f"{width}:{height}:{radius}:{fill}:{outline}".encode()).hexdigest()
 
 STATUS_STYLES: dict[str, tuple[str, str]] = {
     "ready": ("就绪", TOKENS.green_light),
@@ -102,23 +193,128 @@ class RoundedCard(tk.Frame):
         self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
         self.body_window = self.canvas.create_window(0, 0, anchor="nw", window=self.body)
         self.canvas.bind("<Configure>", self._redraw)
+        self._photo: ImageTk.PhotoImage | None = None
 
     def _redraw(self, event: tk.Event[tk.Misc]) -> None:
         width, height = max(1, event.width), max(1, event.height)
         self.canvas.delete("card-shape")
-        _rounded_rectangle(self.canvas, 2, 2, width - 2, height - 1, TOKENS.radius_card,
-                           fill=TOKENS.shadow_soft, outline="")
-        _rounded_rectangle(self.canvas, 1, 1, width - 3, height - 3, TOKENS.radius_card,
-                           fill=TOKENS.shadow, outline="")
-        _rounded_rectangle(self.canvas, 0, 0, width - 4, height - 5, TOKENS.radius_card,
-                           fill=TOKENS.surface, outline=TOKENS.border_soft, width=1)
-        for item in self.canvas.find_all():
-            if item != self.body_window:
-                self.canvas.addtag_withtag("card-shape", item)
+        image = render_rounded_image(width, height, TOKENS.radius_card, TOKENS.surface,
+                                     outline=TOKENS.border_soft, shadow=TOKENS.shadow)
+        self._photo = ImageTk.PhotoImage(image)
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags="card-shape")
         self.canvas.tag_lower("card-shape")
         self.canvas.itemconfigure(self.body_window, width=max(1, width - self._padding * 2 - 4),
                                   height=max(1, height - self._padding * 2 - 5))
         self.canvas.coords(self.body_window, self._padding, self._padding)
+
+
+class ScrollableRoundedCard(tk.Frame):
+    """A rounded card whose content can be scrolled with mouse or keyboard."""
+
+    def __init__(self, master: tk.Misc, *, padding: int = TOKENS.space_4, **kwargs: object) -> None:
+        parent_bg = str(kwargs.pop("parent_bg", TOKENS.canvas))
+        super().__init__(master, bg=parent_bg, highlightthickness=0, bd=0, **kwargs)
+        self._padding = padding
+        self._parent_bg = parent_bg
+        self.canvas = tk.Canvas(self, bg=parent_bg, highlightthickness=0, bd=0,
+                                yscrollcommand=self._on_scroll)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
+                                      bg=TOKENS.ceramic, troughcolor=TOKENS.surface,
+                                      activebackground=TOKENS.accent, relief="flat", bd=0,
+                                      width=7)
+        self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
+        self.body_window = self.canvas.create_window(padding, padding, anchor="nw", window=self.body)
+        self._photo: ImageTk.PhotoImage | None = None
+        self._active = False
+        self.canvas.bind("<Configure>", self._redraw)
+        self.body.bind("<Configure>", self._update_scrollregion)
+        self.bind_all("<Enter>", self._on_global_enter, add="+")
+        self.bind_all("<Leave>", self._on_global_leave, add="+")
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-4>", lambda event: self._scroll_lines(-1, event), add="+")
+        self.bind_all("<Button-5>", lambda event: self._scroll_lines(1, event), add="+")
+        self.bind_all("<FocusIn>", self._on_focus_in_global, add="+")
+
+    def _contains(self, widget: tk.Misc | None) -> bool:
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = widget.master  # type: ignore[assignment]
+        return False
+
+    def _on_global_enter(self, event: tk.Event[tk.Misc]) -> None:
+        try:
+            self._active = self._contains(self.winfo_containing(event.x_root, event.y_root))
+        except tk.TclError:
+            self._active = False
+
+    def _on_global_leave(self, event: tk.Event[tk.Misc]) -> None:
+        try:
+            self._active = self._contains(self.winfo_containing(event.x_root, event.y_root))
+        except tk.TclError:
+            self._active = False
+
+    def _scroll_lines(self, lines: int, event: tk.Event[tk.Misc]) -> str | None:
+        if not self._active:
+            return None
+        self.canvas.yview_scroll(lines, "units")
+        return "break"
+
+    def _on_mousewheel(self, event: tk.Event[tk.Misc]) -> str | None:
+        if not self._active:
+            return None
+        delta = int(getattr(event, "delta", 0))
+        if delta:
+            self.canvas.yview_scroll(-max(1, abs(delta) // 120) * (1 if delta > 0 else -1), "units")
+        return "break"
+
+    def _on_focus_in_global(self, event: tk.Event[tk.Misc]) -> None:
+        widget = event.widget
+        if self._contains(widget):
+            self.after_idle(lambda: self.scroll_to_widget(widget))
+
+    def scroll_to_widget(self, widget: tk.Misc) -> None:
+        try:
+            top = widget.winfo_rooty() - self.canvas.winfo_rooty()
+            bottom = top + widget.winfo_height()
+            visible = self.canvas.winfo_height()
+            current_top = self.canvas.canvasy(0)
+            current_bottom = current_top + visible
+            if top < current_top:
+                self.canvas.yview_scroll(int((top - current_top) / 20) - 1, "units")
+            elif bottom > current_bottom:
+                self.canvas.yview_scroll(int((bottom - current_bottom) / 20) + 1, "units")
+        except tk.TclError:
+            pass
+
+    def _on_scroll(self, first: str, last: str) -> None:
+        if float(last) - float(first) < 0.999:
+            if not self.scrollbar.winfo_ismapped():
+                self.scrollbar.pack(side="right", fill="y")
+        elif self.scrollbar.winfo_ismapped():
+            self.scrollbar.pack_forget()
+
+    def _update_scrollregion(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self.after_idle(self._set_scrollregion)
+
+    def _set_scrollregion(self) -> None:
+        try:
+            width = max(1, self.canvas.winfo_width() - self._padding * 2 - 4)
+            self.canvas.itemconfigure(self.body_window, width=width)
+            self.canvas.configure(scrollregion=self.canvas.bbox(self.body_window) or (0, 0, width, 1))
+        except tk.TclError:
+            pass
+
+    def _redraw(self, event: tk.Event[tk.Misc]) -> None:
+        width, height = max(1, event.width), max(1, event.height)
+        self.canvas.delete("card-shape")
+        image = render_rounded_image(width, height, TOKENS.radius_card, TOKENS.surface,
+                                     outline=TOKENS.border_soft, shadow=TOKENS.shadow)
+        self._photo = ImageTk.PhotoImage(image)
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags="card-shape")
+        self.canvas.tag_lower("card-shape")
+        self._set_scrollregion()
 
 
 class PillButton(tk.Canvas):
@@ -143,6 +339,7 @@ class PillButton(tk.Canvas):
         button_width = width or max(112, self._font.measure(text) + 32)
         super().__init__(master, width=button_width, height=40, highlightthickness=0, bd=0,
                          bg=kwargs.pop("bg", TOKENS.surface), takefocus=True, **kwargs)
+        self._photo: ImageTk.PhotoImage | None = None
         self._draw()
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
@@ -166,8 +363,10 @@ class PillButton(tk.Canvas):
         self.delete("all")
         fill, foreground, outline = self._colors()
         inset = 2 if self._pressed else 0
-        _rounded_rectangle(self, inset, inset, width - inset - 1, height - inset - 1,
-                           height / 2, fill=fill, outline=outline, width=1)
+        image = render_rounded_image(max(1, width - inset * 2), max(1, height - inset * 2),
+                                     height // 2, fill, outline=outline)
+        self._photo = ImageTk.PhotoImage(image)
+        self.create_image(inset, inset, anchor="nw", image=self._photo, tags="surface")
         self.create_text(width / 2, height / 2, text=self._label, fill=foreground,
                          font=self._font, tags="label")
         if self.focus_get() is self and self._button_state != "disabled":

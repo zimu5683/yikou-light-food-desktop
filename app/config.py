@@ -9,6 +9,19 @@ from typing import Any, Dict, Optional
 
 
 APP_NAME = "yikou-light-food"
+MIN_SPLIT_RATIO = 0.30
+MAX_SPLIT_RATIO = 0.55
+
+
+def clamp_split_ratio(value: object) -> float:
+    """Keep the user-controlled pane ratio inside a usable range."""
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        ratio = 0.38
+    if ratio != ratio:  # NaN
+        ratio = 0.38
+    return max(MIN_SPLIT_RATIO, min(MAX_SPLIT_RATIO, ratio))
 
 
 def user_data_dir() -> Path:
@@ -36,6 +49,7 @@ class AppConfig:
     order_search_timeout_ms: int = 8000
     retry_wait_ms: int = 1000
     order_search_attempts: int = 3
+    split_ratio: float = 0.38
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -43,6 +57,7 @@ class AppConfig:
                  max_page_search: int = 20, element_timeout_ms: int = 8000,
                  network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
                  retry_wait_ms: int = 1000, order_search_attempts: int = 3,
+                 split_ratio: float = 0.38,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -61,6 +76,7 @@ class AppConfig:
         self.order_search_timeout_ms = order_search_timeout_ms
         self.retry_wait_ms = retry_wait_ms
         self.order_search_attempts = order_search_attempts
+        self.split_ratio = clamp_split_ratio(split_ratio)
         self.config_path = config_path
 
     @property
