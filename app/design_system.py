@@ -11,6 +11,7 @@ import hashlib
 import os
 import tkinter as tk
 from tkinter import font as tkfont
+from collections import OrderedDict
 from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
@@ -103,7 +104,8 @@ def apply_tk_scaling(root: tk.Misc) -> float:
     return scale
 
 
-_IMAGE_CACHE: dict[tuple[object, ...], Image.Image] = {}
+IMAGE_CACHE_LIMIT = 128
+_IMAGE_CACHE: OrderedDict[tuple[object, ...], Image.Image] = OrderedDict()
 
 
 def _color_rgb(value: str) -> tuple[int, int, int]:
@@ -115,13 +117,14 @@ def _color_rgb(value: str) -> tuple[int, int, int]:
 
 def render_rounded_image(width: int, height: int, radius: int, fill: str,
                          *, outline: str = "", shadow: str = "",
-                         scale: int = 4) -> Image.Image:
+                         scale: int = 4, dpi_scale: float = 1.0) -> Image.Image:
     """Render a cached, supersampled rounded surface with antialiased edges."""
     width, height = max(1, int(width)), max(1, int(height))
     scale = max(1, int(scale))
-    key = (width, height, int(radius), fill, outline, shadow, scale)
+    key = ("surface", width, height, int(radius), fill, outline, shadow, scale, round(float(dpi_scale), 2))
     cached = _IMAGE_CACHE.get(key)
     if cached is not None:
+        _IMAGE_CACHE.move_to_end(key)
         return cached.copy()
     size = (width * scale, height * scale)
     image = Image.new("RGBA", size, (0, 0, 0, 0))
@@ -139,12 +142,128 @@ def render_rounded_image(width: int, height: int, radius: int, fill: str,
                            width=max(1, scale) if outline else 1)
     result = image.resize((width, height), Image.Resampling.LANCZOS)
     _IMAGE_CACHE[key] = result.copy()
+    _IMAGE_CACHE.move_to_end(key)
+    while len(_IMAGE_CACHE) > IMAGE_CACHE_LIMIT:
+        _IMAGE_CACHE.popitem(last=False)
     return result
+
+
+def render_rounded_corner_tiles(radius: int, fill: str, *, outline: str = "",
+                                shadow: str = "", dpi_scale: float = 1.0,
+                                scale: int = 4) -> dict[str, Image.Image]:
+    """Create four small antialiased corner tiles for a scalable surface.
+
+    Large cards should not allocate a full-size supersampled bitmap during a
+    window resize.  A canonical 2R tile is enough because all straight
+    portions are painted by Tk's fast rectangles.
+    """
+    radius = max(2, int(round(radius * max(0.75, float(dpi_scale)))))
+    scale = max(1, int(scale))
+    pad = max(2, int(round(4 * max(0.75, float(dpi_scale)))))
+    key = ("corners", radius, fill, outline, shadow, scale, round(float(dpi_scale), 2), pad)
+    cached = _IMAGE_CACHE.get(key)
+    if cached is not None:
+        _IMAGE_CACHE.move_to_end(key)
+        # Corner tiles are stored as one horizontal strip to keep the cache
+        # value type stable and reduce duplicate image objects.
+        strip = cached.copy()
+    else:
+        extent = radius * 2 + pad * 2
+        size = extent * scale
+        strip = Image.new("RGBA", (size * 2, size * 2), (0, 0, 0, 0))
+        shadow_layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow_layer)
+        if shadow:
+            shadow_draw.rounded_rectangle(
+                (pad * scale, pad * scale, (extent - pad) * scale, (extent - pad) * scale),
+                radius=radius * scale,
+                fill=_color_rgb(shadow) + (150,),
+            )
+            shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(max(1, scale)))
+        surface = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(surface)
+        draw.rounded_rectangle(
+            (0, 0, (extent - 1) * scale, (extent - 1) * scale),
+            radius=radius * scale,
+            fill=_color_rgb(fill) + (255,),
+            outline=_color_rgb(outline) + (255,) if outline else None,
+            width=max(1, scale) if outline else 1,
+        )
+        combined = shadow_layer.copy()
+        combined.alpha_composite(surface)
+        # Keep only the useful top-left quadrant and mirror it for the other
+        # corners.  Resampling happens once, not once per window size.
+        tile = combined.crop((0, 0, (radius + pad) * scale, (radius + pad) * scale))
+        tile = tile.resize((radius + pad, radius + pad), Image.Resampling.LANCZOS)
+        strip = Image.new("RGBA", ((radius + pad) * 2, (radius + pad) * 2), (0, 0, 0, 0))
+        strip.alpha_composite(tile, (0, 0))
+        strip.alpha_composite(tile.transpose(Image.Transpose.FLIP_LEFT_RIGHT), (radius + pad, 0))
+        strip.alpha_composite(tile.transpose(Image.Transpose.FLIP_TOP_BOTTOM), (0, radius + pad))
+        strip.alpha_composite(tile.transpose(Image.Transpose.ROTATE_180), (radius + pad, radius + pad))
+        _IMAGE_CACHE[key] = strip.copy()
+        _IMAGE_CACHE.move_to_end(key)
+        while len(_IMAGE_CACHE) > IMAGE_CACHE_LIMIT:
+            _IMAGE_CACHE.popitem(last=False)
+    edge = strip.width // 2
+    return {
+        "top_left": strip.crop((0, 0, edge, edge)),
+        "top_right": strip.crop((edge, 0, edge * 2, edge)),
+        "bottom_left": strip.crop((0, edge, edge, edge * 2)),
+        "bottom_right": strip.crop((edge, edge, edge * 2, edge * 2)),
+    }
 
 
 def image_cache_key(width: int, height: int, radius: int, fill: str, outline: str = "") -> str:
     """Return a stable debug key for a rendered component image."""
     return hashlib.sha1(f"{width}:{height}:{radius}:{fill}:{outline}".encode()).hexdigest()
+
+
+def _tk_dpi_scale(widget: tk.Misc) -> float:
+    try:
+        value = float(widget.tk.call("tk", "scaling"))
+        return max(0.75, min(3.0, value))
+    except (tk.TclError, TypeError, ValueError):
+        return 1.0
+
+
+def _draw_scalable_surface(canvas: tk.Canvas, width: int, height: int, *,
+                           fill: str, outline: str, shadow: str,
+                           dpi_scale: float) -> list[ImageTk.PhotoImage]:
+    """Paint a scalable rounded surface without allocating a large bitmap."""
+    canvas.delete("card-shape")
+    if width < 2 or height < 2:
+        return []
+    tiles = render_rounded_corner_tiles(TOKENS.radius_card, fill, outline=outline,
+                                        shadow=shadow, dpi_scale=dpi_scale)
+    photos = [ImageTk.PhotoImage(tiles[name]) for name in
+              ("top_left", "top_right", "bottom_left", "bottom_right")]
+    corner = photos[0].width()
+    shadow_offset = max(1, int(round(2 * dpi_scale)))
+    # Straight portions are deliberately native Canvas rectangles; only the
+    # four corners require antialiased Pillow pixels.
+    canvas.create_rectangle(corner, shadow_offset, max(corner, width - corner), height,
+                            fill=shadow, outline="", tags="card-shape")
+    canvas.create_rectangle(shadow_offset, corner, width, max(corner, height - corner),
+                            fill=shadow, outline="", tags="card-shape")
+    canvas.create_rectangle(corner, 0, max(corner, width - corner), max(1, height - shadow_offset),
+                            fill=fill, outline="", tags="card-shape")
+    canvas.create_rectangle(0, corner, max(1, width - shadow_offset), max(corner, height - corner),
+                            fill=fill, outline="", tags="card-shape")
+    if outline:
+        canvas.create_line(corner, 0, max(corner, width - corner), 0,
+                           fill=outline, width=1, tags="card-shape")
+        canvas.create_line(0, corner, 0, max(corner, height - corner),
+                           fill=outline, width=1, tags="card-shape")
+        canvas.create_line(corner, max(1, height - 1), max(corner, width - corner), max(1, height - 1),
+                           fill=outline, width=1, tags="card-shape")
+        canvas.create_line(max(1, width - 1), corner, max(1, width - 1), max(corner, height - corner),
+                           fill=outline, width=1, tags="card-shape")
+    positions = ((0, 0), (width - corner, 0), (0, height - corner),
+                 (width - corner, height - corner))
+    for photo, (x, y) in zip(photos, positions):
+        canvas.create_image(max(0, x), max(0, y), anchor="nw", image=photo, tags="card-shape")
+    canvas.tag_lower("card-shape")
+    return photos
 
 STATUS_STYLES: dict[str, tuple[str, str]] = {
     "ready": ("就绪", TOKENS.green_light),
@@ -160,6 +279,24 @@ def layout_mode(width: int) -> str:
     """Return the responsive layout mode for a window width."""
 
     return "split" if width >= TOKENS.breakpoint_split else "stacked"
+
+
+def form_layout_mode(width: int) -> str:
+    """Return the left-form layout mode for the available content width."""
+
+    return "compact" if int(width) < 430 else "wide"
+
+
+def calculate_scrollregion(view_width: int, view_height: int, content_width: int,
+                           content_height: int, padding: int) -> tuple[int, int, int, int]:
+    """Return a scroll region anchored at the canvas origin."""
+    view_width = max(1, int(view_width))
+    view_height = max(1, int(view_height))
+    content_width = max(1, int(content_width))
+    content_height = max(1, int(content_height))
+    padding = max(0, int(padding))
+    return (0, 0, max(view_width, content_width + padding * 2),
+            max(view_height, content_height + padding * 2))
 
 
 def _rounded_rectangle(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
@@ -192,20 +329,40 @@ class RoundedCard(tk.Frame):
         self.canvas.pack(fill="both", expand=True)
         self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
         self.body_window = self.canvas.create_window(0, 0, anchor="nw", window=self.body)
+        self._surface_photos: list[ImageTk.PhotoImage] = []
+        self._redraw_job: str | None = None
+        self._last_surface_size: tuple[int, int, float] | None = None
         self.canvas.bind("<Configure>", self._redraw)
-        self._photo: ImageTk.PhotoImage | None = None
 
     def _redraw(self, event: tk.Event[tk.Misc]) -> None:
-        width, height = max(1, event.width), max(1, event.height)
-        self.canvas.delete("card-shape")
-        image = render_rounded_image(width, height, TOKENS.radius_card, TOKENS.surface,
-                                     outline=TOKENS.border_soft, shadow=TOKENS.shadow)
-        self._photo = ImageTk.PhotoImage(image)
-        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags="card-shape")
-        self.canvas.tag_lower("card-shape")
+        self._pending_surface_size = (max(1, event.width), max(1, event.height))
+        if self._redraw_job is None:
+            self._redraw_job = self.after(16, self._redraw_now)
+
+    def _redraw_now(self) -> None:
+        self._redraw_job = None
+        width, height = getattr(self, "_pending_surface_size", (1, 1))
+        scale = _tk_dpi_scale(self.canvas)
+        size_key = (width, height, round(scale, 2))
+        if size_key == self._last_surface_size:
+            return
+        self._last_surface_size = size_key
+        self._surface_photos = _draw_scalable_surface(
+            self.canvas, width, height, fill=TOKENS.surface,
+            outline=TOKENS.border_soft, shadow=TOKENS.shadow, dpi_scale=scale,
+        )
         self.canvas.itemconfigure(self.body_window, width=max(1, width - self._padding * 2 - 4),
                                   height=max(1, height - self._padding * 2 - 5))
         self.canvas.coords(self.body_window, self._padding, self._padding)
+
+    def destroy(self) -> None:
+        if self._redraw_job is not None:
+            try:
+                self.after_cancel(self._redraw_job)
+            except tk.TclError:
+                pass
+            self._redraw_job = None
+        super().destroy()
 
 
 class ScrollableRoundedCard(tk.Frame):
@@ -225,7 +382,9 @@ class ScrollableRoundedCard(tk.Frame):
                                       width=7)
         self.body = tk.Frame(self.canvas, bg=TOKENS.surface, bd=0, highlightthickness=0)
         self.body_window = self.canvas.create_window(padding, padding, anchor="nw", window=self.body)
-        self._photo: ImageTk.PhotoImage | None = None
+        self._surface_photos: list[ImageTk.PhotoImage] = []
+        self._redraw_job: str | None = None
+        self._last_surface_size: tuple[int, int, float] | None = None
         self._active = False
         self.canvas.bind("<Configure>", self._redraw)
         self.body.bind("<Configure>", self._update_scrollregion)
@@ -300,21 +459,44 @@ class ScrollableRoundedCard(tk.Frame):
 
     def _set_scrollregion(self) -> None:
         try:
-            width = max(1, self.canvas.winfo_width() - self._padding * 2 - 4)
+            canvas_width = max(1, self.canvas.winfo_width())
+            canvas_height = max(1, self.canvas.winfo_height())
+            width = max(1, canvas_width - self._padding * 2 - 4)
             self.canvas.itemconfigure(self.body_window, width=width)
-            self.canvas.configure(scrollregion=self.canvas.bbox(self.body_window) or (0, 0, width, 1))
+            content_height = max(1, self.body.winfo_reqheight())
+            self.canvas.configure(scrollregion=calculate_scrollregion(
+                canvas_width, canvas_height, width, content_height, self._padding,
+            ))
         except tk.TclError:
             pass
 
     def _redraw(self, event: tk.Event[tk.Misc]) -> None:
-        width, height = max(1, event.width), max(1, event.height)
-        self.canvas.delete("card-shape")
-        image = render_rounded_image(width, height, TOKENS.radius_card, TOKENS.surface,
-                                     outline=TOKENS.border_soft, shadow=TOKENS.shadow)
-        self._photo = ImageTk.PhotoImage(image)
-        self.canvas.create_image(0, 0, anchor="nw", image=self._photo, tags="card-shape")
-        self.canvas.tag_lower("card-shape")
+        self._pending_surface_size = (max(1, event.width), max(1, event.height))
+        if self._redraw_job is None:
+            self._redraw_job = self.after(16, self._redraw_now)
+
+    def _redraw_now(self) -> None:
+        self._redraw_job = None
+        width, height = getattr(self, "_pending_surface_size", (1, 1))
+        scale = _tk_dpi_scale(self.canvas)
+        size_key = (width, height, round(scale, 2))
+        if size_key == self._last_surface_size:
+            return
+        self._last_surface_size = size_key
+        self._surface_photos = _draw_scalable_surface(
+            self.canvas, width, height, fill=TOKENS.surface,
+            outline=TOKENS.border_soft, shadow=TOKENS.shadow, dpi_scale=scale,
+        )
         self._set_scrollregion()
+
+    def destroy(self) -> None:
+        if self._redraw_job is not None:
+            try:
+                self.after_cancel(self._redraw_job)
+            except tk.TclError:
+                pass
+            self._redraw_job = None
+        super().destroy()
 
 
 class PillButton(tk.Canvas):
@@ -337,10 +519,15 @@ class PillButton(tk.Canvas):
         self._pressed = False
         self._font = tkfont.Font(family=FONT_FAMILY, size=10, weight="bold")
         button_width = width or max(112, self._font.measure(text) + 32)
+        self._requested_width = button_width
+        self._requested_height = 40
         super().__init__(master, width=button_width, height=40, highlightthickness=0, bd=0,
                          bg=kwargs.pop("bg", TOKENS.surface), takefocus=True, **kwargs)
         self._photo: ImageTk.PhotoImage | None = None
-        self._draw()
+        self._draw_job: str | None = None
+        self._last_draw_size: tuple[int, int, str, bool] | None = None
+        self._draw_now()
+        self.bind("<Configure>", self._on_configure, add="+")
         self.bind("<Enter>", self._on_enter)
         self.bind("<Leave>", self._on_leave)
         self.bind("<ButtonPress-1>", self._on_press)
@@ -357,14 +544,38 @@ class PillButton(tk.Canvas):
             return TOKENS.ceramic, TOKENS.text_soft, TOKENS.ceramic
         return fill, foreground, outline
 
+    def _current_size(self) -> tuple[int, int]:
+        width = int(self.winfo_width())
+        height = int(self.winfo_height())
+        if width <= 1:
+            width = self._requested_width
+        if height <= 1:
+            height = self._requested_height
+        return max(40, width), max(32, height)
+
+    def _on_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        self._schedule_draw()
+
+    def _schedule_draw(self) -> None:
+        if self._draw_job is None:
+            self._draw_job = self.after(16, self._draw_now)
+
     def _draw(self) -> None:
-        width = max(40, int(self.winfo_width() or int(self.cget("width"))))
-        height = max(32, int(self.winfo_height() or int(self.cget("height"))))
+        # State and focus changes need an immediate visual response; geometry
+        # changes are coalesced by _on_configure.
+        self._draw_now()
+
+    def _draw_now(self) -> None:
+        self._draw_job = None
+        width, height = self._current_size()
         self.delete("all")
         fill, foreground, outline = self._colors()
+        draw_key = (width, height, self._button_state, self._pressed)
+        self._last_draw_size = draw_key
         inset = 2 if self._pressed else 0
         image = render_rounded_image(max(1, width - inset * 2), max(1, height - inset * 2),
-                                     height // 2, fill, outline=outline)
+                                     height // 2, fill, outline=outline,
+                                     dpi_scale=_tk_dpi_scale(self))
         self._photo = ImageTk.PhotoImage(image)
         self.create_image(inset, inset, anchor="nw", image=self._photo, tags="surface")
         self.create_text(width / 2, height / 2, text=self._label, fill=foreground,
@@ -420,6 +631,15 @@ class PillButton(tk.Canvas):
         if state is not None:
             self.set_state(str(state))
         return result
+
+    def destroy(self) -> None:
+        if self._draw_job is not None:
+            try:
+                self.after_cancel(self._draw_job)
+            except tk.TclError:
+                pass
+            self._draw_job = None
+        super().destroy()
 
 
 class FormField(tk.Frame):

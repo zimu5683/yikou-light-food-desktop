@@ -14,7 +14,7 @@ from .config import AppConfig, clamp_split_ratio
 from .credentials import delete_password, get_password, set_password
 from .design_system import (FONT_FAMILY, FONT_MONO, PillButton, RoundedCard,
                             ScrollableRoundedCard, StatusBadge, TOKENS, FormField, apply_tk_scaling,
-                            layout_mode)
+                            form_layout_mode, layout_mode)
 from . import __version__
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
@@ -39,6 +39,10 @@ class App(tk.Tk):
         self._saved_config = AppConfig.load()
         self._split_ratio = clamp_split_ratio(self._saved_config.split_ratio)
         self._sash_dragging = False
+        self._applying_sash = False
+        self._resize_job: str | None = None
+        self._config_layout_job: str | None = None
+        self._config_compact = False
         self.configure(bg=TOKENS.canvas)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
@@ -86,8 +90,8 @@ class App(tk.Tk):
         self.paned.grid(row=0, column=0, sticky="nsew")
         self.config_card = ScrollableRoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
         self.log_card = RoundedCard(self.paned, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
-        self.paned.add(self.config_card, minsize=300, stretch="always")
-        self.paned.add(self.log_card, minsize=420, stretch="always")
+        self.paned.add(self.config_card, minsize=380, stretch="always")
+        self.paned.add(self.log_card, minsize=500, stretch="always")
         self.paned.bind("<B1-Motion>", lambda _event: setattr(self, "_sash_dragging", True), add="+")
         self.paned.bind("<ButtonRelease-1>", self._on_sash_release, add="+")
         self._build_config_card()
@@ -113,6 +117,7 @@ class App(tk.Tk):
     def _build_config_card(self) -> None:
         body = self.config_card.body
         body.columnconfigure(0, weight=1)
+        body.bind("<Configure>", self._on_config_body_configure, add="+")
         tk.Label(body, text="任务配置", bg=TOKENS.surface, fg=TOKENS.primary,
                  font=(FONT_FAMILY, 20, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
         tk.Label(body, text="准备好订单资料后，即可开始自动处理。", bg=TOKENS.surface,
@@ -131,13 +136,15 @@ class App(tk.Tk):
             self.form_fields[key] = field
 
         excel_row = tk.Frame(body, bg=TOKENS.surface)
+        self.excel_row = excel_row
         excel_row.grid(row=5, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         excel_row.columnconfigure(0, weight=1)
         self.vars["excel"] = tk.StringVar()
         self.form_fields["excel"] = FormField(excel_row, "Excel 文件", self.vars["excel"], helper="支持 .xlsx 和 .xlsm 文件")
         self.form_fields["excel"].grid(row=0, column=0, sticky="ew")
-        PillButton(excel_row, "选择文件", self._choose_excel, variant="outline", width=112,
-                   bg=TOKENS.surface).grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+        self.excel_button = PillButton(excel_row, "选择文件", self._choose_excel, variant="outline", width=112,
+                                       bg=TOKENS.surface)
+        self.excel_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         order_row = tk.Frame(body, bg=TOKENS.surface)
         order_row.grid(row=6, column=0, sticky="ew", pady=(0, TOKENS.space_3))
@@ -174,12 +181,57 @@ class App(tk.Tk):
         self.stop_button.set_state("disabled")
 
         tools = tk.Frame(body, bg=TOKENS.surface)
+        self.tools = tools
         tools.grid(row=10, column=0, sticky="ew")
+        self.tool_buttons = [
+            PillButton(tools, "检查浏览器", self.install_browser, variant="outline"),
+            PillButton(tools, "清除密码", self.clear_password, variant="outline"),
+            PillButton(tools, "检查更新", lambda: self.check_for_updates(manual=True), variant="outline"),
+        ]
+        self._apply_config_layout(520)
+
+    def _on_config_body_configure(self, _event: tk.Event[tk.Misc]) -> None:
+        if self._config_layout_job is None:
+            self._config_layout_job = self.after(16, self._apply_config_layout_from_widget)
+
+    def _apply_config_layout_from_widget(self) -> None:
+        self._config_layout_job = None
+        width = max(1, self.config_card.body.winfo_width())
+        self._apply_config_layout(width)
+
+    def _apply_config_layout(self, width: int) -> None:
+        """Reflow the left form before its controls become too narrow."""
+        compact = form_layout_mode(width) == "compact"
+        self._config_compact = compact
+
+        self.excel_row.columnconfigure(0, weight=1)
+        self.excel_row.columnconfigure(1, weight=0)
+        self.form_fields["excel"].grid_configure(row=0, column=0, columnspan=1, sticky="ew")
+        if compact:
+            self.excel_button.grid_configure(row=1, column=0, columnspan=2, sticky="e",
+                                             padx=0, pady=(TOKENS.space_2, 0))
+        else:
+            self.excel_button.grid_configure(row=0, column=1, columnspan=1, sticky="s",
+                                             padx=(TOKENS.space_2, 0), pady=(20, 0))
+
         for column in range(3):
-            tools.columnconfigure(column, weight=1)
-        PillButton(tools, "检查浏览器", self.install_browser, variant="outline").grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
-        PillButton(tools, "清除密码", self.clear_password, variant="outline").grid(row=0, column=1, sticky="ew", padx=TOKENS.space_1)
-        PillButton(tools, "检查更新", lambda: self.check_for_updates(manual=True), variant="outline").grid(row=0, column=2, sticky="ew", padx=(TOKENS.space_1, 0))
+            self.tools.columnconfigure(column, weight=0 if compact else 1)
+        if compact:
+            self.tools.columnconfigure(0, weight=1)
+            self.tools.columnconfigure(1, weight=1)
+            self.tool_buttons[0].grid(row=0, column=0, columnspan=1, sticky="ew",
+                                      padx=(0, TOKENS.space_1), pady=(0, TOKENS.space_1))
+            self.tool_buttons[1].grid(row=0, column=1, columnspan=1, sticky="ew",
+                                      padx=(TOKENS.space_1, 0), pady=(0, TOKENS.space_1))
+            self.tool_buttons[2].grid(row=1, column=0, columnspan=2, sticky="ew",
+                                      padx=0, pady=(TOKENS.space_1, 0))
+        else:
+            self.tool_buttons[0].grid(row=0, column=0, columnspan=1, sticky="ew",
+                                      padx=(0, TOKENS.space_1), pady=0)
+            self.tool_buttons[1].grid(row=0, column=1, columnspan=1, sticky="ew",
+                                      padx=TOKENS.space_1, pady=0)
+            self.tool_buttons[2].grid(row=0, column=2, columnspan=1, sticky="ew",
+                                      padx=(TOKENS.space_1, 0), pady=0)
 
     def _build_log_card(self) -> None:
         body = self.log_card.body
@@ -226,22 +278,35 @@ class App(tk.Tk):
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
 
-    def _on_resize(self, _event: tk.Event[tk.Misc] | None = None) -> None:
-        mode = layout_mode(self.winfo_width())
-        if mode == self._layout_mode:
-            if mode == "split" and not self._sash_dragging:
-                self.after_idle(self._apply_split_ratio)
+    def _on_resize(self, event: tk.Event[tk.Misc] | None = None) -> None:
+        if event is not None and getattr(event, "widget", self) is not self:
             return
-        self._layout_mode = mode
-        if mode == "split":
-            self.paned.configure(orient=tk.HORIZONTAL)
-            self.paned.paneconfigure(self.config_card, minsize=300, stretch="always")
-            self.paned.paneconfigure(self.log_card, minsize=420, stretch="always")
-            self.after_idle(self._apply_split_ratio)
-        else:
-            self.paned.configure(orient=tk.VERTICAL)
-            self.paned.paneconfigure(self.config_card, minsize=260, stretch="always")
-            self.paned.paneconfigure(self.log_card, minsize=300, stretch="always")
+        if self._applying_sash:
+            return
+        if self._resize_job is not None:
+            try:
+                self.after_cancel(self._resize_job)
+            except tk.TclError:
+                pass
+        self._resize_job = self.after(50, self._reflow_window)
+
+    def _reflow_window(self) -> None:
+        self._resize_job = None
+        mode = layout_mode(self.winfo_width())
+        if mode == self._layout_mode and mode != "split":
+            return
+        if mode != self._layout_mode:
+            self._layout_mode = mode
+            if mode == "split":
+                self.paned.configure(orient=tk.HORIZONTAL)
+                self.paned.paneconfigure(self.config_card, minsize=380, stretch="always")
+                self.paned.paneconfigure(self.log_card, minsize=500, stretch="always")
+            else:
+                self.paned.configure(orient=tk.VERTICAL)
+                self.paned.paneconfigure(self.config_card, minsize=260, stretch="always")
+                self.paned.paneconfigure(self.log_card, minsize=300, stretch="always")
+        if mode == "split" and not self._sash_dragging:
+            self._apply_split_ratio()
 
     def _apply_split_ratio(self) -> None:
         if self._layout_mode != "split" or not self.paned.winfo_ismapped():
@@ -251,11 +316,14 @@ class App(tk.Tk):
             return
         ratio = clamp_split_ratio(self._split_ratio)
         left = int(width * ratio)
-        left = max(300, min(width - 420, left))
+        left = max(380, min(width - 500, left))
         try:
+            self._applying_sash = True
             self.paned.sash_place(0, left, 0)
         except tk.TclError:
             pass
+        finally:
+            self._applying_sash = False
 
     def _on_sash_release(self, _event: tk.Event[tk.Misc]) -> None:
         if self._layout_mode != "split":
