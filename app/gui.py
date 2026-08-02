@@ -12,6 +12,8 @@ from tkinter import filedialog, messagebox, ttk
 from .automation import BrowserNotFoundError, ensure_browser, run_job
 from .config import AppConfig
 from .credentials import delete_password, get_password, set_password
+from .design_system import (FONT_FAMILY, FONT_MONO, FONT_FALLBACK, PillButton, RoundedCard, StatusBadge,
+                            TOKENS, FormField, layout_mode)
 from . import __version__
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
@@ -20,15 +22,15 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("一口轻食 - 订单处理")
-        self.geometry("980x700")
-        self.minsize(820, 600)
+        self.geometry("1080x720")
+        self.minsize(820, 620)
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self._closing = False
         self._log_lines: list[str] = []
         self._search_var = tk.StringVar()
-        self.configure(bg="#f4f7fb")
+        self.configure(bg=TOKENS.canvas)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._build_widgets()
         self._load_saved_values()
@@ -41,79 +43,182 @@ class App(tk.Tk):
             style.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure("App.TFrame", background="#f4f7fb")
-        style.configure("Card.TFrame", background="#ffffff")
-        style.configure("Title.TLabel", background="#f4f7fb", foreground="#17324d", font=("Segoe UI", 22, "bold"))
-        style.configure("Subtitle.TLabel", background="#f4f7fb", foreground="#60758a", font=("Segoe UI", 10))
-        style.configure("Section.TLabel", background="#ffffff", foreground="#17324d", font=("Segoe UI", 12, "bold"))
-        style.configure("Field.TLabel", background="#ffffff", foreground="#425466", font=("Segoe UI", 10, "bold"))
-        style.configure("TEntry", padding=8, fieldbackground="#fbfcfe")
-        style.configure("TSpinbox", padding=6)
-        style.configure("TButton", padding=(12, 7), font=("Segoe UI", 10))
-        style.configure("Primary.TButton", background="#1677d2", foreground="#ffffff", padding=(18, 8), font=("Segoe UI", 10, "bold"))
-        style.map("Primary.TButton", background=[("active", "#0f5eaa"), ("disabled", "#a8bdd3")])
-        style.configure("Danger.TButton", foreground="#b42318")
+        style.configure("TProgressbar", troughcolor=TOKENS.ceramic, background=TOKENS.accent,
+                        bordercolor=TOKENS.ceramic, lightcolor=TOKENS.accent, darkcolor=TOKENS.accent)
 
-        outer = ttk.Frame(self, style="App.TFrame", padding=(28, 24))
+        outer = tk.Frame(self, bg=TOKENS.canvas)
         outer.pack(fill="both", expand=True)
+        outer.rowconfigure(1, weight=1)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(2, weight=1)
-        ttk.Label(outer, text="一口轻食", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(outer, text="订单自动处理中心  |  配置任务并实时查看运行状态", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 18))
 
-        card = ttk.Frame(outer, style="Card.TFrame", padding=20)
-        card.grid(row=2, column=0, sticky="nsew")
-        card.columnconfigure(1, weight=1)
-        card.rowconfigure(9, weight=1)
-        ttk.Label(card, text="任务配置", style="Section.TLabel").grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 14))
-        fields = [("管理网址", "url"), ("手机号 / 账号", "phone"), ("Excel 文件", "excel")]
-        self.vars: dict[str, tk.StringVar] = {key: tk.StringVar() for _, key in fields}
-        for row, (label, key) in enumerate(fields, start=1):
-            ttk.Label(card, text=label, style="Field.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 14), pady=6)
-            ttk.Entry(card, textvariable=self.vars[key]).grid(row=row, column=1, sticky="ew", pady=6)
-            if key == "excel":
-                ttk.Button(card, text="选择文件", command=self._choose_excel).grid(row=row, column=2, padx=(10, 0), pady=6)
-        ttk.Label(card, text="登录密码", style="Field.TLabel").grid(row=4, column=0, sticky="w", padx=(0, 14), pady=6)
+        header = tk.Frame(outer, bg=TOKENS.house, height=104)
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_propagate(False)
+        header.columnconfigure(0, weight=1)
+        header_inner = tk.Frame(header, bg=TOKENS.house)
+        header_inner.grid(row=0, column=0, sticky="nsew", padx=TOKENS.space_6, pady=TOKENS.space_4)
+        header_inner.columnconfigure(0, weight=1)
+        tk.Label(header_inner, text="一口轻食", bg=TOKENS.house, fg=TOKENS.text_on_dark,
+                 font=(FONT_FAMILY, 24, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(header_inner, text="订单自动处理中心  ·  配置任务并实时查看运行状态",
+                 bg=TOKENS.house, fg=TOKENS.text_on_dark_soft, font=(FONT_FAMILY, 10),
+                 anchor="w").grid(row=1, column=0, sticky="w", pady=(TOKENS.space_1, 0))
+        tk.Label(header_inner, text=f"版本 {__version__}", bg=TOKENS.uplift, fg=TOKENS.text_on_dark,
+                 font=(FONT_FAMILY, 9, "bold"), padx=12, pady=5).grid(row=0, column=1, rowspan=2, sticky="e")
+
+        self.content = tk.Frame(outer, bg=TOKENS.canvas, padx=TOKENS.space_6, pady=TOKENS.space_5)
+        self.content.grid(row=1, column=0, sticky="nsew")
+        self.content.columnconfigure(0, weight=1)
+        self.content.columnconfigure(1, weight=1)
+        self.content.rowconfigure(0, weight=1)
+
+        self.config_card = RoundedCard(self.content, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self.log_card = RoundedCard(self.content, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        self._build_config_card()
+        self._build_log_card()
+        self._layout_mode = ""
+        self.bind("<Configure>", self._on_resize)
+        self.after_idle(self._on_resize)
+
+    def _build_config_card(self) -> None:
+        body = self.config_card.body
+        body.columnconfigure(0, weight=1)
+        tk.Label(body, text="任务配置", bg=TOKENS.surface, fg=TOKENS.primary,
+                 font=(FONT_FAMILY, 20, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(body, text="准备好订单资料后，即可开始自动处理。", bg=TOKENS.surface,
+                 fg=TOKENS.text_soft, font=(FONT_FAMILY, 10), anchor="w").grid(row=1, column=0, sticky="w", pady=(TOKENS.space_1, TOKENS.space_4))
+
+        fields = [("管理网址", "url", "例如：https://example.com/admin"),
+                  ("手机号 / 账号", "phone", "用于登录管理后台"),
+                  ("登录密码", "password", "密码仅保存在系统凭据管理器中")]
+        self.vars: dict[str, tk.StringVar] = {key: tk.StringVar() for _, key, _ in fields if key != "password"}
         self.password = tk.StringVar()
-        ttk.Entry(card, textvariable=self.password, show="*").grid(row=4, column=1, sticky="ew", pady=6)
-        self.remember = tk.BooleanVar(value=True)
-        ttk.Checkbutton(card, text="保存到系统凭据管理器", variable=self.remember).grid(row=4, column=2, padx=(10, 0), sticky="w")
-        ttk.Label(card, text="待处理订单数", style="Field.TLabel").grid(row=5, column=0, sticky="w", padx=(0, 14), pady=6)
+        self.form_fields: dict[str, FormField] = {}
+        for row, (label, key, helper) in enumerate(fields, start=2):
+            variable = self.password if key == "password" else self.vars[key]
+            field = FormField(body, label, variable, show="*" if key == "password" else "", helper=helper)
+            field.grid(row=row, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+            self.form_fields[key] = field
+
+        excel_row = tk.Frame(body, bg=TOKENS.surface)
+        excel_row.grid(row=5, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        excel_row.columnconfigure(0, weight=1)
+        self.vars["excel"] = tk.StringVar()
+        self.form_fields["excel"] = FormField(excel_row, "Excel 文件", self.vars["excel"], helper="支持 .xlsx 和 .xlsm 文件")
+        self.form_fields["excel"].grid(row=0, column=0, sticky="ew")
+        PillButton(excel_row, "选择文件", self._choose_excel, variant="outline", width=112,
+                   bg=TOKENS.surface).grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+
+        order_row = tk.Frame(body, bg=TOKENS.surface)
+        order_row.grid(row=6, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        order_row.columnconfigure(0, weight=1)
+        tk.Label(order_row, text="待处理订单数", bg=TOKENS.surface, fg=TOKENS.text,
+                 font=(FONT_FAMILY, 10, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
         self.order_count = tk.StringVar(value="1")
-        ttk.Spinbox(card, from_=1, to=9999, textvariable=self.order_count, width=10).grid(row=5, column=1, sticky="w", pady=6)
+        self.order_spinbox = tk.Spinbox(order_row, from_=1, to=9999, textvariable=self.order_count,
+                                        width=7, relief="flat", bd=0, bg=TOKENS.surface_muted,
+                                        fg=TOKENS.text, buttonbackground=TOKENS.ceramic,
+                                        font=(FONT_FAMILY, 11), highlightthickness=1,
+                                        highlightbackground=TOKENS.border, highlightcolor=TOKENS.focus)
+        self.order_spinbox.grid(row=0, column=1, sticky="e", ipady=6)
+        self.order_error = tk.Label(body, text="", bg=TOKENS.surface, fg=TOKENS.error,
+                                    font=(FONT_FAMILY, 9), anchor="w")
+        self.order_error.grid(row=7, column=0, sticky="ew")
 
-        buttons = ttk.Frame(card, style="Card.TFrame")
-        buttons.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(14, 12))
-        self.start_button = ttk.Button(buttons, text="开始处理", style="Primary.TButton", command=self.start)
-        self.start_button.pack(side="left", padx=(0, 8))
-        self.stop_button = ttk.Button(buttons, text="停止", style="Danger.TButton", command=self.stop, state="disabled")
-        self.stop_button.pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="安装 / 检查浏览器", command=self.install_browser).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="清除已保存密码", command=self.clear_password).pack(side="left")
-        ttk.Button(buttons, text="检查更新", command=lambda: self.check_for_updates(manual=True)).pack(side="left", padx=(8, 0))
-        self.status = tk.StringVar(value="就绪")
-        ttk.Label(buttons, textvariable=self.status, foreground="#60758a", background="#ffffff").pack(side="right")
+        remember_row = tk.Frame(body, bg=TOKENS.surface)
+        remember_row.grid(row=8, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        self.remember = tk.BooleanVar(value=True)
+        tk.Checkbutton(remember_row, text="保存到系统凭据管理器", variable=self.remember,
+                       bg=TOKENS.surface, fg=TOKENS.text_soft, activebackground=TOKENS.surface,
+                       selectcolor=TOKENS.green_light, font=(FONT_FAMILY, 10), anchor="w",
+                       highlightthickness=0).pack(side="left")
 
-        search = ttk.Frame(card, style="Card.TFrame")
-        search.grid(row=7, column=0, columnspan=3, sticky="ew", pady=(4, 4))
-        search.columnconfigure(1, weight=1)
-        ttk.Label(search, text="搜索运行日志", style="Field.TLabel").grid(row=0, column=0, padx=(0, 8))
-        search_entry = ttk.Entry(search, textvariable=self._search_var)
-        search_entry.grid(row=0, column=1, sticky="ew")
+        actions = tk.Frame(body, bg=TOKENS.surface)
+        actions.grid(row=9, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self.start_button = PillButton(actions, "开始处理", self.start, variant="primary")
+        self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        self.stop_button = PillButton(actions, "停止", self.stop, variant="danger")
+        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
+        self.stop_button.set_state("disabled")
+
+        tools = tk.Frame(body, bg=TOKENS.surface)
+        tools.grid(row=10, column=0, sticky="ew")
+        for column in range(3):
+            tools.columnconfigure(column, weight=1)
+        PillButton(tools, "检查浏览器", self.install_browser, variant="outline").grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        PillButton(tools, "清除密码", self.clear_password, variant="outline").grid(row=0, column=1, sticky="ew", padx=TOKENS.space_1)
+        PillButton(tools, "检查更新", lambda: self.check_for_updates(manual=True), variant="outline").grid(row=0, column=2, sticky="ew", padx=(TOKENS.space_1, 0))
+
+    def _build_log_card(self) -> None:
+        body = self.log_card.body
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(4, weight=1)
+        top = tk.Frame(body, bg=TOKENS.surface)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        tk.Label(top, text="运行日志", bg=TOKENS.surface, fg=TOKENS.primary,
+                 font=(FONT_FAMILY, 20, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
+        self.status_badge = StatusBadge(top, state="ready", bg=TOKENS.surface)
+        self.status_badge.grid(row=0, column=1, sticky="e")
+        tk.Label(body, text="实时记录订单处理、浏览器检查和更新状态。", bg=TOKENS.surface,
+                 fg=TOKENS.text_soft, font=(FONT_FAMILY, 10), anchor="w").grid(row=1, column=0, sticky="w", pady=(TOKENS.space_1, TOKENS.space_3))
+
+        search = tk.Frame(body, bg=TOKENS.surface)
+        search.grid(row=2, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        search.columnconfigure(0, weight=1)
+        search_shell = tk.Frame(search, bg=TOKENS.border)
+        search_shell.grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_2))
+        search_entry = tk.Entry(search_shell, textvariable=self._search_var, relief="flat", bd=0,
+                                bg=TOKENS.surface_muted, fg=TOKENS.text, insertbackground=TOKENS.primary,
+                                font=(FONT_FAMILY, 10), highlightthickness=0)
+        search_entry.pack(fill="both", expand=True, padx=1, pady=1, ipady=7)
         search_entry.bind("<Return>", lambda _event: self.search_log())
-        ttk.Button(search, text="搜索", command=self.search_log).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(search, text="清除", command=self.clear_log_search).grid(row=0, column=3, padx=(8, 0))
+        search.columnconfigure(0, weight=1)
+        actions = tk.Frame(search, bg=TOKENS.surface)
+        actions.grid(row=0, column=1, sticky="e")
+        PillButton(actions, "搜索", self.search_log, variant="primary", width=76).pack(side="left", padx=(0, TOKENS.space_1))
+        PillButton(actions, "清除", self.clear_log_search, variant="outline", width=76).pack(side="left")
 
-        ttk.Label(card, text="运行日志", style="Section.TLabel").grid(row=8, column=0, columnspan=3, sticky="w", pady=(12, 6))
-        log_frame = ttk.Frame(card, style="Card.TFrame")
-        log_frame.grid(row=9, column=0, columnspan=3, sticky="nsew")
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log = tk.Text(log_frame, height=12, state="disabled", wrap="word", bg="#172333", fg="#d8e6f3", insertbackground="#ffffff", relief="flat", padx=12, pady=10, font=("Consolas", 10))
+        log_shell = tk.Frame(body, bg=TOKENS.house, bd=0, highlightthickness=0)
+        log_shell.grid(row=4, column=0, sticky="nsew")
+        log_shell.columnconfigure(0, weight=1)
+        log_shell.rowconfigure(0, weight=1)
+        self.log = tk.Text(log_shell, height=18, state="disabled", wrap="word", bg=TOKENS.house,
+                           fg=TOKENS.text_on_dark, insertbackground=TOKENS.text_on_dark,
+                           selectbackground=TOKENS.uplift, relief="flat", bd=0, padx=14, pady=14,
+                           font=FONT_MONO, spacing1=2, spacing3=2)
         self.log.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        scrollbar = tk.Scrollbar(log_shell, orient="vertical", command=self.log.yview,
+                                 bg=TOKENS.uplift, troughcolor=TOKENS.house,
+                                 activebackground=TOKENS.green_light, relief="flat", bd=0)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.log.configure(yscrollcommand=scrollbar.set)
+
+    def _on_resize(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        mode = layout_mode(self.winfo_width())
+        if mode == self._layout_mode:
+            return
+        self._layout_mode = mode
+        self.config_card.grid_forget()
+        self.log_card.grid_forget()
+        if mode == "split":
+            self.content.columnconfigure(0, weight=5)
+            self.content.columnconfigure(1, weight=7)
+            self.content.rowconfigure(0, weight=1)
+            self.config_card.grid(row=0, column=0, sticky="nsew", padx=(0, TOKENS.space_2))
+            self.log_card.grid(row=0, column=1, sticky="nsew", padx=(TOKENS.space_2, 0))
+        else:
+            self.content.columnconfigure(0, weight=1)
+            self.content.columnconfigure(1, weight=0)
+            self.content.rowconfigure(0, weight=0)
+            self.content.rowconfigure(1, weight=1)
+            self.config_card.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, TOKENS.space_3))
+            self.log_card.grid(row=1, column=0, columnspan=2, sticky="nsew")
+
+    def _set_status(self, state: str) -> None:
+        self.status_badge.set(state)
 
     def _load_saved_values(self) -> None:
         config = AppConfig.load()
@@ -121,11 +226,18 @@ class App(tk.Tk):
         self.vars["phone"].set(config.phone_number)
         self.vars["excel"].set(str(config.excel_path) if config.excel_path else "")
         self.password.set(get_password(config.phone_number) or "")
+        if config.excel_path and config.excel_path.is_file():
+            self.form_fields["excel"].set_state("valid")
 
     def _choose_excel(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
         if path:
             self.vars["excel"].set(path)
+            selected = AppConfig(excel_path=path).excel_path
+            if selected and selected.is_file() and selected.suffix.lower() in {".xlsx", ".xlsm"}:
+                self.form_fields["excel"].set_state("valid", "文件已选择")
+            else:
+                self.form_fields["excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
 
     def _config(self) -> AppConfig:
         try:
@@ -136,6 +248,51 @@ class App(tk.Tk):
             raise ValueError("待处理订单数必须是大于等于 1 的整数") from exc
         return AppConfig(target_url=self.vars["url"].get().strip(), phone_number=self.vars["phone"].get().strip(),
                          excel_path=self.vars["excel"].get().strip(), browser_mode="auto")
+
+    def _validate_form(self) -> tuple[AppConfig, int] | None:
+        """Validate inputs and render semantic field states before starting."""
+        for field in self.form_fields.values():
+            field.set_state("neutral")
+        self.order_error.configure(text="")
+        try:
+            config = self._config()
+            count = int(self.order_count.get())
+            if count < 1:
+                raise ValueError
+        except ValueError:
+            self.order_error.configure(text="请输入大于等于 1 的整数", fg=TOKENS.error)
+            self.order_spinbox.configure(highlightbackground=TOKENS.error, highlightcolor=TOKENS.error)
+            return None
+
+        valid = True
+        if not config.url:
+            self.form_fields["url"].set_state("invalid", "请输入管理网址")
+            valid = False
+        else:
+            self.form_fields["url"].set_state("valid")
+        if not config.phone:
+            self.form_fields["phone"].set_state("invalid", "请输入手机号或账号")
+            valid = False
+        else:
+            self.form_fields["phone"].set_state("valid")
+        if not self.password.get():
+            self.form_fields["password"].set_state("invalid", "请输入登录密码")
+            valid = False
+        else:
+            self.form_fields["password"].set_state("valid")
+        if not config.excel_path or not config.excel_path.is_file():
+            self.form_fields["excel"].set_state("invalid", "请选择存在的 Excel 文件")
+            valid = False
+        elif config.excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            self.form_fields["excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
+            valid = False
+        else:
+            self.form_fields["excel"].set_state("valid", "文件已准备")
+        if not valid:
+            self._set_status("error")
+            return None
+        self.order_spinbox.configure(highlightbackground=TOKENS.border, highlightcolor=TOKENS.focus)
+        return config, count
 
     def _append(self, text: str) -> None:
         self._log_lines.append(text.rstrip())
@@ -175,19 +332,22 @@ class App(tk.Tk):
                     self._append(value)
                 elif kind == "done":
                     self._append(value)
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
+                    self.start_button.set_state("normal")
+                    self.stop_button.set_state("disabled")
+                    self._set_status("success")
                     self.worker = None
                 elif kind == "error":
                     self._append("错误: " + value)
                     messagebox.showerror("处理失败", value)
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
+                    self.start_button.set_state("normal")
+                    self.stop_button.set_state("disabled")
+                    self._set_status("error")
                     self.worker = None
                 elif kind == "browser_missing":
                     self._append(value)
-                    self.start_button.configure(state="normal")
-                    self.stop_button.configure(state="disabled")
+                    self.start_button.set_state("normal")
+                    self.stop_button.set_state("disabled")
+                    self._set_status("error")
                     self.worker = None
                     self.choose_browser_download()
                 elif kind == "update":
@@ -203,9 +363,11 @@ class App(tk.Tk):
                             elif release.html_url:
                                 webbrowser.open(release.html_url)
                 elif kind == "update_latest":
+                    self._set_status("ready")
                     messagebox.showinfo("检查更新", f"当前已是最新版本（{__version__}）。")
                 elif kind == "update_error":
                     self._append("检查更新失败：" + value)
+                    self._set_status("error")
                 elif kind == "update_progress":
                     downloaded, total = value
                     self._set_update_progress(downloaded, total)
@@ -213,8 +375,10 @@ class App(tk.Tk):
                     self._close_update_progress()
                     self._append("更新失败：" + value)
                     messagebox.showerror("更新失败", value)
+                    self._set_status("error")
                 elif kind == "update_installed":
                     self._append(value)
+                    self._set_status("success")
                     self._set_update_progress(1, 1)
                     messagebox.showinfo("更新完成", "更新已下载，点击确定后程序将关闭并自动重启。")
                     self._closing = True
@@ -244,24 +408,17 @@ class App(tk.Tk):
             self.destroy()
 
     def start(self) -> None:
-        try:
-            config = self._config()
-            count = int(self.order_count.get())
-            if not config.excel_path or not config.excel_path.is_file():
-                raise ValueError("Excel 文件不存在，请重新选择")
-            if config.excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
-                raise ValueError("请选择 .xlsx 或 .xlsm Excel 文件")
-            if not config.url or not config.phone or not self.password.get():
-                raise ValueError("请填写网址、账号和密码")
-        except ValueError as exc:
-            messagebox.showwarning("配置不完整", str(exc))
+        validated = self._validate_form()
+        if validated is None:
             return
+        config, count = validated
         config.save()
         if self.remember.get():
             set_password(config.phone_number, self.password.get())
         self.stop_event.clear()
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
+        self.start_button.set_state("disabled")
+        self.stop_button.set_state("normal")
+        self._set_status("running")
         self._append("开始处理订单...")
         self.worker = threading.Thread(target=self._run, args=(config, count, self.password.get()), daemon=True)
         self.worker.start()
@@ -283,6 +440,7 @@ class App(tk.Tk):
         action = messagebox.askyesnocancel("暂停处理", "是否停止当前任务？点击“是”停止，点击“否”继续处理，点击“取消”返回。")
         if action:
             self.stop_event.set()
+            self._set_status("stopping")
             self._append("已请求停止，正在等待浏览器操作结束...")
 
     def _order_decision(self, code: str, error: str) -> str:
@@ -305,6 +463,7 @@ class App(tk.Tk):
         return result.get()
 
     def install_browser(self) -> None:
+        self._set_status("updating")
         self._append("正在检查浏览器...")
         threading.Thread(target=self._install_browser_worker, daemon=True).start()
 
@@ -323,6 +482,7 @@ class App(tk.Tk):
         if getattr(self, "_update_checking", False):
             return
         self._update_checking = True
+        self._set_status("updating")
         self._append("正在检查更新...")
         threading.Thread(target=self._check_updates_worker, args=(manual,), daemon=True).start()
 
@@ -358,19 +518,25 @@ class App(tk.Tk):
         dialog = tk.Toplevel(self)
         self._update_progress_window = dialog
         dialog.title("正在更新")
-        dialog.geometry("480x170")
+        dialog.geometry("520x210")
         dialog.resizable(False, False)
+        dialog.configure(bg=TOKENS.canvas)
         dialog.transient(self)
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
-        content = ttk.Frame(dialog, padding=22)
-        content.pack(fill="both", expand=True)
-        ttk.Label(content, text=f"正在下载一口轻食 {release.tag_name}", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        card = RoundedCard(dialog, parent_bg=TOKENS.canvas, padding=TOKENS.space_4)
+        card.pack(fill="both", expand=True, padx=TOKENS.space_3, pady=TOKENS.space_3)
+        content = card.body
+        content.columnconfigure(0, weight=1)
+        tk.Label(content, text=f"正在下载一口轻食 {release.tag_name}", bg=TOKENS.surface,
+                 fg=TOKENS.primary, font=(FONT_FAMILY, 16, "bold"), anchor="w").pack(anchor="w")
         self._update_progress_text = tk.StringVar(value="正在连接 GitHub...")
-        ttk.Label(content, textvariable=self._update_progress_text).pack(anchor="w", pady=(8, 8))
+        tk.Label(content, textvariable=self._update_progress_text, bg=TOKENS.surface,
+                 fg=TOKENS.text_soft, font=(FONT_FAMILY, 10), anchor="w").pack(anchor="w", pady=(TOKENS.space_2, TOKENS.space_2))
         self._update_progressbar = ttk.Progressbar(content, maximum=100, mode="indeterminate")
         self._update_progressbar.pack(fill="x")
         self._update_progressbar.start(12)
-        ttk.Label(content, text="下载完成后程序会自动关闭、替换并重新启动。", foreground="#60758a").pack(anchor="w", pady=(10, 0))
+        tk.Label(content, text="下载完成后程序会自动关闭、替换并重新启动。", bg=TOKENS.surface,
+                 fg=TOKENS.text_soft, font=(FONT_FAMILY, 9), anchor="w").pack(anchor="w", pady=(TOKENS.space_2, 0))
         dialog.grab_set()
 
     def _set_update_progress(self, downloaded: int, total: int | None) -> None:
