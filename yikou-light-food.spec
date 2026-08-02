@@ -34,7 +34,12 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX-packed PyInstaller bootloaders are frequently classified as
+    # heuristic malware by Windows Defender and browser download filters.
+    # Keep the portable one-file executable uncompressed; this is larger but
+    # materially safer for end users and can still be Authenticode-signed in
+    # the release workflow when a certificate is configured.
+    upx=False,
     console=False,
     manifest=str(project / "windows-app.manifest"),
 )
