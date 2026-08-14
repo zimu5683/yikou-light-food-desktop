@@ -31,9 +31,11 @@ REPOSITORY = "zimu5683/yikou-light-food-desktop"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/latest.json"
 # GitHub 直连在国内经常不可达，检查更新与下载都依次尝试：直连 → 国内加速镜像。
+# 前缀只到镜像域名，候选 = 前缀 + 完整 GitHub URL（ghproxy 类服务要求保持原路径）。
 GITHUB_MIRROR_PREFIXES = (
-    "https://ghfast.top/https://github.com/",
-    "https://gh-proxy.com/https://github.com/",
+    "https://ghproxy.net/",
+    "https://gh-proxy.com/",
+    "https://ghfast.top/",
 )
 TRUSTED_DOWNLOAD_HOSTS = {
     "github.com",
@@ -299,14 +301,18 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
 
 
 def _fetch_json(url: str, *, timeout: float, opener: Callable[..., Any]) -> Any:
+    """按 [直连, 镜像1, 镜像2...] 依次尝试；每个源内部重试 1 次，抵御网络瞬断。"""
     last_error: Exception | None = None
     for candidate in _github_url_candidates(url):
-        request = Request(candidate, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
-        try:
-            with opener(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except Exception as exc:
-            last_error = exc
+        for attempt in range(2):
+            request = Request(candidate, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
+            try:
+                with opener(request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    time.sleep(0.4)
     if len(_github_url_candidates(url)) == 1:
         # 没有镜像可回退时保持原始异常，与旧行为一致。
         assert last_error is not None
