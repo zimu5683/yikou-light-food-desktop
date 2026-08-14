@@ -574,7 +574,6 @@ def _download_and_apply_patch(
     stage_callback: Callable[[str], None] | None,
 ) -> Path:
     """下载差分补丁，用本地 exe 还原出完整新版，校验后替换并重启。"""
-    open_func = opener or urlopen
     patch_file = target.with_name(f".{target.stem}.patch-{os.getpid()}.tmp")
     temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
     try:
@@ -702,7 +701,7 @@ def _download_and_install_macos(
         if stage_callback:
             stage_callback("校验安装包")
         checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-        with open_func(checksum_request, timeout=timeout) as response:
+        with (opener or urlopen)(checksum_request, timeout=timeout) as response:
             expected_hash = response.read().decode("ascii").strip().split()[0].lower()
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid SHA-256")
