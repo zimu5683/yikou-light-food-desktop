@@ -30,6 +30,11 @@ from . import bspatch
 REPOSITORY = "zimu5683/yikou-light-food-desktop"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/latest.json"
+# GitHub 直连在国内经常不可达，检查更新与下载都依次尝试：直连 → 国内加速镜像。
+GITHUB_MIRROR_PREFIXES = (
+    "https://ghfast.top/https://github.com/",
+    "https://gh-proxy.com/https://github.com/",
+)
 TRUSTED_DOWNLOAD_HOSTS = {
     "github.com",
     "objects.githubusercontent.com",
@@ -123,6 +128,13 @@ def safe_asset_name(name: str) -> bool:
 def _trusted_url(value: str) -> bool:
     parsed = urlparse(str(value or ""))
     return parsed.scheme == "https" and (parsed.hostname or "").lower() in TRUSTED_DOWNLOAD_HOSTS
+
+
+def _github_url_candidates(url: str) -> list[str]:
+    """返回 [直连, 镜像1, 镜像2...]，镜像只对 github.com 的 URL 生效。"""
+    if url.startswith("https://github.com/"):
+        return [url] + [f"{prefix}{url}" for prefix in GITHUB_MIRROR_PREFIXES]
+    return [url]
 
 
 def _asset_url(asset: dict[str, Any] | None) -> str:
@@ -287,9 +299,20 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
 
 
 def _fetch_json(url: str, *, timeout: float, opener: Callable[..., Any]) -> Any:
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
-    with opener(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+    last_error: Exception | None = None
+    for candidate in _github_url_candidates(url):
+        request = Request(candidate, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
+        try:
+            with opener(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except Exception as exc:
+            last_error = exc
+    if len(_github_url_candidates(url)) == 1:
+        # 没有镜像可回退时保持原始异常，与旧行为一致。
+        assert last_error is not None
+        raise last_error
+    assert last_error is not None
+    raise UpdateError(f"Unable to fetch update metadata: {last_error}") from last_error
 
 
 def check_for_update(
@@ -372,38 +395,27 @@ def download_and_install(
     except OSError as exc:
         raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
     temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
-    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
     if stage_callback:
         stage_callback("下载更新")
-    try:
-        with (opener or urlopen)(request, timeout=timeout) as response, temporary.open("wb") as output:
-            content_length = None
-            headers = getattr(response, "headers", None)
-            if headers is not None:
-                try:
-                    content_length = int(headers.get("Content-Length") or 0) or None
-                except (TypeError, ValueError):
-                    content_length = None
-            if content_length and content_length > MAX_UPDATE_SIZE:
-                raise UpdateError("更新资源大小异常")
-            downloaded = 0
-            if progress_callback:
-                progress_callback(downloaded, content_length)
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback:
-                    progress_callback(downloaded, content_length)
-            if expected_size and downloaded != expected_size:
-                raise UpdateError("下载文件大小与清单不一致")
-            if downloaded > MAX_UPDATE_SIZE:
-                raise UpdateError("更新资源大小异常")
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+    last_error: Exception | None = None
+    for candidate in _github_url_candidates(url):
         temporary.unlink(missing_ok=True)
-        raise UpdateError(f"Unable to download update: {exc}") from exc
+        try:
+            _stream_download(
+                candidate,
+                temporary,
+                timeout=timeout,
+                opener=opener or urlopen,
+                expected_size=expected_size,
+                progress_callback=progress_callback,
+            )
+            last_error = None
+            break
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+            last_error = exc
+    if last_error is not None:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to download update: {last_error}") from last_error
     if temporary.stat().st_size < 1_000_000:
         temporary.unlink(missing_ok=True)
         raise UpdateError("Downloaded update is unexpectedly small")
@@ -452,6 +464,57 @@ def _sha256_file(path: Path) -> str:
                 break
             digest.update(block)
     return digest.hexdigest()
+
+
+def _stream_download(
+    url: str,
+    destination: Path,
+    *,
+    timeout: float,
+    opener: Callable[..., Any],
+    expected_size: int | None,
+    progress_callback: Callable[[int, int | None], None] | None,
+) -> None:
+    """把单个 URL 流式下载到 destination；瞬断重试 3 次（退避 0.5s/1s）。"""
+    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            with opener(request, timeout=timeout) as response, destination.open("wb") as output:
+                content_length = None
+                headers = getattr(response, "headers", None)
+                if headers is not None:
+                    try:
+                        content_length = int(headers.get("Content-Length") or 0) or None
+                    except (TypeError, ValueError):
+                        content_length = None
+                if content_length and content_length > MAX_UPDATE_SIZE:
+                    raise UpdateError("更新资源大小异常")
+                downloaded = 0
+                if progress_callback:
+                    progress_callback(downloaded, content_length)
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, content_length)
+                if expected_size and downloaded != expected_size:
+                    raise UpdateError("下载文件大小与清单不一致")
+                if downloaded > MAX_UPDATE_SIZE:
+                    raise UpdateError("更新资源大小异常")
+            return
+        except HTTPError:
+            raise
+        except (URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+            last_error = exc
+            destination.unlink(missing_ok=True)
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
 
 
 def _find_applicable_patch(release: ReleaseInfo, target: Path) -> dict[str, Any] | None:
@@ -516,24 +579,30 @@ def _download_and_apply_patch(
 
     if stage_callback:
         stage_callback("下载差分补丁")
-    request = Request(patch["url"], headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
-    try:
-        with open_func(request, timeout=timeout) as response, patch_file.open("wb") as output:
-            received = 0
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                received += len(chunk)
-                if received > MAX_UPDATE_SIZE:
-                    raise UpdateError("补丁大小异常")
-                if progress_callback:
-                    progress_callback(received, received)
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+    last_error: Exception | None = None
+    for candidate in _github_url_candidates(patch["url"]):
+        patch_file.unlink(missing_ok=True)
+        try:
+            with (opener or urlopen)(Request(candidate, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"}), timeout=timeout) as response, patch_file.open("wb") as output:
+                received = 0
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    output.write(chunk)
+                    received += len(chunk)
+                    if received > MAX_UPDATE_SIZE:
+                        raise UpdateError("补丁大小异常")
+                    if progress_callback:
+                        progress_callback(received, received)
+            last_error = None
+            break
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+            last_error = exc
+    if last_error is not None:
         patch_file.unlink(missing_ok=True)
         temporary.unlink(missing_ok=True)
-        raise UpdateError(f"Unable to download patch: {exc}") from exc
+        raise UpdateError(f"Unable to download patch: {last_error}") from last_error
 
     try:
         if hashlib.sha256(patch_file.read_bytes()).hexdigest() != patch["sha256"]:
@@ -596,53 +665,27 @@ def _download_and_install_macos(
 
     workdir = Path(tempfile.mkdtemp(prefix="yikou-light-food-update-"))
     archive = workdir / asset_name
-    open_func = opener or urlopen
-    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
     if stage_callback:
         stage_callback("下载更新")
-    try:
-        response = None
-        last_exc: Exception | None = None
-        for attempt in range(3):
-            try:
-                response = open_func(request, timeout=timeout)
-                break
-            except HTTPError:
-                raise
-            except (URLError, TimeoutError, OSError) as exc:
-                last_exc = exc
-                response = None
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-        if response is None:
-            assert last_exc is not None
-            raise last_exc
-        with response, archive.open("wb") as output:
-            content_length = None
-            headers = getattr(response, "headers", None)
-            if headers is not None:
-                try:
-                    content_length = int(headers.get("Content-Length") or 0) or None
-                except (TypeError, ValueError):
-                    content_length = None
-            if content_length and content_length > MAX_UPDATE_SIZE:
-                raise UpdateError("更新资源大小异常")
-            downloaded = 0
-            if progress_callback:
-                progress_callback(downloaded, content_length)
-            while True:
-                chunk = response.read(1024 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback:
-                    progress_callback(downloaded, content_length)
-            if downloaded > MAX_UPDATE_SIZE:
-                raise UpdateError("更新资源大小异常")
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+    last_error: Exception | None = None
+    for candidate in _github_url_candidates(url):
+        archive.unlink(missing_ok=True)
+        try:
+            _stream_download(
+                candidate,
+                archive,
+                timeout=timeout,
+                opener=opener or urlopen,
+                expected_size=None,
+                progress_callback=progress_callback,
+            )
+            last_error = None
+            break
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+            last_error = exc
+    if last_error is not None:
         shutil.rmtree(workdir, ignore_errors=True)
-        raise UpdateError(f"Unable to download update: {exc}") from exc
+        raise UpdateError(f"Unable to download update: {last_error}") from last_error
 
     checksum_asset = release.macos_checksum_asset
     checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
