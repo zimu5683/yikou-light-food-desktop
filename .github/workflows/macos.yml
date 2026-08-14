@@ -23,6 +23,20 @@ jobs:
           test "v${version}" = "${GITHUB_REF_NAME}"
       - name: Build app
         run: bash scripts/build_macos.sh
+      - name: Smoke-test application imports on macOS
+        run: |
+          python3 -c "import app.main, app.gui, app.automation, app.sss, app.updater, app.design_system; print('imports OK on macOS')"
+      - name: Verify app bundle structure
+        run: |
+          APP="dist/yikou-light-food.app"
+          BIN="$APP/Contents/MacOS/yikou-light-food"
+          test -d "$APP" || { echo "missing .app bundle"; exit 1; }
+          test -f "$APP/Contents/Info.plist" || { echo "missing Info.plist"; exit 1; }
+          test -x "$BIN" || { echo "main binary missing or not executable"; exit 1; }
+          plutil -lint "$APP/Contents/Info.plist"
+          echo "Bundle ID: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Contents/Info.plist")"
+          echo "Architecture:"
+          file "$BIN"
       - name: Archive app
         run: |
           ditto -c -k --sequesterRsrc --keepParent "dist/yikou-light-food.app" "yikou-light-food-macos.zip"
