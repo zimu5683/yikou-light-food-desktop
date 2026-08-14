@@ -59,6 +59,8 @@ def main() -> int:
             "sha256_url": next((other.get("browser_download_url") for other in payload.get("assets", [])
                                 if other.get("name") == f"{name}.sha256"), None),
         })
+
+    patches = _load_patches(payload)
     manifest = {
         "schema_version": 1,
         "version": str(payload.get("tag_name") or tag),
@@ -66,11 +68,40 @@ def main() -> int:
         "body": str(payload.get("body") or ""),
         "assets": assets,
     }
+    if patches:
+        manifest["patches"] = patches
     with open("latest.json", "w", encoding="utf-8", newline="\n") as handle:
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
     subprocess.run(["gh", "release", "upload", tag, "latest.json", "--repo", repository, "--clobber"], check=True)
     return 0
+
+
+def _load_patches(payload: dict) -> list[dict]:
+    """Build the ``patches`` list from dist/patch-meta.json + release assets."""
+    meta_path = os.path.join("dist", "patch-meta.json")
+    if not os.path.isfile(meta_path):
+        return []
+    try:
+        with open(meta_path, encoding="utf-8") as handle:
+            meta = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    name = str(meta.get("name") or "")
+    url_by_name = {
+        str(item.get("name")): item.get("browser_download_url")
+        for item in payload.get("assets", []) if isinstance(item, dict)
+    }
+    url = url_by_name.get(name)
+    if not name or not url:
+        return []
+    return [{
+        "name": name,
+        "url": url,
+        "sha256": str(meta.get("sha256") or "").strip().lower(),
+        "from_sha256": str(meta.get("from_sha256") or "").strip().lower(),
+        "target_sha256": str(meta.get("target_sha256") or "").strip().lower(),
+    }]
 
 
 if __name__ == "__main__":

@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import re
 import os
+import shlex
 import hashlib
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from typing import Any, Callable
 from pathlib import Path
@@ -23,6 +25,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from . import __version__
+from . import bspatch
 
 REPOSITORY = "zimu5683/yikou-light-food-desktop"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -47,6 +50,7 @@ class ReleaseInfo:
     body: str
     html_url: str
     assets: tuple[dict[str, Any], ...] = ()
+    patches: tuple[dict[str, Any], ...] = ()
     manifest_source: str = "api"
     manifest_url: str = ""
 
@@ -83,6 +87,27 @@ class ReleaseInfo:
             return size if size and size > 0 else None
         except (TypeError, ValueError):
             return None
+
+    @property
+    def macos_asset(self) -> dict[str, Any] | None:
+        """Return the macOS ``.app`` archive attached to this release."""
+        for asset in self.assets:
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food-macos.zip" and safe_asset_name(name):
+                return asset
+        return None
+
+    @property
+    def macos_checksum_asset(self) -> dict[str, Any] | None:
+        for asset in self.assets:
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food-macos.zip.sha256" and safe_asset_name(name):
+                return asset
+        archive = self.macos_asset
+        checksum_url = str((archive or {}).get("sha256_url") or "")
+        if checksum_url:
+            return {"name": "yikou-light-food-macos.zip.sha256", "browser_download_url": checksum_url}
+        return None
 
 
 def safe_asset_name(name: str) -> bool:
@@ -187,8 +212,40 @@ def _decode_release(payload: Any) -> ReleaseInfo:
         body=str(payload.get("body") or "").strip(),
         html_url=str(payload.get("html_url") or ""),
         assets=tuple(normalized_assets),
+        patches=(),
         manifest_source="api",
     )
+
+
+def _decode_patches(payload: Any) -> tuple[dict[str, Any], ...]:
+    """解析 latest.json 里的差分补丁清单，过滤掉不完整或不受信任的条目。"""
+    raw_patches = payload.get("patches") or []
+    if not isinstance(raw_patches, list):
+        return ()
+    patches: list[dict[str, Any]] = []
+    for item in raw_patches:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "")
+        url = str(item.get("url") or item.get("browser_download_url") or "")
+        patch_sha = str(item.get("sha256") or "").strip().lower()
+        from_sha = str(item.get("from_sha256") or "").strip().lower()
+        target_sha = str(item.get("target_sha256") or "").strip().lower()
+        if (
+            safe_asset_name(name)
+            and _trusted_url(url)
+            and re.fullmatch(r"[0-9a-f]{64}", patch_sha)
+            and re.fullmatch(r"[0-9a-f]{64}", from_sha)
+            and re.fullmatch(r"[0-9a-f]{64}", target_sha)
+        ):
+            patches.append({
+                "name": name,
+                "url": url,
+                "sha256": patch_sha,
+                "from_sha256": from_sha,
+                "target_sha256": target_sha,
+            })
+    return tuple(patches)
 
 
 def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> ReleaseInfo:
@@ -216,12 +273,14 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
         if item.get("sha256_url"):
             copied["sha256_url"] = item["sha256_url"]
         assets.append(copied)
+    patches = _decode_patches(payload)
     return ReleaseInfo(
         tag_name=version if version.lower().startswith("v") else f"v{version}",
         name=str(payload.get("name") or version),
         body=str(payload.get("body") or payload.get("release_summary") or payload.get("notes") or "").strip(),
         html_url=str(payload.get("url") or payload.get("html_url") or ""),
         assets=tuple(assets),
+        patches=patches,
         manifest_source="manifest",
         manifest_url=source_url,
     )
@@ -269,9 +328,18 @@ def download_and_install(
 
     Windows locks the running executable, so a short-lived command script does
     the final move and relaunches the updated file after the GUI closes.
+    macOS replaces the whole ``.app`` bundle instead.
     """
+    if sys.platform == "darwin":
+        return _download_and_install_macos(
+            release,
+            timeout=timeout,
+            opener=opener,
+            progress_callback=progress_callback,
+            stage_callback=stage_callback,
+        )
     if os.name != "nt":
-        raise UpdateError("Automatic installation is currently supported on Windows only")
+        raise UpdateError("Automatic installation is currently supported on Windows and macOS only")
     if current_executable is None and not getattr(sys, "frozen", False):
         # In source mode sys.executable is python.exe.  Replacing it would
         # corrupt the user's Python installation.
@@ -286,6 +354,14 @@ def download_and_install(
         raise UpdateError("Automatic installation is only available from the packaged exe")
     if not target.parent.exists() or not os.access(target.parent, os.W_OK):
         raise UpdateError("安装目录不可写，请将程序移动到可写目录后重试")
+    # 优先走差分更新：只下载很小的补丁，用本地 exe 还原出完整新版。
+    patch = _find_applicable_patch(release, target)
+    if patch is not None:
+        return _download_and_apply_patch(
+            release, patch, target,
+            timeout=timeout, opener=opener,
+            progress_callback=progress_callback, stage_callback=stage_callback,
+        )
     expected_size = release.executable_size
     if expected_size and expected_size > MAX_UPDATE_SIZE:
         raise UpdateError("更新资源大小异常")
@@ -363,6 +439,40 @@ def download_and_install(
     # that copy waits for this process to exit, atomically replaces the old
     # executable, and starts the installed copy.  This avoids PowerShell and
     # works with Chinese paths.
+    return _schedule_windows_replacement(temporary, target, stage_callback)
+
+
+def _sha256_file(path: Path) -> str:
+    """流式计算文件的 SHA-256，避免一次性读入内存。"""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _find_applicable_patch(release: ReleaseInfo, target: Path) -> dict[str, Any] | None:
+    """按本地 exe 的实际 SHA-256 匹配补丁；不匹配则返回 None（回退全量下载）。"""
+    if not release.patches:
+        return None
+    if not target.is_file():
+        return None
+    local_sha = _sha256_file(target)
+    for patch in release.patches:
+        if patch["from_sha256"] == local_sha:
+            return patch
+    return None
+
+
+def _schedule_windows_replacement(
+    temporary: Path,
+    target: Path,
+    stage_callback: Callable[[str], None] | None,
+) -> Path:
+    """把已验证的新 exe 交给临时 helper，等待本进程退出后原子替换并重启。"""
     helper = Path(tempfile.gettempdir()) / f"yikou-light-food-updater-{os.getpid()}.exe"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
@@ -382,6 +492,235 @@ def download_and_install(
         helper.unlink(missing_ok=True)
         raise UpdateError(f"Unable to start update installer: {exc}") from exc
     return target
+
+
+def _download_and_apply_patch(
+    release: ReleaseInfo,
+    patch: dict[str, Any],
+    target: Path,
+    *,
+    timeout: float,
+    opener: Callable[..., Any] | None,
+    progress_callback: Callable[[int, int | None], None] | None,
+    stage_callback: Callable[[str], None] | None,
+) -> Path:
+    """下载差分补丁，用本地 exe 还原出完整新版，校验后替换并重启。"""
+    open_func = opener or urlopen
+    patch_file = target.with_name(f".{target.stem}.patch-{os.getpid()}.tmp")
+    temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
+    try:
+        if shutil.disk_usage(target.parent).free < target.stat().st_size + 1_048_576:
+            raise UpdateError("磁盘剩余空间不足，无法安装更新")
+    except OSError as exc:
+        raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
+
+    if stage_callback:
+        stage_callback("下载差分补丁")
+    request = Request(patch["url"], headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
+    try:
+        with open_func(request, timeout=timeout) as response, patch_file.open("wb") as output:
+            received = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                received += len(chunk)
+                if received > MAX_UPDATE_SIZE:
+                    raise UpdateError("补丁大小异常")
+                if progress_callback:
+                    progress_callback(received, received)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+        patch_file.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to download patch: {exc}") from exc
+
+    try:
+        if hashlib.sha256(patch_file.read_bytes()).hexdigest() != patch["sha256"]:
+            raise UpdateError("补丁 SHA-256 校验失败")
+        if stage_callback:
+            stage_callback("应用差分补丁")
+        bspatch.apply_file(target, patch_file, temporary)
+    except (OSError, ValueError) as exc:
+        patch_file.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to apply patch: {exc}") from exc
+    finally:
+        patch_file.unlink(missing_ok=True)
+
+    try:
+        if hashlib.sha256(temporary.read_bytes()).hexdigest() != patch["target_sha256"]:
+            raise UpdateError("还原后的文件 SHA-256 校验失败")
+        with temporary.open("rb") as handle:
+            if handle.read(2) != b"MZ":
+                raise UpdateError("还原后的文件不是有效的 Windows 可执行文件")
+    except UpdateError:
+        temporary.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise UpdateError(f"Unable to verify rebuilt file: {exc}") from exc
+
+    return _schedule_windows_replacement(temporary, target, stage_callback)
+
+
+def _download_and_install_macos(
+    release: ReleaseInfo,
+    *,
+    timeout: float = 60.0,
+    opener: Callable[..., Any] | None = None,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """Download the macOS archive, replace the running .app, and relaunch.
+
+    A PyInstaller macOS build runs from inside a ``yikou-light-food.app``
+    bundle.  macOS does not lock the bundle, but replacing it while the
+    process is still reading its resources is unreliable, so a detached shell
+    waits for this process to exit before swapping in the freshly extracted
+    bundle and relaunching it with ``open``.
+    """
+    if not getattr(sys, "frozen", False):
+        raise UpdateError("源码运行模式不支持自动安装，请前往 GitHub Release 页面下载")
+    asset = release.macos_asset
+    asset_name = str(asset.get("name") if asset else "")
+    url = _asset_url(asset)
+    if not safe_asset_name(asset_name) or not asset_name.lower().endswith(".zip") or not _trusted_url(url):
+        raise UpdateError("Release does not contain a trusted macOS archive")
+    executable = Path(sys.executable).resolve()
+    if executable.parent.name != "MacOS" or executable.parent.parent.name != "Contents":
+        raise UpdateError("无法确定当前应用包结构，无法自动更新")
+    app_bundle = executable.parent.parent.parent
+    if app_bundle.suffix.lower() != ".app":
+        raise UpdateError("无法确定当前应用包路径")
+
+    workdir = Path(tempfile.mkdtemp(prefix="yikou-light-food-update-"))
+    archive = workdir / asset_name
+    open_func = opener or urlopen
+    request = Request(url, headers={"Accept": "application/octet-stream", "User-Agent": "yikou-light-food"})
+    if stage_callback:
+        stage_callback("下载更新")
+    try:
+        response = None
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = open_func(request, timeout=timeout)
+                break
+            except HTTPError:
+                raise
+            except (URLError, TimeoutError, OSError) as exc:
+                last_exc = exc
+                response = None
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+        if response is None:
+            assert last_exc is not None
+            raise last_exc
+        with response, archive.open("wb") as output:
+            content_length = None
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                try:
+                    content_length = int(headers.get("Content-Length") or 0) or None
+                except (TypeError, ValueError):
+                    content_length = None
+            if content_length and content_length > MAX_UPDATE_SIZE:
+                raise UpdateError("更新资源大小异常")
+            downloaded = 0
+            if progress_callback:
+                progress_callback(downloaded, content_length)
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+                if progress_callback:
+                    progress_callback(downloaded, content_length)
+            if downloaded > MAX_UPDATE_SIZE:
+                raise UpdateError("更新资源大小异常")
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError(f"Unable to download update: {exc}") from exc
+
+    checksum_asset = release.macos_checksum_asset
+    checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
+    if not _trusted_url(checksum_url):
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+    try:
+        if stage_callback:
+            stage_callback("校验安装包")
+        checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+        with open_func(checksum_request, timeout=timeout) as response:
+            expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError("invalid SHA-256")
+        actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
+        if actual_hash != expected_hash:
+            raise UpdateError("Downloaded update failed SHA-256 verification")
+    except UpdateError:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+
+    # Reject path-traversal entries before extracting, then use ditto so that
+    # symlinks, permissions and extended attributes inside the .app survive.
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            for info in bundle.infolist():
+                member = Path(info.filename)
+                if member.is_absolute() or ".." in member.parts:
+                    raise UpdateError("更新包包含非法路径条目")
+    except (zipfile.BadZipFile, OSError, UpdateError) as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError(f"Unable to read update archive: {exc}") from exc
+    if stage_callback:
+        stage_callback("解压更新")
+    extract_dir = workdir / "extracted"
+    extract_dir.mkdir()
+    try:
+        subprocess.run(
+            ["/usr/bin/ditto", "-x", "-k", str(archive), str(extract_dir)],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError(f"Unable to extract update: {exc}") from exc
+
+    new_app = next((p for p in extract_dir.iterdir() if p.suffix.lower() == ".app" and p.is_dir()), None)
+    if new_app is None or not (new_app / "Contents" / "MacOS").is_dir():
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError("更新包中未找到有效的 .app 应用包")
+
+    if stage_callback:
+        stage_callback("准备重启")
+    pid = os.getpid()
+    script = (
+        f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+        f"rm -rf {shlex.quote(str(app_bundle))}; "
+        f"ditto {shlex.quote(str(new_app))} {shlex.quote(str(app_bundle))}; "
+        f"open {shlex.quote(str(app_bundle))}; "
+        f"rm -rf {shlex.quote(str(workdir))}"
+    )
+    try:
+        subprocess.Popen(
+            ["/bin/sh", "-c", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        shutil.rmtree(workdir, ignore_errors=True)
+        raise UpdateError(f"Unable to start update installer: {exc}") from exc
+    return app_bundle
 
 
 def apply_pending_update(
