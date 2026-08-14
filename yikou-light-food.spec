@@ -20,9 +20,22 @@ analysis = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # openpyxl treats numpy and lxml as optional accelerators and falls back to
+    # the standard library when they are absent; excluding them (and the
+    # bs4/yaml/soupsieve chain they pull in) keeps the executable lean.
+    excludes=["numpy", "lxml", "bs4", "yaml", "soupsieve"],
     noarchive=False,
 )
+# Playwright's own PyInstaller hook re-collects the bundled browser payload
+# (playwright/driver/package/.local-browsers) regardless of the filter above,
+# so strip it after analysis too.  Only the Node driver is kept; the browser
+# binary is resolved at runtime from a system Edge/Chrome or the Playwright
+# Chromium cache, never from inside the executable.
+for _toc in ("datas", "binaries"):
+    setattr(analysis, _toc, [
+        entry for entry in getattr(analysis, _toc)
+        if ".local-browsers" not in str(entry[0]) and ".local-browsers" not in str(entry[1])
+    ])
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,

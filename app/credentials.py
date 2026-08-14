@@ -9,6 +9,8 @@ import getpass
 from typing import Optional
 
 SERVICE_NAME = "yikou-light-food"
+# 闪时送（sss）平台使用独立的服务名，避免与管理后台同名账号的密码互相覆盖。
+SSS_SERVICE_NAME = "yikou-light-food-sss"
 
 
 def _backend():
@@ -54,6 +56,21 @@ def delete_password(username: str, service: str = SERVICE_NAME) -> bool:
 def prompt_password(username: str = "") -> str:
     """Get a password interactively without echoing it (CLI fallback)."""
     return getpass.getpass(f"Password{f' for {username}' if username else ''}: ")
+
+
+def get_sss_password(username: str) -> Optional[str]:
+    """Read the 闪时送 password from the OS keychain."""
+    return get_password(username, SSS_SERVICE_NAME)
+
+
+def set_sss_password(username: str, password: str) -> bool:
+    """Persist the 闪时送 password to the OS keychain."""
+    return set_password(username, password, SSS_SERVICE_NAME)
+
+
+def delete_sss_password(username: str) -> bool:
+    """Remove the 闪时送 password from the OS keychain."""
+    return delete_password(username, SSS_SERVICE_NAME)
 
 
 # Compatibility aliases used by the Tkinter layer.

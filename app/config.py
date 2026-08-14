@@ -50,6 +50,12 @@ class AppConfig:
     retry_wait_ms: int = 1000
     order_search_attempts: int = 3
     split_ratio: float = 0.38
+    # 闪时送（sss）下单任务的独立配置，与管理后台订单处理互不影响。
+    sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout"
+    sss_account: str = ""
+    sss_excel_path: Path | None = None
+    sss_product_name: str = "轻食"
+    sss_common_address: str = "嗯哼"
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -58,6 +64,11 @@ class AppConfig:
                  network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
                  retry_wait_ms: int = 1000, order_search_attempts: int = 3,
                  split_ratio: float = 0.38,
+                 sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout",
+                 sss_account: str = "",
+                 sss_excel_path: str | os.PathLike[str] = "",
+                 sss_product_name: str = "轻食",
+                 sss_common_address: str = "嗯哼",
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -77,6 +88,11 @@ class AppConfig:
         self.retry_wait_ms = retry_wait_ms
         self.order_search_attempts = order_search_attempts
         self.split_ratio = clamp_split_ratio(split_ratio)
+        self.sss_url = sss_url
+        self.sss_account = sss_account
+        self.sss_excel_path = Path(sss_excel_path) if sss_excel_path else None
+        self.sss_product_name = sss_product_name or "轻食"
+        self.sss_common_address = sss_common_address or "嗯哼"
         self.config_path = config_path
 
     @property
@@ -127,6 +143,8 @@ class AppConfig:
         payload: Dict[str, Any] = asdict(self)
         if isinstance(payload.get("excel_path"), Path):
             payload["excel_path"] = str(payload["excel_path"])
+        if isinstance(payload.get("sss_excel_path"), Path):
+            payload["sss_excel_path"] = str(payload["sss_excel_path"])
         payload.pop("config_path", None)
         target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         self.config_path = str(target)

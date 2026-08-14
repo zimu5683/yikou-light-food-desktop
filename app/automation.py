@@ -33,6 +33,13 @@ except ImportError:  # pragma: no cover - allows ``python app/automation.py``
         parse_receiver_info,
     )
 
+try:
+    from .config import user_data_dir
+    from .locators import DEFAULT_LOCATORS, load_locators
+except ImportError:  # pragma: no cover - allows ``python app/automation.py``
+    from config import user_data_dir
+    from locators import DEFAULT_LOCATORS, load_locators
+
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
 MAX_PAGE_SEARCH = 20
@@ -46,6 +53,15 @@ class BrowserNotFoundError(RuntimeError):
     def __init__(self, browsers: dict[str, str | None] | None = None) -> None:
         self.browsers = browsers or detect_browsers()
         super().__init__("未检测到可用浏览器，请安装 Microsoft Edge/Google Chrome，或安装 Playwright Chromium")
+
+
+class LocatorError(RuntimeError):
+    """Raised when a UI step matches none of its locator candidates.
+
+    A screenshot, an HTML snapshot and the current URL are saved to the user
+    log directory before this error is raised, so the site change can be
+    fixed by editing the locator configuration instead of the code.
+    """
 
 
 def detect_browsers() -> dict[str, str | None]:
@@ -93,6 +109,148 @@ def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
         callback(message)
 
 
+def _base_url(config: Any) -> str:
+    """Return the SPA base URL (scheme://host/path plus ``#`` for hash routing)."""
+    url = str(getattr(config, "target_url", getattr(config, "url", "")) or "").strip()
+    if not url:
+        return ""
+    if "#" in url:
+        return url.split("#")[0].rstrip("/") + "/#"
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    path = parts.path.rsplit("/", 1)[0].rstrip("/")
+    return f"{parts.scheme}://{parts.netloc}{path}/"
+
+
+def _build_locator(page: Any, candidate: dict[str, Any]) -> Any:
+    """Build a Playwright locator for one candidate entry.
+
+    The kind is detected from the keys present: ``css``, ``role`` (with
+    optional ``name``/``name_re``), ``placeholder``, ``text`` or ``text_re``,
+    and ``xpath`` (a full XPath expression such as ``//input``).
+    ``has_text``/``has_text_re`` further filter the matched set.
+    """
+    if "css" in candidate:
+        locator = page.locator(candidate["css"])
+    elif "role" in candidate:
+        kwargs: dict[str, Any] = {}
+        if candidate.get("name_re"):
+            kwargs["name"] = re.compile(candidate["name_re"])
+        elif "name" in candidate:
+            kwargs["name"] = candidate["name"]
+        locator = page.get_by_role(candidate["role"], **kwargs)
+    elif "placeholder" in candidate:
+        locator = page.get_by_placeholder(candidate["placeholder"])
+    elif "text" in candidate:
+        locator = page.get_by_text(candidate["text"])
+    elif "text_re" in candidate:
+        locator = page.get_by_text(re.compile(candidate["text_re"]))
+    elif "xpath" in candidate:
+        locator = page.locator(candidate["xpath"])
+    else:
+        raise ValueError(f"无法识别的定位器候选: {candidate!r}")
+    if candidate.get("has_text_re"):
+        locator = locator.filter(has_text=re.compile(candidate["has_text_re"]))
+    elif candidate.get("has_text"):
+        locator = locator.filter(has_text=candidate["has_text"])
+    return locator
+
+
+def _find_by_candidates(page: Any, step: dict[str, Any], timeout: int) -> tuple[Any, int]:
+    """Return ``(locator, candidate_index)`` for the first candidate that matches."""
+    for index, candidate in enumerate(step.get("candidates", [])):
+        try:
+            locator = _build_locator(page, candidate)
+            if locator.count() == 0:
+                continue
+            narrowed = locator.nth(int(candidate["index"])) if "index" in candidate else locator.first
+            narrowed.wait_for(state="visible", timeout=min(max(timeout, 1), 3000))
+            return narrowed, index
+        except Exception:
+            continue
+    return None, -1
+
+
+def _save_failure_snapshot(page: Any, step_name: str) -> Path:
+    """Save screenshot, HTML and URL evidence for a failed UI step."""
+    log_dir = user_data_dir() / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    safe = re.sub(r"[^\w\u4e00-\u9fff-]+", "_", step_name)
+    for extension, writer in (
+        (".png", lambda path: page.screenshot(path=str(path), full_page=True)),
+        (".html", lambda path: path.write_text(page.content(), encoding="utf-8")),
+        (".txt", lambda path: path.write_text(page.url, encoding="utf-8")),
+    ):
+        try:
+            writer(log_dir / f"{stamp}_{safe}{extension}")
+        except Exception:
+            pass
+    return log_dir
+
+
+def _locator_failure(page: Any, step_name: str) -> LocatorError:
+    log_dir = _save_failure_snapshot(page, step_name)
+    return LocatorError(
+        f"页面定位失败：{step_name}。已保存页面截图、HTML 与当前网址到 {log_dir}，"
+        f"可据此修改定位器配置（locators.json）后重试，无需更新程序。"
+    )
+
+
+def _locator_step(locators: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    """Return a step, falling back to the built-in default when missing."""
+    return (locators or {}).get(name) or DEFAULT_LOCATORS.get(name) or {}
+
+
+def _label_step(locators: dict[str, Any] | None, label: str) -> dict[str, Any]:
+    user = ((locators or {}).get("labels") or {}).get(label)
+    if user:
+        return user
+    default = (DEFAULT_LOCATORS.get("labels") or {}).get(label)
+    return default or {"candidates": [{"text": label}]}
+
+
+def _navigate(page: Any, step_name: str, locators: dict[str, Any] | None, base_url: str,
+              timeout: int, callback: Callable[[str], Any] | None) -> None:
+    """Open a page: direct URL first, then the ordered locator chain."""
+    step = _locator_step(locators, step_name)
+    wait_url = step.get("wait_url")
+    if step.get("goto"):
+        original_url = page.url
+        url = str(step["goto"]).replace("{base}", base_url)
+        try:
+            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            if wait_url:
+                page.wait_for_url(wait_url, timeout=min(max(timeout, 1), 5000))
+            _emit(callback, f"{step_name}：URL 直达成功")
+            if step.get("confirm") == "table":
+                _wait_for_order_table(page, timeout)
+            return
+        except Exception:
+            try:
+                if page.url != original_url:
+                    page.goto(original_url, timeout=timeout, wait_until="domcontentloaded")
+            except Exception:
+                pass
+    element, index = _find_by_candidates(page, step, timeout)
+    if element is None:
+        raise _locator_failure(page, step_name)
+    try:
+        if step.get("action") == "dblclick":
+            element.dblclick(timeout=timeout)
+        else:
+            element.click(timeout=timeout)
+        if step.get("wait_networkidle"):
+            page.wait_for_load_state("networkidle", timeout=timeout)
+        if wait_url:
+            page.wait_for_url(wait_url, timeout=timeout)
+        if step.get("confirm") == "table":
+            _wait_for_order_table(page, timeout)
+    except Exception:
+        raise _locator_failure(page, step_name) from None
+    _emit(callback, f"{step_name}：第 {index + 1} 个定位候选命中")
+
+
 def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
     result: list[MealInfo] = []
     for row in rows:
@@ -114,23 +272,46 @@ def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[Meal
     return result
 
 
-def extract_meal_info(page: Any, meal_type: str) -> list[MealInfo]:
-    rows = page.eval_on_selector_all(
-        ".table_box tbody tr",
-        """rows => rows.map(r => ({product:(r.querySelector('td:nth-child(1)')||{}).innerText||'', qty:(r.querySelector('td:nth-child(3)')||{}).innerText||''}))""",
-    )
-    return parse_meal_rows(rows or [], meal_type)
+MEAL_ROWS_JS = """rows => rows.map(r => ({product:(r.querySelector('td:nth-child(1)')||{}).innerText||'', qty:(r.querySelector('td:nth-child(3)')||{}).innerText||''}))"""
 
 
-def extract_product_note_text(page: Any) -> str:
+def _meal_rows(page: Any, locators: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Collect meal rows using the first table candidate that yields data."""
+    step = _locator_step(locators, "meal_table_row")
+    for candidate in step.get("candidates", []):
+        css = candidate.get("css")
+        if not css:
+            continue
+        try:
+            rows = page.eval_on_selector_all(css, MEAL_ROWS_JS)
+            if rows:
+                return rows or []
+        except Exception:
+            continue
+    return []
+
+
+def extract_meal_info(page: Any, meal_type: str, locators: dict[str, Any] | None = None) -> list[MealInfo]:
+    return parse_meal_rows(_meal_rows(page, locators), meal_type)
+
+
+def extract_product_note_text(page: Any, locators: dict[str, Any] | None = None) -> str:
     """Collect free-form notes rendered below product names."""
-    try:
-        products = page.eval_on_selector_all(
-            ".table_box tbody tr",
-            """rows => rows.map(r => (r.querySelector('td:nth-child(1)') || {}).innerText || '')""",
-        )
-    except Exception:
-        return ""
+    step = _locator_step(locators, "meal_table_row")
+    products: list[str] = []
+    for candidate in step.get("candidates", []):
+        css = candidate.get("css")
+        if not css:
+            continue
+        try:
+            products = page.eval_on_selector_all(
+                css,
+                """rows => rows.map(r => (r.querySelector('td:nth-child(1)') || {}).innerText || '')""",
+            )
+            if products:
+                break
+        except Exception:
+            continue
     lines: list[str] = []
     for product in products or []:
         parts = [line.strip() for line in str(product).splitlines() if line.strip()]
@@ -199,11 +380,17 @@ def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
     return playwright.chromium.launch(executable_path=executable, **kwargs)
 
 
-def _label(page: Any, label: str, timeout: int) -> str:
+def _label(page: Any, label: str, timeout: int, locators: dict[str, Any] | None = None) -> str:
+    """Read the value shown next to a detail label (e.g. 收货人 → 张三)."""
+    element, _ = _find_by_candidates(page, _label_step(locators, label), timeout)
+    if element is None:
+        return ""
     try:
-        elem = page.locator(f"text={label}").first
-        elem.wait_for(timeout=timeout)
-        return elem.locator("..").inner_text().strip().split(label)[-1].lstrip("：:").strip()
+        matched = element.inner_text().strip()
+        parent_text = element.locator("..").inner_text().strip()
+        if matched and matched in parent_text:
+            return parent_text.split(matched)[-1].lstrip("：:").strip()
+        return parent_text.split(label)[-1].lstrip("：:").strip()
     except Exception:
         return ""
 
@@ -240,7 +427,8 @@ def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = N
 
 def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
             order_decision_callback: Callable[[str, str], str] | None = None,
-            save_decision_callback: Callable[[str], str] | None = None) -> dict[str, int]:
+            save_decision_callback: Callable[[str], str] | None = None,
+            locators: dict[str, Any] | None = None) -> dict[str, int]:
     """Process the newest W orders and append their meals to the workbook."""
     configured_excel = getattr(config, "excel_path", None)
     if not configured_excel:
@@ -254,6 +442,8 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
         raise ValueError("order_count 必须大于等于 1")
     if password is None:
         password = getattr(config, "password", "")
+    if locators is None:
+        locators = load_locators()
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -274,15 +464,27 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
             try:
                 _emit(progress_callback, "正在登录...")
                 page.goto(getattr(config, "target_url", getattr(config, "url", "")), timeout=timeout, wait_until="networkidle")
-                page.locator('input[placeholder="请输入手机号/账号"]').fill(getattr(config, "phone_number", getattr(config, "phone", "")))
-                page.locator('input[placeholder="登录密码"]').fill(password or "")
-                page.locator("text=立即登录").click()
+                base_url = _base_url(config)
+
+                account_input, _ = _find_by_candidates(page, _locator_step(locators, "login_account_input"), timeout)
+                if account_input is None:
+                    raise _locator_failure(page, "账号输入框")
+                account_input.fill(getattr(config, "phone_number", getattr(config, "phone", "")))
+
+                password_input, _ = _find_by_candidates(page, _locator_step(locators, "login_password_input"), timeout)
+                if password_input is None:
+                    raise _locator_failure(page, "密码输入框")
+                password_input.fill(password or "")
+
+                submit, _ = _find_by_candidates(page, _locator_step(locators, "login_submit"), timeout)
+                if submit is None:
+                    raise _locator_failure(page, "登录按钮")
+                submit.click(timeout=timeout)
                 page.wait_for_url("**/workbench/store", timeout=timeout)
-                page.locator('div.detail:has-text("门店地址")').dblclick()
-                page.wait_for_url("**/home", timeout=timeout)
-                page.locator('div.navBarItem:has-text("订单")').click()
-                page.wait_for_url("**/order/**", timeout=timeout)
-                page.locator("text=外送订单").click()
+
+                _navigate(page, "门店地址", locators, base_url, timeout, progress_callback)
+                _navigate(page, "订单菜单", locators, base_url, timeout, progress_callback)
+                _navigate(page, "外送订单", locators, base_url, timeout, progress_callback)
                 page.wait_for_load_state("networkidle")
                 _wait_for_order_table(page, timeout)
                 _emit(progress_callback, "登录成功，开始搜索订单")
@@ -297,17 +499,17 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                             cell = _find_order_cell(page, code, config, progress_callback)
                             cell.locator("xpath=ancestor::tr").locator("text=详情").first.click()
                             page.wait_for_timeout(300)
-                            receiver = _label(page, "收货人", timeout)
+                            receiver = _label(page, "收货人", timeout, locators)
                             name, phone = parse_receiver_info(receiver)
-                            address = _label(page, "配送地址", timeout)
+                            address = _label(page, "配送地址", timeout, locators)
                             base = get_address_base_sheet_name(address)
                             if base == "东湖":
                                 address = get_donghu_address_segment(address)
                             elif base == "衣锦":
-                                address = get_yijin_address_from_product_note(extract_product_note_text(page))
+                                address = get_yijin_address_from_product_note(extract_product_note_text(page, locators))
                             candidate = OrderInfo(code, name, phone, address, base, delivery_address=address)
                             for typ, attr in (("午餐", "lunch"), ("晚餐", "dinner")):
-                                setattr(candidate, attr, extract_meal_info(page, typ))
+                                setattr(candidate, attr, extract_meal_info(page, typ, locators))
 
                             # Do not mutate the workbook until the browser has
                             # safely returned to the order list.  A retry can
@@ -455,4 +657,4 @@ def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str]
     raise last_error or TimeoutError(f"订单 {code} 未找到")
 
 
-__all__ = ["run_job", "ensure_browser", "detect_browsers", "BrowserNotFoundError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]
+__all__ = ["run_job", "ensure_browser", "detect_browsers", "BrowserNotFoundError", "LocatorError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]

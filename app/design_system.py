@@ -939,6 +939,13 @@ class PillButton(tk.Canvas):
         self._button_state = "disabled" if state == "disabled" else "normal"
         self._draw()
 
+    def set_variant(self, variant: str) -> None:
+        if variant not in self.VARIANTS:
+            return
+        self._variant = variant
+        self._surface_parts = None
+        self._draw_now()
+
     def configure(self, cnf: dict[str, object] | None = None, **kwargs: object) -> object:
         state = kwargs.pop("state", None)
         result = super().configure(cnf or {}, **kwargs)

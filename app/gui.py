@@ -11,7 +11,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from .automation import BrowserNotFoundError, ensure_browser, run_job
 from .config import AppConfig, clamp_split_ratio
-from .credentials import delete_password, get_password, set_password
+from .credentials import (delete_password, delete_sss_password, get_password,
+                          get_sss_password, set_password, set_sss_password)
+from .sss import run_sss_job
 from .design_system import (FONT_FAMILY, FONT_MONO, PillButton, ResponsiveSplitPane,
                             RoundedCard, ScrollableRoundedCard, StatusBadge, TOKENS, FormField,
                             apply_tk_scaling, form_layout_mode, layout_mode)
@@ -119,8 +121,47 @@ class App(tk.Tk):
         body.bind("<Configure>", self._on_config_body_configure, add="+")
         tk.Label(body, text="任务配置", bg=TOKENS.surface, fg=TOKENS.primary,
                  font=(FONT_FAMILY, 20, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
-        tk.Label(body, text="准备好订单资料后，即可开始自动处理。", bg=TOKENS.surface,
+        tk.Label(body, text="选择要执行的任务类型，并准备好相应资料。", bg=TOKENS.surface,
                  fg=TOKENS.text_soft, font=(FONT_FAMILY, 10), anchor="w").grid(row=1, column=0, sticky="w", pady=(TOKENS.space_1, TOKENS.space_4))
+
+        self._build_mode_switch(body)
+
+        self.mode_host = tk.Frame(body, bg=TOKENS.surface)
+        self.mode_host.grid(row=3, column=0, sticky="ew")
+        self.mode_host.columnconfigure(0, weight=1)
+        self.order_form = tk.Frame(self.mode_host, bg=TOKENS.surface)
+        self.sss_form = tk.Frame(self.mode_host, bg=TOKENS.surface)
+        self._build_order_form()
+        self._build_sss_form()
+        self._switch_mode("order")
+        self._apply_config_layout(520)
+
+    def _build_mode_switch(self, body: tk.Misc) -> None:
+        switch = tk.Frame(body, bg=TOKENS.surface)
+        switch.grid(row=2, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        switch.columnconfigure(0, weight=1)
+        switch.columnconfigure(1, weight=1)
+        self.mode_buttons = {
+            "order": PillButton(switch, "订单处理", lambda: self._switch_mode("order"), variant="primary"),
+            "sss": PillButton(switch, "闪时送下单", lambda: self._switch_mode("sss"), variant="outline"),
+        }
+        self.mode_buttons["order"].grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        self.mode_buttons["sss"].grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
+
+    def _switch_mode(self, mode: str) -> None:
+        self._mode = mode
+        self.order_form.grid_remove()
+        self.sss_form.grid_remove()
+        target = self.order_form if mode == "order" else self.sss_form
+        target.grid(row=0, column=0, sticky="ew")
+        for key, button in self.mode_buttons.items():
+            button.set_variant("primary" if key == mode else "outline")
+        self.start_button = self.order_start_button if mode == "order" else self.sss_start_button
+        self.stop_button = self.order_stop_button if mode == "order" else self.sss_stop_button
+
+    def _build_order_form(self) -> None:
+        body = self.order_form
+        body.columnconfigure(0, weight=1)
 
         fields = [("管理网址", "url", "例如：https://example.com/admin"),
                   ("手机号 / 账号", "phone", "用于登录管理后台"),
@@ -128,7 +169,7 @@ class App(tk.Tk):
         self.vars: dict[str, tk.StringVar] = {key: tk.StringVar() for _, key, _ in fields if key != "password"}
         self.password = tk.StringVar()
         self.form_fields: dict[str, FormField] = {}
-        for row, (label, key, helper) in enumerate(fields, start=2):
+        for row, (label, key, helper) in enumerate(fields, start=0):
             variable = self.password if key == "password" else self.vars[key]
             field = FormField(body, label, variable, show="*" if key == "password" else "", helper=helper)
             field.grid(row=row, column=0, sticky="ew", pady=(0, TOKENS.space_3))
@@ -136,7 +177,7 @@ class App(tk.Tk):
 
         excel_row = tk.Frame(body, bg=TOKENS.surface)
         self.excel_row = excel_row
-        excel_row.grid(row=5, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        excel_row.grid(row=3, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         excel_row.columnconfigure(0, weight=1)
         self.vars["excel"] = tk.StringVar()
         self.form_fields["excel"] = FormField(excel_row, "Excel 文件", self.vars["excel"], helper="支持 .xlsx 和 .xlsm 文件")
@@ -146,7 +187,7 @@ class App(tk.Tk):
         self.excel_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         order_row = tk.Frame(body, bg=TOKENS.surface)
-        order_row.grid(row=6, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        order_row.grid(row=4, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         order_row.columnconfigure(0, weight=1)
         tk.Label(order_row, text="待处理订单数", bg=TOKENS.surface, fg=TOKENS.text,
                  font=(FONT_FAMILY, 10, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
@@ -159,10 +200,10 @@ class App(tk.Tk):
         self.order_spinbox.grid(row=0, column=1, sticky="e", ipady=6)
         self.order_error = tk.Label(body, text="", bg=TOKENS.surface, fg=TOKENS.error,
                                     font=(FONT_FAMILY, 9), anchor="w")
-        self.order_error.grid(row=7, column=0, sticky="ew")
+        self.order_error.grid(row=5, column=0, sticky="ew")
 
         remember_row = tk.Frame(body, bg=TOKENS.surface)
-        remember_row.grid(row=8, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        remember_row.grid(row=6, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
         self.remember = tk.BooleanVar(value=True)
         tk.Checkbutton(remember_row, text="保存到系统凭据管理器", variable=self.remember,
                        bg=TOKENS.surface, fg=TOKENS.text_soft, activebackground=TOKENS.surface,
@@ -170,24 +211,86 @@ class App(tk.Tk):
                        highlightthickness=0).pack(side="left")
 
         actions = tk.Frame(body, bg=TOKENS.surface)
-        actions.grid(row=9, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        actions.grid(row=7, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
-        self.start_button = PillButton(actions, "开始处理", self.start, variant="primary")
-        self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
-        self.stop_button = PillButton(actions, "停止", self.stop, variant="danger")
-        self.stop_button.grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
-        self.stop_button.set_state("disabled")
+        self.order_start_button = PillButton(actions, "开始处理", self.start, variant="primary")
+        self.order_start_button.grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        self.order_stop_button = PillButton(actions, "停止", self.stop, variant="danger")
+        self.order_stop_button.grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
+        self.order_stop_button.set_state("disabled")
 
         tools = tk.Frame(body, bg=TOKENS.surface)
         self.tools = tools
-        tools.grid(row=10, column=0, sticky="ew")
+        tools.grid(row=8, column=0, sticky="ew")
         self.tool_buttons = [
             PillButton(tools, "检查浏览器", self.install_browser, variant="outline"),
             PillButton(tools, "清除密码", self.clear_password, variant="outline"),
             PillButton(tools, "检查更新", lambda: self.check_for_updates(manual=True), variant="outline"),
         ]
-        self._apply_config_layout(520)
+
+    def _build_sss_form(self) -> None:
+        body = self.sss_form
+        body.columnconfigure(0, weight=1)
+
+        fields = [("闪时送网址", "sss_url", "闪时送下单平台地址"),
+                  ("闪时送账号", "sss_account", "用于登录闪时送平台"),
+                  ("登录密码", "sss_password", "密码仅保存在系统凭据管理器中")]
+        self.vars_sss: dict[str, tk.StringVar] = {key: tk.StringVar() for _, key, _ in fields if key != "sss_password"}
+        self.sss_password = tk.StringVar()
+        self.sss_form_fields: dict[str, FormField] = {}
+        for row, (label, key, helper) in enumerate(fields, start=0):
+            variable = self.sss_password if key == "sss_password" else self.vars_sss[key]
+            field = FormField(body, label, variable, show="*" if key == "sss_password" else "", helper=helper)
+            field.grid(row=row, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+            self.sss_form_fields[key] = field
+
+        sss_excel_row = tk.Frame(body, bg=TOKENS.surface)
+        self.sss_excel_row = sss_excel_row
+        sss_excel_row.grid(row=3, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        sss_excel_row.columnconfigure(0, weight=1)
+        self.vars_sss["sss_excel"] = tk.StringVar()
+        self.sss_form_fields["sss_excel"] = FormField(sss_excel_row, "订单 Excel 文件", self.vars_sss["sss_excel"], helper="午餐/晚餐两表，A=姓名 B=门牌号 C=电话")
+        self.sss_form_fields["sss_excel"].grid(row=0, column=0, sticky="ew")
+        self.sss_excel_button = PillButton(sss_excel_row, "选择文件", self._choose_sss_excel, variant="outline", width=112,
+                                           bg=TOKENS.surface)
+        self.sss_excel_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+
+        self.vars_sss["sss_product_name"] = tk.StringVar()
+        self.sss_form_fields["sss_product_name"] = FormField(body, "商品名称", self.vars_sss["sss_product_name"], helper="下单时商品“名称”的默认值")
+        self.sss_form_fields["sss_product_name"].grid(row=4, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        self.vars_sss["sss_common_address"] = tk.StringVar()
+        self.sss_form_fields["sss_common_address"] = FormField(body, "常用地址", self.vars_sss["sss_common_address"], helper="下单时选择的常用地址")
+        self.sss_form_fields["sss_common_address"].grid(row=5, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+
+        remember_row = tk.Frame(body, bg=TOKENS.surface)
+        remember_row.grid(row=6, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        self.sss_remember = tk.BooleanVar(value=True)
+        tk.Checkbutton(remember_row, text="保存到系统凭据管理器", variable=self.sss_remember,
+                       bg=TOKENS.surface, fg=TOKENS.text_soft, activebackground=TOKENS.surface,
+                       selectcolor=TOKENS.green_light, font=(FONT_FAMILY, 10), anchor="w",
+                       highlightthickness=0).pack(side="left")
+
+        actions = tk.Frame(body, bg=TOKENS.surface)
+        actions.grid(row=7, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        actions.columnconfigure(0, weight=1)
+        actions.columnconfigure(1, weight=1)
+        self.sss_start_button = PillButton(actions, "开始下单", self.start, variant="primary")
+        self.sss_start_button.grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        self.sss_stop_button = PillButton(actions, "停止", self.stop, variant="danger")
+        self.sss_stop_button.grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
+        self.sss_stop_button.set_state("disabled")
+
+        tools = tk.Frame(body, bg=TOKENS.surface)
+        tools.grid(row=8, column=0, sticky="ew")
+        for column in range(2):
+            tools.columnconfigure(column, weight=1)
+        self.sss_tool_buttons = [
+            PillButton(tools, "检查浏览器", self.install_browser, variant="outline"),
+            PillButton(tools, "清除密码", self.clear_sss_password, variant="outline"),
+        ]
+        self.sss_tool_buttons[0].grid(row=0, column=0, sticky="ew", padx=(0, TOKENS.space_1))
+        self.sss_tool_buttons[1].grid(row=0, column=1, sticky="ew", padx=(TOKENS.space_1, 0))
 
     def _on_config_body_configure(self, _event: tk.Event[tk.Misc]) -> None:
         if self._config_layout_job is None:
@@ -214,6 +317,18 @@ class App(tk.Tk):
         else:
             self.excel_button.grid_configure(row=0, column=1, columnspan=1, sticky="s",
                                              padx=(TOKENS.space_2, 0), pady=(20, 0))
+
+        # 闪时送表单的“选择文件”按钮同样需要适配窄布局。
+        if hasattr(self, "sss_excel_row"):
+            self.sss_excel_row.columnconfigure(0, weight=1)
+            self.sss_excel_row.columnconfigure(1, weight=0)
+            self.sss_form_fields["sss_excel"].grid_configure(row=0, column=0, columnspan=1, sticky="ew")
+            if compact:
+                self.sss_excel_button.grid_configure(row=1, column=0, columnspan=2, sticky="e",
+                                                     padx=0, pady=(TOKENS.space_2, 0))
+            else:
+                self.sss_excel_button.grid_configure(row=0, column=1, columnspan=1, sticky="s",
+                                                     padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         for column in range(3):
             self.tools.columnconfigure(column, weight=0 if compact else 1)
@@ -317,9 +432,17 @@ class App(tk.Tk):
         self.vars["phone"].set(config.phone_number)
         self.vars["excel"].set(str(config.excel_path) if config.excel_path else "")
         self.password.set(get_password(config.phone_number) or "")
+        self.vars_sss["sss_url"].set(config.sss_url)
+        self.vars_sss["sss_account"].set(config.sss_account)
+        self.vars_sss["sss_excel"].set(str(config.sss_excel_path) if config.sss_excel_path else "")
+        self.vars_sss["sss_product_name"].set(config.sss_product_name)
+        self.vars_sss["sss_common_address"].set(config.sss_common_address)
+        self.sss_password.set(get_sss_password(config.sss_account) or "")
         self._split_ratio = clamp_split_ratio(config.split_ratio)
         if config.excel_path and config.excel_path.is_file():
             self.form_fields["excel"].set_state("valid")
+        if config.sss_excel_path and config.sss_excel_path.is_file():
+            self.sss_form_fields["sss_excel"].set_state("valid")
 
     def _choose_excel(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
@@ -331,6 +454,16 @@ class App(tk.Tk):
             else:
                 self.form_fields["excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
 
+    def _choose_sss_excel(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
+        if path:
+            self.vars_sss["sss_excel"].set(path)
+            selected = AppConfig(sss_excel_path=path).sss_excel_path
+            if selected and selected.is_file() and selected.suffix.lower() in {".xlsx", ".xlsm"}:
+                self.sss_form_fields["sss_excel"].set_state("valid", "文件已选择")
+            else:
+                self.sss_form_fields["sss_excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
+
     def _config(self) -> AppConfig:
         try:
             count = int(self.order_count.get())
@@ -340,6 +473,16 @@ class App(tk.Tk):
             raise ValueError("待处理订单数必须是大于等于 1 的整数") from exc
         return AppConfig(target_url=self.vars["url"].get().strip(), phone_number=self.vars["phone"].get().strip(),
                          excel_path=self.vars["excel"].get().strip(), browser_mode="auto")
+
+    def _config_sss(self) -> AppConfig:
+        return AppConfig(
+            sss_url=self.vars_sss["sss_url"].get().strip(),
+            sss_account=self.vars_sss["sss_account"].get().strip(),
+            sss_excel_path=self.vars_sss["sss_excel"].get().strip(),
+            sss_product_name=self.vars_sss["sss_product_name"].get().strip(),
+            sss_common_address=self.vars_sss["sss_common_address"].get().strip(),
+            browser_mode="auto",
+        )
 
     def _validate_form(self) -> tuple[AppConfig, int] | None:
         """Validate inputs and render semantic field states before starting."""
@@ -385,6 +528,40 @@ class App(tk.Tk):
             return None
         self.order_spinbox.configure(highlightbackground=TOKENS.border, highlightcolor=TOKENS.focus)
         return config, count
+
+    def _validate_sss_form(self) -> AppConfig | None:
+        """Validate 闪时送 inputs and render semantic field states before starting."""
+        for field in self.sss_form_fields.values():
+            field.set_state("neutral")
+        config = self._config_sss()
+        valid = True
+        if not config.sss_url:
+            self.sss_form_fields["sss_url"].set_state("invalid", "请输入闪时送网址")
+            valid = False
+        else:
+            self.sss_form_fields["sss_url"].set_state("valid")
+        if not config.sss_account:
+            self.sss_form_fields["sss_account"].set_state("invalid", "请输入闪时送账号")
+            valid = False
+        else:
+            self.sss_form_fields["sss_account"].set_state("valid")
+        if not self.sss_password.get():
+            self.sss_form_fields["sss_password"].set_state("invalid", "请输入登录密码")
+            valid = False
+        else:
+            self.sss_form_fields["sss_password"].set_state("valid")
+        if not config.sss_excel_path or not config.sss_excel_path.is_file():
+            self.sss_form_fields["sss_excel"].set_state("invalid", "请选择存在的 Excel 文件")
+            valid = False
+        elif config.sss_excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            self.sss_form_fields["sss_excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
+            valid = False
+        else:
+            self.sss_form_fields["sss_excel"].set_state("valid", "文件已准备")
+        if not valid:
+            self._set_status("error")
+            return None
+        return config
 
     def _append(self, text: str) -> None:
         self._log_lines.append(text.rstrip())
@@ -506,6 +683,13 @@ class App(tk.Tk):
             self.destroy()
 
     def start(self) -> None:
+        mode = getattr(self, "_mode", "order")
+        if mode == "sss":
+            self._start_sss()
+        else:
+            self._start_order()
+
+    def _start_order(self) -> None:
         validated = self._validate_form()
         if validated is None:
             return
@@ -521,12 +705,39 @@ class App(tk.Tk):
         self.worker = threading.Thread(target=self._run, args=(config, count, self.password.get()), daemon=True)
         self.worker.start()
 
+    def _start_sss(self) -> None:
+        config = self._validate_sss_form()
+        if config is None:
+            return
+        config.save()
+        if self.sss_remember.get():
+            set_sss_password(config.sss_account, self.sss_password.get())
+        self.stop_event.clear()
+        self.start_button.set_state("disabled")
+        self.stop_button.set_state("normal")
+        self._set_status("running")
+        self._append("开始闪时送下单...")
+        self.worker = threading.Thread(target=self._run_sss, args=(config, self.sss_password.get()), daemon=True)
+        self.worker.start()
+
     def _run(self, config: AppConfig, count: int, password: str) -> None:
         try:
             result = run_job(config, count, self.stop_event, lambda msg: self.events.put(("log", msg)), password=password,
                              order_decision_callback=self._order_decision,
                              save_decision_callback=self._save_decision)
             self.events.put(("done", f"处理完成：{result}"))
+        except BrowserNotFoundError as exc:
+            self.events.put(("browser_missing", str(exc)))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
+
+    def _run_sss(self, config: AppConfig, password: str) -> None:
+        try:
+            result = run_sss_job(config, self.stop_event,
+                                 lambda msg: self.events.put(("log", msg)),
+                                 password=password,
+                                 decision_callback=self._sss_decision)
+            self.events.put(("done", f"闪时送下单完成：{result}"))
         except BrowserNotFoundError as exc:
             self.events.put(("browser_missing", str(exc)))
         except Exception as exc:
@@ -545,6 +756,14 @@ class App(tk.Tk):
         result: queue.Queue[str] = queue.Queue(maxsize=1)
         def ask() -> None:
             choice = messagebox.askyesnocancel("订单定位失败", f"订单 {code} 定位失败：\n{error}\n\n是=重试，否=跳过，取消=停止")
+            result.put("retry" if choice is True else "skip" if choice is False else "stop")
+        self.after(0, ask)
+        return result.get()
+
+    def _sss_decision(self, identifier: str, error: str) -> str:
+        result: queue.Queue[str] = queue.Queue(maxsize=1)
+        def ask() -> None:
+            choice = messagebox.askyesnocancel("下单失败", f"订单 {identifier} 创建失败：\n{error}\n\n是=重试，否=跳过，取消=停止")
             result.put("retry" if choice is True else "skip" if choice is False else "stop")
         self.after(0, ask)
         return result.get()
@@ -673,6 +892,13 @@ class App(tk.Tk):
             delete_password(phone)
         self.password.set("")
         self._append("已清除本机保存的密码")
+
+    def clear_sss_password(self) -> None:
+        account = self.vars_sss["sss_account"].get().strip()
+        if account:
+            delete_sss_password(account)
+        self.sss_password.set("")
+        self._append("已清除本机保存的闪时送密码")
 
 
 def main() -> None:
