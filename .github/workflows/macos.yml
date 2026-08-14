@@ -12,7 +12,7 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -41,7 +41,7 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent "dist/yikou-light-food.app" "yikou-light-food-macos.zip"
           shasum -a 256 "yikou-light-food-macos.zip" > "yikou-light-food-macos.zip.sha256"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: yikou-light-food-macos
           path: |
