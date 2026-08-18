@@ -2,6 +2,8 @@
 
 这是一个使用 Tkinter + Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager 或 macOS Keychain（`keyring`）保存。
 
+此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
+
 程序包含两个任务模式：
 
 - **订单处理**：登录管理后台，读取最新订单并写入排单 Excel；
