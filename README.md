@@ -79,3 +79,5 @@ git push origin main --tags
 ```
 
 推送 `vX.Y.Z` 标签会触发 Windows 和 macOS 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版 ZIP，源码运行模式也只提示前往 Release 页面。
+
+更新包下载后会用官方 SHA-256 校验，校验文件优先从 GitHub 直接拉取；GitHub 直连不可达时改用 `latest.json` 内嵌的同一官方哈希（发布工作流会同时写入两处）。注意：若所使用的下载镜像被完全控制，内嵌回退在理论上可被绕过，彻底方案是为 exe 做代码签名。

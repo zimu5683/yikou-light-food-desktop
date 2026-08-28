@@ -1,0 +1,95 @@
+"""processing 纯函数的单元测试：收货人解析、楼栋判定与地址段提取。"""
+from __future__ import annotations
+
+from openpyxl import Workbook
+
+from app.models import MealInfo, OrderInfo
+from app.processing import (
+    get_address_base_sheet_name,
+    get_donghu_address_segment,
+    get_first_empty_row,
+    get_yijin_address_from_product_note,
+    parse_meal_text,
+    parse_receiver_info,
+    write_order_row,
+)
+
+
+def test_parse_receiver_info_accepts_common_formats():
+    assert parse_receiver_info("张三（13800000001）") == ("张三", "13800000001")
+    assert parse_receiver_info("张三(13800000001)") == ("张三", "13800000001")
+    assert parse_receiver_info("张三，13800000001") == ("张三", "13800000001")
+    assert parse_receiver_info("张三:13800000001") == ("张三", "13800000001")
+    assert parse_receiver_info("李四 13900000002") == ("李四", "13900000002")
+    assert parse_receiver_info("王五") == ("王五", "")
+    assert parse_receiver_info("") == ("", "")
+    assert parse_receiver_info(None) == ("", "")
+
+
+def test_address_base_sheet_maps_keywords_and_nonglin_road():
+    assert get_address_base_sheet_name("联建1栋302") == "衣锦"
+    assert get_address_base_sheet_name("lianjian 101") == "衣锦"
+    assert get_address_base_sheet_name("衣锦校区") == "衣锦"
+    assert get_address_base_sheet_name("医学院宿舍") == "医学院"
+    assert get_address_base_sheet_name("东湖小区3栋") == "东湖"
+    # 农林路默认归东湖，除非明确提到联建。
+    assert get_address_base_sheet_name("农林路2号") == "东湖"
+    assert get_address_base_sheet_name("农林路联建门口") == "衣锦"
+    assert get_address_base_sheet_name("完全陌生的地址") is None
+
+
+def test_donghu_segment_extracts_room_from_landmarks():
+    assert get_donghu_address_segment("东湖大西12栋A101") == "A101"
+    assert get_donghu_address_segment("小西3幢B202") == "B202"
+    assert get_donghu_address_segment("东湖大西活动室") == "大西"
+    assert get_donghu_address_segment("东湖小西") == "小西"
+    assert get_donghu_address_segment("其他地址") == "其他地址"
+
+
+def test_yijin_note_picks_cabinet_or_gate():
+    assert get_yijin_address_from_product_note("备注：联建门口外卖柜自提") == "外卖柜"
+    assert get_yijin_address_from_product_note("放校门口") == "校门口"
+    assert get_yijin_address_from_product_note("") == "校门口"
+
+
+def test_parse_meal_text_extracts_grade_and_count():
+    meals = parse_meal_text("豪华轻食六餐x2（午餐）", "午餐")
+    assert len(meals) == 1
+    assert meals[0].total_meals == 6
+    assert meals[0].grade == "豪华"
+    assert meals[0].count == 2
+    assert meals[0].meal_type == "午餐"
+
+    single = parse_meal_text("经济轻食单点（晚餐）", "晚餐")
+    assert single[0].total_meals == 1
+    assert single[0].grade == "经济"
+
+    plain = parse_meal_text("轻食套餐", "午餐")
+    assert plain[0].meal_type == "午餐"
+    assert plain[0].total_meals is None
+    assert plain[0].count == 1
+
+
+def test_write_order_row_appends_lunch_and_dinner_columns():
+    wb = Workbook()
+    ws = wb.active
+    order = OrderInfo(order_no="W1", name="张三", address="大西A101", phone="13800000001")
+    lunch = MealInfo(total_meals=6, grade="经济", count=1, meal_type="午餐")
+
+    assert write_order_row(ws, order, lunch, "午餐") == 3
+    assert [ws["A3"].value, ws["B3"].value, ws["C3"].value, ws["D3"].value,
+            ws["E3"].value, ws["F3"].value] == ["W1", "张三", "大西A101", "13800000001", "经济", 6]
+
+    dinner = MealInfo(total_meals=1, grade="豪华", count=1, meal_type="晚餐")
+    assert write_order_row(ws, order, dinner, "晚餐") == 3
+    assert [ws["G3"].value, ws["H3"].value, ws["K3"].value, ws["L3"].value] == \
+        ["W1", "张三", "豪华", 1]
+
+    assert write_order_row(ws, order, lunch, "午餐") == 4
+
+
+def test_get_first_empty_row_skips_leading_placeholder_rows():
+    ws = Workbook().active
+    ws["A1"] = "表头"
+    ws["A2"] = "占位"
+    assert get_first_empty_row(ws) == 3

@@ -145,6 +145,12 @@ def _asset_url(asset: dict[str, Any] | None) -> str:
     return str(asset.get("browser_download_url") or asset.get("download_url") or asset.get("url") or "")
 
 
+def _embedded_asset_sha256(asset: dict[str, Any] | None) -> str:
+    """Return the SHA-256 embedded in a latest.json asset entry, when valid."""
+    value = str((asset or {}).get("sha256") or "").strip().lower()
+    return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
+
+
 def select_platform_assets(assets: list[dict[str, Any]] | tuple[dict[str, Any], ...],
                            *, platform: str | None = None, architecture: str | None = None) -> tuple[dict[str, Any], ...]:
     """Filter release assets by platform/architecture and safe file names."""
@@ -431,15 +437,27 @@ def download_and_install(
             raise UpdateError("Downloaded file is not a valid Windows executable")
     checksum_asset = release.checksum_asset
     checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
-    if not _trusted_url(checksum_url):
-        temporary.unlink(missing_ok=True)
-        raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+    # latest.json 内嵌的官方哈希：GitHub 直连不可达（镜像存在的场景）时，
+    # 校验文件同样拉不到，此时回退到清单内嵌的同一 SHA-256。发布工作流会把
+    # 官方哈希同时写入校验文件与清单。镜像若被完全控制，此回退理论上可被
+    # 绕过；彻底方案是为 exe 做代码签名。
+    embedded_hash = _embedded_asset_sha256(release.executable_asset)
     try:
         if stage_callback:
             stage_callback("校验安装包")
-        checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-        with (opener or urlopen)(checksum_request, timeout=timeout) as response:
-            expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+        if _trusted_url(checksum_url):
+            try:
+                checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+                with (opener or urlopen)(checksum_request, timeout=timeout) as response:
+                    expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+            except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+                expected_hash = embedded_hash
+                if not expected_hash:
+                    raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+        else:
+            expected_hash = embedded_hash
+            if not expected_hash:
+                raise UpdateError("Release does not contain a trusted SHA-256 checksum")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid SHA-256")
         actual_hash = hashlib.sha256(temporary.read_bytes()).hexdigest()
@@ -694,15 +712,23 @@ def _download_and_install_macos(
 
     checksum_asset = release.macos_checksum_asset
     checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
-    if not _trusted_url(checksum_url):
-        shutil.rmtree(workdir, ignore_errors=True)
-        raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+    embedded_hash = _embedded_asset_sha256(release.macos_asset)
     try:
         if stage_callback:
             stage_callback("校验安装包")
-        checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-        with (opener or urlopen)(checksum_request, timeout=timeout) as response:
-            expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+        if _trusted_url(checksum_url):
+            try:
+                checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+                with (opener or urlopen)(checksum_request, timeout=timeout) as response:
+                    expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+            except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+                expected_hash = embedded_hash
+                if not expected_hash:
+                    raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+        else:
+            expected_hash = embedded_hash
+            if not expected_hash:
+                raise UpdateError("Release does not contain a trusted SHA-256 checksum")
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid SHA-256")
         actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()

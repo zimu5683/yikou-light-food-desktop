@@ -1,3 +1,3 @@
-﻿"""涓€鍙ｈ交椋?desktop application package."""
+"""一口轻食 desktop application package."""
 
 __version__ = "2.0.2"

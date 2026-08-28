@@ -1,6 +1,7 @@
 import io
 import hashlib
 import os
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -122,3 +123,68 @@ def test_only_canonical_executable_asset_is_selected():
         ({"name": "helper.exe", "browser_download_url": "https://github.com/helper.exe"},),
     )
     assert release.executable_asset is None
+
+
+@pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")
+def test_checksum_falls_back_to_embedded_manifest_hash(tmp_path, monkeypatch):
+    # GitHub 直连不可达、.sha256 校验文件拉不到时，使用 latest.json 内嵌哈希。
+    payload = b"MZ" + b"y" * 1_000_000
+    digest = hashlib.sha256(payload).hexdigest()
+
+    def opener(request, timeout):
+        if request.full_url.endswith(".sha256"):
+            raise urllib.error.URLError("github unreachable")
+        return io.BytesIO(payload)
+
+    release = ReleaseInfo(
+        tag_name="v1.3.3",
+        name="v1.3.3",
+        body="",
+        html_url="",
+        assets=(
+            {
+                "name": "yikou-light-food.exe",
+                "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.3/yikou-light-food.exe",
+                "sha256": digest,
+            },
+            {
+                "name": "yikou-light-food.exe.sha256",
+                "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.3/yikou-light-food.exe.sha256",
+            },
+        ),
+    )
+    target = tmp_path / "一口轻食.exe"
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append(args))
+
+    download_and_install(release, current_executable=target, opener=opener)
+
+    assert launched[0][1] == "--apply-update"
+    Path(launched[0][0]).unlink()
+    target.with_name(f".{target.stem}.update-{os.getpid()}.tmp").unlink()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")
+def test_update_without_checksum_source_is_rejected(tmp_path):
+    # 既没有可信校验地址也没有内嵌哈希时，必须拒绝安装。
+    payload = b"MZ" + b"y" * 1_000_000
+    release = ReleaseInfo(
+        tag_name="v1.3.3",
+        name="v1.3.3",
+        body="",
+        html_url="",
+        assets=(
+            {
+                "name": "yikou-light-food.exe",
+                "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v1.3.3/yikou-light-food.exe",
+            },
+        ),
+    )
+    target = tmp_path / "app.exe"
+
+    def opener(request, timeout):
+        return io.BytesIO(payload)
+
+    with pytest.raises(UpdateError, match="trusted SHA-256 checksum"):
+        download_and_install(release, current_executable=target, opener=opener)
+    assert not target.with_name(f".app.update-{os.getpid()}.tmp").exists()

@@ -574,8 +574,16 @@ class App(tk.Tk):
         query = self._search_var.get().strip().lower()
         if not query:
             return
-        for index, line in enumerate(self._log_lines):
-            if query in line.lower():
+        # Repeated searches walk through all matches (wrapping around) instead
+        # of stopping at the first one; a new query or 清除 restarts the scan.
+        if getattr(self, "_search_query", None) != query:
+            self._search_query = query
+            self._search_index = -1
+        total = len(self._log_lines)
+        for offset in range(total):
+            index = (self._search_index + 1 + offset) % total
+            if query in self._log_lines[index].lower():
+                self._search_index = index
                 self.log.configure(state="normal")
                 self.log.tag_remove("search_hit", "1.0", "end")
                 start = f"{index + 1}.0"
@@ -585,10 +593,13 @@ class App(tk.Tk):
                 self.log.see(start)
                 self.log.configure(state="disabled")
                 return
+        self._search_index = -1
         messagebox.showinfo("搜索结果", f"未找到包含“{self._search_var.get().strip()}”的订单日志。")
 
     def clear_log_search(self) -> None:
         self._search_var.set("")
+        self._search_query = None
+        self._search_index = -1
         self.log.configure(state="normal")
         self.log.tag_remove("search_hit", "1.0", "end")
         self.log.configure(state="disabled")

@@ -69,3 +69,17 @@ def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
     path = tmp_path / "orders.xlsm"
     assert _load_order_workbook(path, loader) is workbook
     assert calls == [(path, {"keep_vba": True})]
+
+
+def test_malformed_config_is_backed_up_before_reset(tmp_path):
+    from app.config import AppConfig
+
+    target = tmp_path / "config.json"
+    target.write_text("{broken", encoding="utf-8")
+
+    config = AppConfig.load(target)
+
+    # GUI 随后会用默认值覆盖写回，因此坏文件必须先留档供用户检查恢复。
+    assert config.excel_path is None
+    assert not target.exists()
+    assert target.with_name("config.json.bak").read_text(encoding="utf-8") == "{broken"

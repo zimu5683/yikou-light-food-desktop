@@ -93,15 +93,30 @@ def _macos_browser_paths(browser: str) -> list[Path]:
     return [root / app_name / "Contents" / "MacOS" / executable for root in app_roots]
 
 
+_CHROMIUM_PATH_CACHE: Path | None = None
+
+
 def _playwright_chromium_path() -> Path | None:
-    """Return Playwright's Chromium executable when the browser payload exists."""
+    """Return Playwright's Chromium executable when the browser payload exists.
+
+    Each lookup spawns Playwright's Node driver subprocess, so a positive
+    result is cached for the lifetime of the process.  A failed lookup is not
+    cached: after ``_install_chromium`` the next call must find the new
+    payload without explicit invalidation.
+    """
+    global _CHROMIUM_PATH_CACHE
+    if _CHROMIUM_PATH_CACHE is not None:
+        return _CHROMIUM_PATH_CACHE
     try:
         from playwright.sync_api import sync_playwright
         with sync_playwright() as playwright:
             path = Path(playwright.chromium.executable_path)
-        return path if path.is_file() else None
+        if path.is_file():
+            _CHROMIUM_PATH_CACHE = path
+            return path
     except Exception:
-        return None
+        pass
+    return None
 
 
 def _emit(callback: Callable[[str], Any] | None, message: str) -> None:
@@ -337,7 +352,7 @@ def ensure_browser(mode: str = "auto", allow_install: bool = True) -> str:
         return "chrome"
     if found.get("chromium"):
         return "chromium"
-    if allow_install and not getattr(sys, "frozen", False):
+    if allow_install:
         try:
             _install_chromium()
         except Exception as exc:
@@ -361,18 +376,24 @@ def _install_chromium() -> None:
     from playwright._impl._driver import compute_driver_executable, get_driver_env
 
     driver, cli = compute_driver_executable()
-    subprocess.run(
+    result = subprocess.run(
         [driver, cli, "install", "chromium"],
-        check=True,
         env=get_driver_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
     )
+    if result.returncode != 0:
+        # 输出可能很长（下载进度），只保留尾部关键错误信息用于排障。
+        tail = (result.stdout or "").strip()[-500:]
+        raise RuntimeError(f"Playwright Chromium 安装失败（退出码 {result.returncode}）：{tail}")
 
 
 def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
-    preferred = ensure_browser(mode, allow_install=(str(mode or "auto").lower() == "auto"))
+    # 任务启动不静默下载浏览器：打包版里下载没有任何进度提示，缺浏览器时
+    # 报错交给 GUI 的「检查浏览器」按钮或 --install-browser 显式安装。
+    allow_install = str(mode or "auto").lower() == "auto" and not getattr(sys, "frozen", False)
+    preferred = ensure_browser(mode, allow_install=allow_install)
     kwargs = {"headless": headless, "args": ["--window-size=1300,900"]}
     executable = detect_browsers().get(preferred)
     if not executable:
@@ -480,7 +501,8 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 if submit is None:
                     raise _locator_failure(page, "登录按钮")
                 submit.click(timeout=timeout)
-                page.wait_for_url("**/workbench/store", timeout=timeout)
+                login_step = _locator_step(locators, "登录成功")
+                page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
 
                 _navigate(page, "门店地址", locators, base_url, timeout, progress_callback)
                 _navigate(page, "订单菜单", locators, base_url, timeout, progress_callback)

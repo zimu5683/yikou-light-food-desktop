@@ -208,6 +208,27 @@ def _wait_modal_close(page: Any, locators: dict[str, Any] | None, timeout: int,
     _emit(callback, "订单创建完成，页面已就绪")
 
 
+def _recover_sss_page(page: Any, locators: dict[str, Any] | None, timeout: int,
+                      callback: Callable[[str], Any] | None) -> None:
+    """下单失败后的兜底恢复：先关掉可能残留的弹窗，再回到可下单状态。
+
+    与订单处理侧的 :func:`_recover_order_table` 对应。全程 best-effort：
+    恢复不成功时留给随后的重试流程自行报错，不在此处打断用户决策。
+    """
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+    if _find_by_candidates(page, _resolve(locators, "创建订单"), timeout)[0] is not None:
+        return
+    try:
+        page.reload(timeout=timeout, wait_until="domcontentloaded")
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+
 def _create_one_order(page: Any, locators: dict[str, Any] | None, order: dict[str, Any],
                       is_dinner: bool, config: Any, timeout: int,
                       callback: Callable[[str], Any] | None) -> None:
@@ -337,6 +358,7 @@ def run_sss_job(config: Any, stop_event: Any,
                         if decision_callback is not None:
                             decision = decision_callback(identifier, str(exc)).lower()
                             if decision == "retry":
+                                _recover_sss_page(page, locators, timeout, progress_callback)
                                 try:
                                     _create_one_order(page, locators, order, is_dinner, config, timeout, progress_callback)
                                     created += 1

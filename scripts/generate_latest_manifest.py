@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from urllib.request import Request, urlopen
 
 
@@ -47,18 +49,29 @@ def main() -> int:
     if payload is None:
         raise RuntimeError("timed out waiting for all platform release assets")
 
+    # 官方 SHA-256 同时内嵌进清单：GitHub 直连不可达、.sha256 校验文件拉不到
+    # 时，更新器可回退使用此处内嵌的同一官方哈希（镜像被完全控制时该回退
+    # 理论上可被绕过，彻底方案是为 exe 做代码签名）。
+    checksum_files = {
+        "yikou-light-food.exe": Path("dist") / "yikou-light-food.exe.sha256",
+        "yikou-light-food-macos.zip": Path("dist") / "yikou-light-food-macos.zip.sha256",
+    }
     assets = []
     for item in payload.get("assets", []):
         name = str(item.get("name") or "")
         if name not in REQUIRED:
             continue
-        assets.append({
+        entry = {
             "name": name,
             "url": item.get("browser_download_url"),
             "size": item.get("size"),
             "sha256_url": next((other.get("browser_download_url") for other in payload.get("assets", [])
                                 if other.get("name") == f"{name}.sha256"), None),
-        })
+        }
+        embedded = _read_checksum_file(checksum_files.get(name))
+        if embedded:
+            entry["sha256"] = embedded
+        assets.append(entry)
 
     patches = _load_patches(payload)
     manifest = {
@@ -75,6 +88,17 @@ def main() -> int:
         handle.write("\n")
     subprocess.run(["gh", "release", "upload", tag, "latest.json", "--repo", repository, "--clobber"], check=True)
     return 0
+
+
+def _read_checksum_file(path: Path | None) -> str:
+    """Read a ``<sha256>  <filename>`` checksum file produced by the builds."""
+    if path is None or not path.is_file():
+        return ""
+    try:
+        first = path.read_text(encoding="ascii").strip().split()[0].lower()
+    except (OSError, UnicodeError, IndexError):
+        return ""
+    return first if re.fullmatch(r"[0-9a-f]{64}", first) else ""
 
 
 def _load_patches(payload: dict) -> list[dict]:

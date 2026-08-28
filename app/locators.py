@@ -42,6 +42,10 @@ DEFAULT_LOCATORS: Dict[str, Any] = {
             {"text": "立即登录"},
         ],
     },
+    # 登录成功后的跳转地址同样允许用户侧配置，网站改版时不需改代码。
+    "登录成功": {
+        "wait_url": "**/workbench/store",
+    },
     "门店地址": {
         "goto": "{base}home",
         "wait_url": "**/home",

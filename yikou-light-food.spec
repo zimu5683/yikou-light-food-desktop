@@ -1,4 +1,4 @@
-﻿# PyInstaller build specification for the desktop application.
+# PyInstaller build specification for the desktop application.
 # Build with: python -m PyInstaller --clean --noconfirm yikou-light-food.spec
 from pathlib import Path
 import sys

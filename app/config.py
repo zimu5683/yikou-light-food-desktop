@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -28,7 +29,7 @@ def user_data_dir() -> Path:
     """Return a per-user writable directory, independent of the repository."""
     if os.name == "nt":
         root = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
-    elif os.sys.platform == "darwin":
+    elif sys.platform == "darwin":
         root = Path.home() / "Library" / "Application Support"
     else:
         root = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -134,7 +135,13 @@ class AppConfig:
             values = {k: v for k, v in payload.items() if k in valid and k != "config_path"}
             return cls(**values, config_path=str(target))
         except (OSError, ValueError, TypeError):
-            # A malformed config should not prevent the application starting.
+            # A malformed config must not prevent the application starting,
+            # but the GUI saves defaults over it on the next run, so keep a
+            # copy the user can still inspect or restore.
+            try:
+                target.replace(target.with_name(target.name + ".bak"))
+            except OSError:
+                pass
             return cls(config_path=str(target))
 
     def save(self, path: Optional[os.PathLike[str] | str] = None) -> Path:

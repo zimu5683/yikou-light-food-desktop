@@ -1,4 +1,4 @@
-﻿from playwright.sync_api import sync_playwright, TimeoutError
+from playwright.sync_api import sync_playwright, TimeoutError
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell

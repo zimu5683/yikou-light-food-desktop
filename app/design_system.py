@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
-import hashlib
 import os
 import tkinter as tk
 from tkinter import font as tkfont
@@ -265,57 +264,12 @@ def pill_cap_geometry(width: int, height: int, inset: int = 0) -> tuple[int, int
     return inset, inset, width - inset, height - inset, cap_width
 
 
-def image_cache_key(width: int, height: int, radius: int, fill: str, outline: str = "") -> str:
-    """Return a stable debug key for a rendered component image."""
-    return hashlib.sha1(f"{width}:{height}:{radius}:{fill}:{outline}".encode()).hexdigest()
-
-
 def _tk_dpi_scale(widget: tk.Misc) -> float:
     try:
         value = float(widget.tk.call("tk", "scaling"))
         return max(0.75, min(3.0, value))
     except (tk.TclError, TypeError, ValueError):
         return 1.0
-
-
-def _draw_scalable_surface(canvas: tk.Canvas, width: int, height: int, *,
-                           fill: str, outline: str, shadow: str,
-                           dpi_scale: float) -> list[ImageTk.PhotoImage]:
-    """Paint a scalable rounded surface without allocating a large bitmap."""
-    canvas.delete("card-shape")
-    if width < 2 or height < 2:
-        return []
-    tiles = render_rounded_corner_tiles(TOKENS.radius_card, fill, outline=outline,
-                                        shadow=shadow, dpi_scale=dpi_scale)
-    photos = [ImageTk.PhotoImage(tiles[name]) for name in
-              ("top_left", "top_right", "bottom_left", "bottom_right")]
-    corner = photos[0].width()
-    shadow_offset = max(1, int(round(2 * dpi_scale)))
-    # Straight portions are deliberately native Canvas rectangles; only the
-    # four corners require antialiased Pillow pixels.
-    canvas.create_rectangle(corner, shadow_offset, max(corner, width - corner), height,
-                            fill=shadow, outline="", tags="card-shape")
-    canvas.create_rectangle(shadow_offset, corner, width, max(corner, height - corner),
-                            fill=shadow, outline="", tags="card-shape")
-    canvas.create_rectangle(corner, 0, max(corner, width - corner), max(1, height - shadow_offset),
-                            fill=fill, outline="", tags="card-shape")
-    canvas.create_rectangle(0, corner, max(1, width - shadow_offset), max(corner, height - corner),
-                            fill=fill, outline="", tags="card-shape")
-    if outline:
-        canvas.create_line(corner, 0, max(corner, width - corner), 0,
-                           fill=outline, width=1, tags="card-shape")
-        canvas.create_line(0, corner, 0, max(corner, height - corner),
-                           fill=outline, width=1, tags="card-shape")
-        canvas.create_line(corner, max(1, height - 1), max(corner, width - corner), max(1, height - 1),
-                           fill=outline, width=1, tags="card-shape")
-        canvas.create_line(max(1, width - 1), corner, max(1, width - 1), max(corner, height - corner),
-                           fill=outline, width=1, tags="card-shape")
-    positions = ((0, 0), (width - corner, 0), (0, height - corner),
-                 (width - corner, height - corner))
-    for photo, (x, y) in zip(photos, positions):
-        canvas.create_image(max(0, x), max(0, y), anchor="nw", image=photo, tags="card-shape")
-    canvas.tag_lower("card-shape")
-    return photos
 
 
 def _create_surface_parts(canvas: tk.Canvas, *, fill: str, outline: str,
@@ -432,24 +386,6 @@ def calculate_scrollregion(view_width: int, view_height: int, content_width: int
     padding = max(0, int(padding))
     return (0, 0, max(view_width, content_width + padding * 2),
             max(view_height, content_height + padding * 2))
-
-
-def _rounded_rectangle(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float,
-                       radius: float, *, fill: str, outline: str = "", width: int = 0) -> tuple[int, ...]:
-    """Draw a rounded rectangle using Canvas primitives available on all Tk builds."""
-
-    radius = max(0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
-    ids = (
-        canvas.create_rectangle(x1 + radius, y1, x2 - radius, y2, fill=fill, outline=""),
-        canvas.create_rectangle(x1, y1 + radius, x2, y2 - radius, fill=fill, outline=""),
-        canvas.create_arc(x1, y1, x1 + 2 * radius, y1 + 2 * radius, start=90, extent=90, fill=fill, outline=""),
-        canvas.create_arc(x2 - 2 * radius, y1, x2, y1 + 2 * radius, start=0, extent=90, fill=fill, outline=""),
-        canvas.create_arc(x1, y2 - 2 * radius, x1 + 2 * radius, y2, start=180, extent=90, fill=fill, outline=""),
-        canvas.create_arc(x2 - 2 * radius, y2 - 2 * radius, x2, y2, start=270, extent=90, fill=fill, outline=""),
-    )
-    if outline:
-        ids += (canvas.create_arc(x1, y1, x1 + 2 * radius, y1 + 2 * radius, start=90, extent=90, outline=outline, width=width),)
-    return ids
 
 
 class ResponsiveSplitPane(tk.Frame):
@@ -1040,5 +976,5 @@ class StatusBadge(tk.Canvas):
         label, fill = STATUS_STYLES.get(self._state, STATUS_STYLES["ready"])
         foreground = TOKENS.house if self._state in {"ready", "success", "stopping", "updating"} else TOKENS.text_on_dark
         self.delete("all")
-        self.create_oval(4, 10, 10, 16, fill=foreground, outline="")
+        self.create_oval(4, 10, 10, 16, fill=fill, outline="")
         self.create_text(17, 13, text=label, anchor="w", fill=foreground, font=(FONT_FAMILY, 10, "bold"))

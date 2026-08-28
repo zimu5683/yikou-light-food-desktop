@@ -97,3 +97,41 @@ def test_find_order_cell_traverses_pagination():
     cell = automation._find_order_cell(page, "W1", config, None)
     assert cell.count() == 1
     assert page.page_number == 2
+
+
+def test_ensure_browser_explicit_install_works_when_frozen(monkeypatch):
+    # 打包版里显式入口（「检查浏览器」按钮 / --install-browser）必须可以安装。
+    calls = []
+    monkeypatch.setattr(
+        automation, "detect_browsers",
+        lambda: ({"msedge": None, "chrome": None, "chromium": None} if not calls
+                 else {"msedge": None, "chrome": None, "chromium": "/tmp/chromium"}),
+    )
+    monkeypatch.setattr(automation, "_install_chromium", lambda: calls.append(True))
+    monkeypatch.setattr(automation.sys, "frozen", True, raising=False)
+    assert automation.ensure_browser() == "chromium"
+    assert calls == [True]
+
+
+def test_launch_browser_does_not_silently_install_when_frozen(monkeypatch):
+    # 打包版任务启动时不静默下载浏览器，缺浏览器时交由 GUI 显式引导。
+    captured = {}
+    monkeypatch.setattr(automation.sys, "frozen", True, raising=False)
+
+    def fake_ensure(mode="auto", allow_install=True):
+        captured["allow_install"] = allow_install
+        return "msedge"
+
+    monkeypatch.setattr(automation, "ensure_browser", fake_ensure)
+    monkeypatch.setattr(automation, "detect_browsers",
+                        lambda: {"msedge": "C:/edge.exe", "chrome": None, "chromium": None})
+
+    class FakeChromium:
+        def launch(self, **_kwargs):
+            return "browser"
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    assert automation._launch_browser(FakePlaywright(), "auto", True) == "browser"
+    assert captured["allow_install"] is False
