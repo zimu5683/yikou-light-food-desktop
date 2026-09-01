@@ -158,13 +158,78 @@ jobs:
           path: yikou-light-food-macos.zip.sha256
           if-no-files-found: error
 
-  # latest.json needs the Windows checksum/patch metadata AND the macOS
-  # archive checksum, so it runs as a job that depends on both builds instead
-  # of polling another workflow with a timeout.  It remains the only place
-  # that uploads latest.json, so the patches field can never be clobbered by
-  # a parallel job publishing an empty manifest.
+  # ubuntu-22.04 (glibc 2.35) keeps the frozen binary compatible with older
+  # distributions than ubuntu-latest would.
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Verify release tag matches application version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version="$(python3 -c 'from app import __version__; print(__version__)')"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: Build tarball
+        run: bash scripts/build_linux.sh
+      - name: Smoke-test application imports on Linux
+        run: |
+          python3 -c "import app.main, app.gui, app.automation, app.sss, app.updater, app.design_system; print('imports OK on Linux')"
+      - name: Verify binary and archive
+        run: |
+          test -x dist/yikou-light-food
+          file dist/yikou-light-food
+          ./dist/yikou-light-food --version
+          test -s yikou-light-food-linux-x64.tar.gz
+          tar -tzf yikou-light-food-linux-x64.tar.gz | grep -x "yikou-light-food"
+          sha256sum -c yikou-light-food-linux-x64.tar.gz.sha256
+      # Boot the frozen GUI headlessly; a startup crash (e.g. a module the
+      # PyInstaller analysis missed) must fail the release before publishing.
+      - name: Smoke-test frozen GUI under Xvfb
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
+          set +e
+          timeout 25 xvfb-run -a ./dist/yikou-light-food > gui-smoke.log 2>&1
+          CODE=$?
+          set -e
+          if [ "$CODE" -ne 124 ]; then
+            echo "frozen GUI exited during startup (exit ${CODE})"
+            cat gui-smoke.log
+            exit 1
+          fi
+          echo "frozen GUI started successfully"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: yikou-light-food-linux
+          path: |
+            yikou-light-food-linux-x64.tar.gz
+            yikou-light-food-linux-x64.tar.gz.sha256
+      - name: Publish Linux tarball to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            yikou-light-food-linux-x64.tar.gz
+            yikou-light-food-linux-x64.tar.gz.sha256
+          fail_on_unmatched_files: true
+      - name: Upload checksum metadata for manifest
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-release-meta
+          path: yikou-light-food-linux-x64.tar.gz.sha256
+          if-no-files-found: error
+
+  # latest.json needs the Windows checksum/patch metadata, the macOS archive
+  # checksum and the Linux archive checksum, so it runs as a job that depends
+  # on all three builds instead of polling another workflow with a timeout.
+  # It remains the only place that uploads latest.json, so the patches field
+  # can never be clobbered by a parallel job publishing an empty manifest.
   publish-manifest:
-    needs: [build-windows, build-macos]
+    needs: [build-windows, build-macos, build-linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
@@ -181,6 +246,11 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: macos-release-meta
+          path: dist
+      - name: Download Linux checksum metadata
+        uses: actions/download-artifact@v7
+        with:
+          name: linux-release-meta
           path: dist
       - name: Generate latest.json manifest
         env:

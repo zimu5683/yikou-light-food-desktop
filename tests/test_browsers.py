@@ -20,6 +20,31 @@ def test_detect_browsers_finds_macos_app_paths(monkeypatch, tmp_path):
     assert result["msedge"].endswith("Microsoft Edge")
 
 
+def test_linux_browser_paths_resolves_distro_commands(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/google-chrome-stable" if name == "google-chrome-stable" else None
+
+    monkeypatch.setattr(automation.shutil, "which", fake_which)
+    chrome = [str(path) for path in automation._linux_browser_paths("chrome")]
+    assert "/usr/bin/google-chrome-stable" in chrome
+    assert "/opt/google/chrome/chrome" in chrome
+    assert automation._linux_browser_paths("msedge") == [automation.Path("/opt/microsoft/msedge/msedge")]
+
+
+def test_detect_browsers_finds_linux_chrome(monkeypatch, tmp_path):
+    chrome = tmp_path / "opt/google/chrome/chrome"
+    chrome.parent.mkdir(parents=True)
+    chrome.touch()
+    monkeypatch.setattr(automation.os, "name", "posix")
+    monkeypatch.setattr(automation.sys, "platform", "linux")
+    monkeypatch.setattr(automation, "_linux_browser_paths", lambda browser: [chrome] if browser == "chrome" else [])
+    monkeypatch.setattr(automation.shutil, "which", lambda _: None)
+    monkeypatch.setattr(automation, "_playwright_chromium_path", lambda: None)
+    result = automation.detect_browsers()
+    assert result["chrome"] == str(chrome)
+    assert result["msedge"] is None
+
+
 def test_detect_browsers_finds_playwright_chromium(monkeypatch):
     expected = str(automation.Path("C:/tmp/chromium"))
     monkeypatch.setattr(automation.shutil, "which", lambda _: None)

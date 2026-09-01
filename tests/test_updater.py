@@ -125,6 +125,46 @@ def test_only_canonical_executable_asset_is_selected():
     assert release.executable_asset is None
 
 
+def test_select_platform_assets_filters_linux_archives():
+    from app.updater import select_platform_assets
+
+    assets = (
+        {"name": "yikou-light-food.exe"},
+        {"name": "yikou-light-food-macos.zip"},
+        {"name": "yikou-light-food-linux-x64.tar.gz"},
+        {"name": "yikou-light-food-linux-x64.tar.gz.sha256"},
+        {"name": "latest.json"},
+    )
+    selected = select_platform_assets(assets, platform="linux", architecture="x64")
+    assert [item["name"] for item in selected] == ["yikou-light-food-linux-x64.tar.gz"]
+
+
+def test_release_linux_assets_are_selected():
+    from app.updater import _decode_release
+
+    release = _decode_release({
+        "tag_name": "v2.1.0",
+        "assets": [
+            {"name": "yikou-light-food-linux-x64.tar.gz", "browser_download_url": "https://github.com/example/yikou-light-food-linux-x64.tar.gz"},
+            {"name": "yikou-light-food-linux-x64.tar.gz.sha256", "browser_download_url": "https://github.com/example/yikou-light-food-linux-x64.tar.gz.sha256"},
+        ],
+    })
+    assert release.linux_asset["name"] == "yikou-light-food-linux-x64.tar.gz"
+    assert release.linux_checksum_asset["name"] == "yikou-light-food-linux-x64.tar.gz.sha256"
+
+
+def test_linux_download_and_install_is_not_supported(monkeypatch):
+    # Linux 暂不支持自动安装：检查到新版本后由 GUI 引导前往 Release 页面。
+    monkeypatch.setattr("app.updater.sys.platform", "linux")
+    monkeypatch.setattr("app.updater.os.name", "posix")
+    release = ReleaseInfo(
+        "v2.1.0", "v2.1.0", "", "",
+        ({"name": "yikou-light-food-linux-x64.tar.gz", "browser_download_url": "https://github.com/example/yikou-light-food-linux-x64.tar.gz"},),
+    )
+    with pytest.raises(UpdateError, match="Windows and macOS"):
+        download_and_install(release)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")
 def test_checksum_falls_back_to_embedded_manifest_hash(tmp_path, monkeypatch):
     # GitHub 直连不可达、.sha256 校验文件拉不到时，使用 latest.json 内嵌哈希。

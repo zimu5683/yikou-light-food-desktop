@@ -14,6 +14,8 @@ env/
 build/
 dist/
 *.spec~
+yikou-light-food-linux-*.tar.gz
+yikou-light-food-linux-*.tar.gz.sha256
 
 # Local configuration and credentials
 .env

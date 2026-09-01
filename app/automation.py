@@ -78,6 +78,9 @@ def detect_browsers() -> dict[str, str | None]:
     elif sys.platform == "darwin":
         candidates["msedge"] += _macos_browser_paths("msedge")
         candidates["chrome"] += _macos_browser_paths("chrome")
+    else:
+        candidates["msedge"] += _linux_browser_paths("msedge")
+        candidates["chrome"] += _linux_browser_paths("chrome")
     chromium = _playwright_chromium_path()
     if chromium:
         candidates["chromium"].append(chromium)
@@ -91,6 +94,17 @@ def _macos_browser_paths(browser: str) -> list[Path]:
         "chrome": ("Google Chrome.app", "Google Chrome"),
     }[browser]
     return [root / app_name / "Contents" / "MacOS" / executable for root in app_roots]
+
+
+def _linux_browser_paths(browser: str) -> list[Path]:
+    """Resolve distro browser executables whose names differ from ``msedge``/``chrome``."""
+    commands, fixed = {
+        "msedge": (("microsoft-edge", "microsoft-edge-stable"), ("/opt/microsoft/msedge/msedge",)),
+        "chrome": (("google-chrome", "google-chrome-stable"), ("/opt/google/chrome/chrome",)),
+    }[browser]
+    paths = [Path(found) for name in commands if (found := shutil.which(name))]
+    paths += [Path(target) for target in fixed]
+    return paths
 
 
 _CHROMIUM_PATH_CACHE: Path | None = None

@@ -10,6 +10,10 @@ datas, binaries, hiddenimports = collect_all("playwright")
 # The browser payload is machine-specific and is intentionally not bundled.
 datas = [item for item in datas if ".local-browsers" not in str(item[0])]
 binaries = [item for item in binaries if ".local-browsers" not in str(item[0])]
+# Pillow's C extension ``PIL._imagingtk`` imports ``PIL._tkinter_finder`` only
+# at runtime, and hook-PIL excludes tkinter-derived edges, so static analysis
+# never sees it; without this the GUI crashes on first ImageTk.PhotoImage use.
+hiddenimports = hiddenimports + ["PIL.ImageTk", "PIL._tkinter_finder"]
 
 analysis = Analysis(
     [str(project / "run.py")],

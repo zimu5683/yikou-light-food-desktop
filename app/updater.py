@@ -116,6 +116,27 @@ class ReleaseInfo:
             return {"name": "yikou-light-food-macos.zip.sha256", "browser_download_url": checksum_url}
         return None
 
+    @property
+    def linux_asset(self) -> dict[str, Any] | None:
+        """Return the Linux archive attached to this release."""
+        for asset in self.assets:
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food-linux-x64.tar.gz" and safe_asset_name(name):
+                return asset
+        return None
+
+    @property
+    def linux_checksum_asset(self) -> dict[str, Any] | None:
+        for asset in self.assets:
+            name = str(asset.get("name") or "").lower()
+            if name == "yikou-light-food-linux-x64.tar.gz.sha256" and safe_asset_name(name):
+                return asset
+        archive = self.linux_asset
+        checksum_url = str((archive or {}).get("sha256_url") or "")
+        if checksum_url:
+            return {"name": "yikou-light-food-linux-x64.tar.gz.sha256", "browser_download_url": checksum_url}
+        return None
+
 
 def safe_asset_name(name: str) -> bool:
     """Reject path traversal and unexpected release asset names."""

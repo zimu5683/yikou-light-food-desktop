@@ -28,6 +28,10 @@ def main() -> None:
         from .automation import ensure_browser
         print(ensure_browser("auto"))
         return
+    if "--version" in sys.argv:
+        from . import __version__
+        print(f"yikou-light-food {__version__}")
+        return
     enable_high_dpi_awareness()
     from .gui import main as gui_main
     gui_main()

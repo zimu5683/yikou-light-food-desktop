@@ -16,6 +16,8 @@ REQUIRED = {
     "yikou-light-food.exe.sha256",
     "yikou-light-food-macos.zip",
     "yikou-light-food-macos.zip.sha256",
+    "yikou-light-food-linux-x64.tar.gz",
+    "yikou-light-food-linux-x64.tar.gz.sha256",
 }
 
 
@@ -55,6 +57,7 @@ def main() -> int:
     checksum_files = {
         "yikou-light-food.exe": Path("dist") / "yikou-light-food.exe.sha256",
         "yikou-light-food-macos.zip": Path("dist") / "yikou-light-food-macos.zip.sha256",
+        "yikou-light-food-linux-x64.tar.gz": Path("dist") / "yikou-light-food-linux-x64.tar.gz.sha256",
     }
     assets = []
     for item in payload.get("assets", []):

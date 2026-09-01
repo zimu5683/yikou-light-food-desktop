@@ -1,6 +1,6 @@
 # 一口轻食桌面程序
 
-这是一个使用 Tkinter + Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager 或 macOS Keychain（`keyring`）保存。
+这是一个使用 Tkinter + Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager、macOS Keychain 或 Linux SecretService（GNOME Keyring/KWallet，`keyring`）保存；系统没有可用密钥环时退化为每次运行手动输入。
 
 此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
 
@@ -41,6 +41,28 @@ python run.py
 
 推送版本标签后，GitHub Actions 会构建 `.app`，打包为 `yikou-light-food-macos.zip`，并自动附加到对应的 GitHub Release 下载页面。
 
+## Linux 构建
+
+普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建，Ubuntu 22.04/Debian 12/Fedora 36 及更新版本可直接运行）。解压后执行：
+
+```bash
+tar -xzf yikou-light-food-linux-x64.tar.gz
+chmod +x yikou-light-food
+./yikou-light-food
+```
+
+Linux 版同样具备更新检查：发现新版本后会提示前往 GitHub Release 页面下载新的 tar.gz，按上面的步骤覆盖解压即可。
+
+浏览器方面建议安装系统版 Microsoft Edge（`microsoft-edge-stable`）或 Google Chrome（`google-chrome-stable`），程序会自动识别；也可点击“安装 / 检查浏览器”下载 Playwright Chromium（需要系统已具备常见运行库，缺失时可参照 Playwright 文档安装依赖）。
+
+开发者也可以在 Linux 上从源码构建：
+
+```bash
+./scripts/build_linux.sh
+```
+
+产物为仓库根目录的 `yikou-light-food-linux-<架构>.tar.gz` 及其 SHA-256 校验文件。推送版本标签后，GitHub Actions 会构建并自动附加到对应的 GitHub Release 下载页面。
+
 ## 数据与安全
 
 配置、定位器配置与失败快照保存在用户配置目录（Windows：`%APPDATA%\yikou-light-food`），Excel 文件只在用户选择的位置读写。运行前会创建 `backups/` 时间戳备份。请不要将真实 Excel、日志、密码或浏览器缓存提交到 Git。
@@ -78,6 +100,6 @@ git tag v1.1.0
 git push origin main --tags
 ```
 
-推送 `vX.Y.Z` 标签会触发 Windows 和 macOS 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版 ZIP，源码运行模式也只提示前往 Release 页面。
+推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 打包版可校验、下载并自动安装，macOS 与 Linux 用户收到提示后从 Release 页面下载新版安装包，源码运行模式也只提示前往 Release 页面。
 
 更新包下载后会用官方 SHA-256 校验，校验文件优先从 GitHub 直接拉取；GitHub 直连不可达时改用 `latest.json` 内嵌的同一官方哈希（发布工作流会同时写入两处）。注意：若所使用的下载镜像被完全控制，内嵌回退在理论上可被绕过，彻底方案是为 exe 做代码签名。
