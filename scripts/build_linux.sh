@@ -24,7 +24,9 @@ case "$(uname -m)" in
   *) ARCH_TAG="$(uname -m)" ;;
 esac
 
-TARBALL="$ROOT/yikou-light-food-linux-${ARCH_TAG}.tar.gz"
-tar -czf "$TARBALL" -C "$ROOT/dist" "yikou-light-food"
-sha256sum "$TARBALL" > "$TARBALL.sha256"
-echo "Build complete: $TARBALL"
+# Relative names keep the checksum file usable after download, wherever the
+# user extracts it; an absolute path would leak the CI workspace location.
+NAME="yikou-light-food-linux-${ARCH_TAG}.tar.gz"
+tar -czf "$NAME" -C "$ROOT/dist" "yikou-light-food"
+sha256sum "$NAME" > "$NAME.sha256"
+echo "Build complete: $ROOT/$NAME"
