@@ -25,7 +25,9 @@ def test_linux_browser_paths_resolves_distro_commands(monkeypatch):
         return "/usr/bin/google-chrome-stable" if name == "google-chrome-stable" else None
 
     monkeypatch.setattr(automation.shutil, "which", fake_which)
-    chrome = [str(path) for path in automation._linux_browser_paths("chrome")]
+    # The POSIX literals must compare equal even when the suite runs on Windows,
+    # where Path renders them with backslashes.
+    chrome = [str(path).replace("\\", "/") for path in automation._linux_browser_paths("chrome")]
     assert "/usr/bin/google-chrome-stable" in chrome
     assert "/opt/google/chrome/chrome" in chrome
     assert automation._linux_browser_paths("msedge") == [automation.Path("/opt/microsoft/msedge/msedge")]
