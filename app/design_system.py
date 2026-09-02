@@ -295,26 +295,46 @@ def _create_surface_parts(canvas: tk.Canvas, *, fill: str, outline: str,
     return parts, photos
 
 
+def scroll_viewport_offset(first: float, region_height: int) -> int:
+    """Return the canvas-space y of the viewport top for a scroll fraction."""
+    region_height = max(0, int(region_height))
+    try:
+        fraction = min(1.0, max(0.0, float(first)))
+    except (TypeError, ValueError):
+        return 0
+    return int(round(fraction * region_height))
+
+
 def _update_surface_parts(canvas: tk.Canvas, parts: dict[str, int], width: int, height: int,
-                          photos: list[ImageTk.PhotoImage], dpi_scale: float) -> None:
-    """Move existing surface items instead of rebuilding them per frame."""
+                          photos: list[ImageTk.PhotoImage], dpi_scale: float,
+                          y_offset: int = 0) -> None:
+    """Move existing surface items instead of rebuilding them per frame.
+
+    ``y_offset`` anchors the shape to the current viewport top so scrollable
+    cards can keep the card surface fixed on screen while content scrolls.
+    """
     if width < 2 or height < 2 or not photos:
         return
     corner = photos[0].width()
     shadow_offset = max(1, int(round(2 * dpi_scale)))
-    canvas.coords(parts["shadow_h"], corner, shadow_offset, max(corner, width - corner), height)
-    canvas.coords(parts["shadow_v"], shadow_offset, corner, width, max(corner, height - corner))
-    canvas.coords(parts["fill_h"], corner, 0, max(corner, width - corner), max(1, height - shadow_offset))
-    canvas.coords(parts["fill_v"], 0, corner, max(1, width - shadow_offset), max(corner, height - corner))
+    top = y_offset
+    canvas.coords(parts["shadow_h"], corner, top + shadow_offset,
+                  max(corner, width - corner), top + height)
+    canvas.coords(parts["shadow_v"], shadow_offset, top + corner, width,
+                  top + max(corner, height - corner))
+    canvas.coords(parts["fill_h"], corner, top, max(corner, width - corner),
+                  top + max(1, height - shadow_offset))
+    canvas.coords(parts["fill_v"], 0, top + corner, max(1, width - shadow_offset),
+                  top + max(corner, height - corner))
     if "outline_top" in parts:
-        canvas.coords(parts["outline_top"], corner, 0, max(corner, width - corner), 0)
-        canvas.coords(parts["outline_left"], 0, corner, 0, max(corner, height - corner))
-        canvas.coords(parts["outline_bottom"], corner, max(1, height - 1),
-                      max(corner, width - corner), max(1, height - 1))
-        canvas.coords(parts["outline_right"], max(1, width - 1), corner,
-                      max(1, width - 1), max(corner, height - corner))
-    positions = ((0, 0), (width - corner, 0), (0, height - corner),
-                 (width - corner, height - corner))
+        canvas.coords(parts["outline_top"], corner, top, max(corner, width - corner), top)
+        canvas.coords(parts["outline_left"], 0, top + corner, 0, top + max(corner, height - corner))
+        canvas.coords(parts["outline_bottom"], corner, top + max(1, height - 1),
+                      max(corner, width - corner), top + max(1, height - 1))
+        canvas.coords(parts["outline_right"], max(1, width - 1), top + corner,
+                      max(1, width - 1), top + max(corner, height - corner))
+    positions = ((0, top), (width - corner, top), (0, top + height - corner),
+                 (width - corner, top + height - corner))
     for name, (x, y) in zip(("top_left", "top_right", "bottom_left", "bottom_right"), positions):
         canvas.coords(parts[name], max(0, x), max(0, y))
 
@@ -596,6 +616,8 @@ class ScrollableRoundedCard(tk.Frame):
         self._surface_photos: list[ImageTk.PhotoImage] = []
         self._surface_parts: dict[str, int] | None = None
         self._surface_style_key: tuple[float, str, str, str] | None = None
+        self._surface_view: tuple[int, int, float] | None = None
+        self._view_offset: int | None = None
         self._redraw_job: str | None = None
         self._last_surface_size: tuple[int, int, float] | None = None
         self._active = False
@@ -666,6 +688,31 @@ class ScrollableRoundedCard(tk.Frame):
                 self.scrollbar.pack(side="right", fill="y")
         elif self.scrollbar.winfo_ismapped():
             self.scrollbar.pack_forget()
+        self._sync_surface_to_view(float(first))
+
+    def _scrollregion_height(self) -> int:
+        try:
+            region = [int(float(value)) for value in str(self.canvas.cget("scrollregion")).split()]
+        except (tk.TclError, ValueError):
+            return 0
+        return region[3] if len(region) == 4 else 0
+
+    def _sync_surface_to_view(self, first: float | None = None) -> None:
+        """Keep the card shape covering the viewport as the content scrolls."""
+        if self._surface_parts is None or self._surface_view is None:
+            return
+        if first is None:
+            try:
+                first = self.canvas.yview()[0]
+            except tk.TclError:
+                return
+        offset = scroll_viewport_offset(first, self._scrollregion_height())
+        if offset == self._view_offset:
+            return
+        self._view_offset = offset
+        width, height, scale = self._surface_view
+        _update_surface_parts(self.canvas, self._surface_parts, width, height,
+                              self._surface_photos, scale, y_offset=offset)
 
     def _update_scrollregion(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         self.after_idle(self._set_scrollregion)
@@ -704,8 +751,11 @@ class ScrollableRoundedCard(tk.Frame):
                 shadow=TOKENS.shadow, dpi_scale=scale,
             )
             self._surface_style_key = style_key
-        _update_surface_parts(self.canvas, self._surface_parts, width, height,
-                              self._surface_photos, scale)
+            # Fresh items carry default coordinates; force one repaint even if
+            # the viewport offset did not change.
+            self._view_offset = None
+        self._surface_view = (width, height, scale)
+        self._sync_surface_to_view()
         self._set_scrollregion()
 
     def destroy(self) -> None:
@@ -965,6 +1015,7 @@ class StatusBadge(tk.Canvas):
     def __init__(self, master: tk.Misc, *, state: str = "ready", **kwargs: object) -> None:
         super().__init__(master, width=92, height=30, highlightthickness=0, bd=0,
                          bg=kwargs.pop("bg", TOKENS.house), **kwargs)
+        self._font = tkfont.Font(family=FONT_FAMILY, size=10, weight="bold")
         self._state = state
         self._draw()
 
@@ -975,6 +1026,8 @@ class StatusBadge(tk.Canvas):
     def _draw(self) -> None:
         label, fill = STATUS_STYLES.get(self._state, STATUS_STYLES["ready"])
         foreground = TOKENS.house if self._state in {"ready", "success", "stopping", "updating"} else TOKENS.text_on_dark
+        # A fixed width clips CJK labels at high DPI; size to the measured text.
+        self.configure(width=max(92, self._font.measure(label) + 26))
         self.delete("all")
         self.create_oval(4, 10, 10, 16, fill=fill, outline="")
-        self.create_text(17, 13, text=label, anchor="w", fill=foreground, font=(FONT_FAMILY, 10, "bold"))
+        self.create_text(17, 13, text=label, anchor="w", fill=foreground, font=self._font)

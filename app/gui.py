@@ -7,7 +7,7 @@ import sys
 import threading
 import tkinter as tk
 import webbrowser
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from .automation import BrowserNotFoundError, ensure_browser, run_job
 from .config import AppConfig, clamp_split_ratio
@@ -64,7 +64,13 @@ class App(tk.Tk):
         outer.rowconfigure(1, weight=1)
         outer.columnconfigure(0, weight=1)
 
-        header = tk.Frame(outer, bg=TOKENS.house, height=104)
+        # 104px assumes Segoe UI metrics; Linux fallback fonts are taller, so
+        # size the header from real font metrics or the title gets clipped.
+        title_font = tkfont.Font(family=FONT_FAMILY, size=24, weight="bold")
+        subtitle_font = tkfont.Font(family=FONT_FAMILY, size=10)
+        header_height = max(104, title_font.metrics("linespace") + TOKENS.space_1
+                            + subtitle_font.metrics("linespace") + TOKENS.space_4 * 2)
+        header = tk.Frame(outer, bg=TOKENS.house, height=header_height)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_propagate(False)
         header.columnconfigure(0, weight=1)

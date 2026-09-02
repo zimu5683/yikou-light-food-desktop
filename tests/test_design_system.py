@@ -1,7 +1,7 @@
 from app.design_system import (IMAGE_CACHE_LIMIT, STATUS_STYLES, TOKENS, calculate_scrollregion,
                                form_layout_mode, layout_mode, render_rounded_corner_tiles,
                                render_pill_caps, render_rounded_image, pill_cap_geometry,
-                               split_pane_sizes, split_ratio_for_width)
+                               scroll_viewport_offset, split_pane_sizes, split_ratio_for_width)
 
 
 def test_design_tokens_follow_project_design_doc():
@@ -42,6 +42,16 @@ def test_render_cache_is_bounded():
 
 def test_scrollregion_starts_at_origin_and_includes_padding():
     assert calculate_scrollregion(300, 200, 420, 600, 24) == (0, 0, 468, 648)
+
+
+def test_scroll_viewport_offset_tracks_fraction_and_clamps():
+    assert scroll_viewport_offset(0.0, 1000) == 0
+    assert scroll_viewport_offset(0.5, 1000) == 500
+    assert scroll_viewport_offset(1.0, 1000) == 1000
+    assert scroll_viewport_offset(1.5, 1000) == 1000
+    assert scroll_viewport_offset(-0.5, 1000) == 0
+    assert scroll_viewport_offset(0.25, 0) == 0
+    assert scroll_viewport_offset("bad", 1000) == 0
 
 
 def test_status_styles_cover_lifecycle_states():
