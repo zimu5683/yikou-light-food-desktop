@@ -21,6 +21,19 @@ from . import __version__
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 
 
+# Tk 在 Linux/X11 下对 ``("Excel 文件", "*.xlsx *.xlsm")`` 这种单字符串多后缀写法
+# 支持不可靠（空格会被当成文件名的一部分，导致过滤后看不到任何文件）。
+# 这里拆成逐后缀 + 元组形式，Windows/macOS/Linux 三端都可正确过滤。
+# 注意：Linux 下“所有文件”必须用 ``*`` 而非 ``*.*``（后者只匹配带点的文件名）。
+EXCEL_FILETYPES: tuple[tuple[str, str | tuple[str, ...]], ...] = (
+    ("Excel 工作簿 (*.xlsx)", "*.xlsx"),
+    ("Excel 启用宏的工作簿 (*.xlsm)", "*.xlsm"),
+    ("Excel 文件 (*.xlsx *.xlsm)", ("*.xlsx", "*.xlsm")),
+    ("所有文件 (*)", "*"),
+)
+EXCEL_EXTS = {".xlsx", ".xlsm"}
+
+
 class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -186,11 +199,17 @@ class App(tk.Tk):
         excel_row.grid(row=3, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         excel_row.columnconfigure(0, weight=1)
         self.vars["excel"] = tk.StringVar()
-        self.form_fields["excel"] = FormField(excel_row, "Excel 文件", self.vars["excel"], helper="支持 .xlsx 和 .xlsm 文件")
+        self.form_fields["excel"] = FormField(
+            excel_row, "Excel 文件", self.vars["excel"],
+            helper="支持 .xlsx 和 .xlsm；Linux 可用 LibreOffice 另存，或点“新建模板”直接生成",
+        )
         self.form_fields["excel"].grid(row=0, column=0, sticky="ew")
-        self.excel_button = PillButton(excel_row, "选择文件", self._choose_excel, variant="outline", width=112,
+        self.excel_button = PillButton(excel_row, "选择文件", self._choose_excel, variant="outline", width=96,
                                        bg=TOKENS.surface)
         self.excel_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+        self.excel_template_button = PillButton(excel_row, "新建模板", self._new_excel_template, variant="outline", width=96,
+                                                bg=TOKENS.surface)
+        self.excel_template_button.grid(row=0, column=2, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         order_row = tk.Frame(body, bg=TOKENS.surface)
         order_row.grid(row=4, column=0, sticky="ew", pady=(0, TOKENS.space_3))
@@ -256,11 +275,14 @@ class App(tk.Tk):
         sss_excel_row.grid(row=3, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         sss_excel_row.columnconfigure(0, weight=1)
         self.vars_sss["sss_excel"] = tk.StringVar()
-        self.sss_form_fields["sss_excel"] = FormField(sss_excel_row, "订单 Excel 文件", self.vars_sss["sss_excel"], helper="午餐/晚餐两表，A=姓名 B=门牌号 C=电话")
+        self.sss_form_fields["sss_excel"] = FormField(sss_excel_row, "订单 Excel 文件", self.vars_sss["sss_excel"], helper="午餐/晚餐两表，A=姓名 B=门牌号 C=电话；没有文件可点“新建模板”")
         self.sss_form_fields["sss_excel"].grid(row=0, column=0, sticky="ew")
-        self.sss_excel_button = PillButton(sss_excel_row, "选择文件", self._choose_sss_excel, variant="outline", width=112,
+        self.sss_excel_button = PillButton(sss_excel_row, "选择文件", self._choose_sss_excel, variant="outline", width=96,
                                            bg=TOKENS.surface)
         self.sss_excel_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+        self.sss_template_button = PillButton(sss_excel_row, "新建模板", self._new_sss_template, variant="outline", width=96,
+                                              bg=TOKENS.surface)
+        self.sss_template_button.grid(row=0, column=2, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         self.vars_sss["sss_product_name"] = tk.StringVar()
         self.sss_form_fields["sss_product_name"] = FormField(body, "商品名称", self.vars_sss["sss_product_name"], helper="下单时商品“名称”的默认值")
@@ -316,25 +338,35 @@ class App(tk.Tk):
 
         self.excel_row.columnconfigure(0, weight=1)
         self.excel_row.columnconfigure(1, weight=0)
+        self.excel_row.columnconfigure(2, weight=0)
         self.form_fields["excel"].grid_configure(row=0, column=0, columnspan=1, sticky="ew")
         if compact:
-            self.excel_button.grid_configure(row=1, column=0, columnspan=2, sticky="e",
+            self.excel_button.grid_configure(row=1, column=0, columnspan=1, sticky="e",
                                              padx=0, pady=(TOKENS.space_2, 0))
+            self.excel_template_button.grid_configure(row=1, column=1, columnspan=2, sticky="e",
+                                                      padx=(TOKENS.space_2, 0), pady=(TOKENS.space_2, 0))
         else:
             self.excel_button.grid_configure(row=0, column=1, columnspan=1, sticky="s",
                                              padx=(TOKENS.space_2, 0), pady=(20, 0))
+            self.excel_template_button.grid_configure(row=0, column=2, columnspan=1, sticky="s",
+                                                      padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         # 闪时送表单的“选择文件”按钮同样需要适配窄布局。
         if hasattr(self, "sss_excel_row"):
             self.sss_excel_row.columnconfigure(0, weight=1)
             self.sss_excel_row.columnconfigure(1, weight=0)
+            self.sss_excel_row.columnconfigure(2, weight=0)
             self.sss_form_fields["sss_excel"].grid_configure(row=0, column=0, columnspan=1, sticky="ew")
             if compact:
-                self.sss_excel_button.grid_configure(row=1, column=0, columnspan=2, sticky="e",
+                self.sss_excel_button.grid_configure(row=1, column=0, columnspan=1, sticky="e",
                                                      padx=0, pady=(TOKENS.space_2, 0))
+                self.sss_template_button.grid_configure(row=1, column=1, columnspan=2, sticky="e",
+                                                        padx=(TOKENS.space_2, 0), pady=(TOKENS.space_2, 0))
             else:
                 self.sss_excel_button.grid_configure(row=0, column=1, columnspan=1, sticky="s",
                                                      padx=(TOKENS.space_2, 0), pady=(20, 0))
+                self.sss_template_button.grid_configure(row=0, column=2, columnspan=1, sticky="s",
+                                                        padx=(TOKENS.space_2, 0), pady=(20, 0))
 
         for column in range(3):
             self.tools.columnconfigure(column, weight=0 if compact else 1)
@@ -450,25 +482,155 @@ class App(tk.Tk):
         if config.sss_excel_path and config.sss_excel_path.is_file():
             self.sss_form_fields["sss_excel"].set_state("valid")
 
+    def _initial_dir(self, current: str) -> str | None:
+        """文件对话框的初始目录：优先用当前已选文件的目录，否则用用户主目录。"""
+        from pathlib import Path as _Path
+
+        try:
+            parent = _Path(current).expanduser().parent
+            if current and parent.is_dir():
+                return str(parent)
+        except OSError:
+            pass
+        try:
+            home = _Path.home()
+            if home.is_dir():
+                return str(home)
+        except OSError:
+            pass
+        return None
+
     def _choose_excel(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择 Excel 文件（.xlsx / .xlsm）",
+            defaultextension=".xlsx",
+            filetypes=list(EXCEL_FILETYPES),
+            initialdir=self._initial_dir(self.vars["excel"].get().strip()),
+        )
         if path:
             self.vars["excel"].set(path)
             selected = AppConfig(excel_path=path).excel_path
-            if selected and selected.is_file() and selected.suffix.lower() in {".xlsx", ".xlsm"}:
+            if selected and selected.is_file() and selected.suffix.lower() in EXCEL_EXTS:
                 self.form_fields["excel"].set_state("valid", "文件已选择")
             else:
                 self.form_fields["excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
 
     def _choose_sss_excel(self) -> None:
-        path = filedialog.askopenfilename(filetypes=[("Excel 文件", "*.xlsx *.xlsm"), ("所有文件", "*.*")])
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="选择闪时送订单 Excel（.xlsx / .xlsm）",
+            defaultextension=".xlsx",
+            filetypes=list(EXCEL_FILETYPES),
+            initialdir=self._initial_dir(self.vars_sss["sss_excel"].get().strip()),
+        )
         if path:
             self.vars_sss["sss_excel"].set(path)
             selected = AppConfig(sss_excel_path=path).sss_excel_path
-            if selected and selected.is_file() and selected.suffix.lower() in {".xlsx", ".xlsm"}:
+            if selected and selected.is_file() and selected.suffix.lower() in EXCEL_EXTS:
                 self.sss_form_fields["sss_excel"].set_state("valid", "文件已选择")
             else:
                 self.sss_form_fields["sss_excel"].set_state("invalid", "请选择 .xlsx 或 .xlsm 文件")
+
+    def _new_excel_template(self) -> None:
+        """Linux 没有预装 Excel 时，一键生成排单用的 .xlsx 模板。"""
+        from pathlib import Path as _Path
+
+        target = filedialog.asksaveasfilename(
+            parent=self,
+            title="新建排单 Excel 模板",
+            defaultextension=".xlsx",
+            filetypes=list(EXCEL_FILETYPES),
+            initialdir=self._initial_dir(self.vars["excel"].get().strip()),
+            initialfile="排单.xlsx",
+        )
+        if not target:
+            return
+        dest = _Path(target)
+        if dest.suffix.lower() not in EXCEL_EXTS:
+            dest = dest.with_suffix(".xlsx")
+        try:
+            self._write_order_template(dest)
+        except Exception as exc:  # 缺 openpyxl 等依赖时给明确提示
+            messagebox.showerror("新建模板失败", f"无法写入模板文件：\n{exc}", parent=self)
+            return
+        self.vars["excel"].set(str(dest))
+        self.form_fields["excel"].set_state("valid", "模板已生成")
+        self._append(f"已生成排单模板：{dest}")
+
+    def _new_sss_template(self) -> None:
+        """生成闪时送下单用的《午餐/晚餐》两表模板。"""
+        from pathlib import Path as _Path
+
+        target = filedialog.asksaveasfilename(
+            parent=self,
+            title="新建闪时送订单模板",
+            defaultextension=".xlsx",
+            filetypes=list(EXCEL_FILETYPES),
+            initialdir=self._initial_dir(self.vars_sss["sss_excel"].get().strip()),
+            initialfile="闪时送.xlsx",
+        )
+        if not target:
+            return
+        dest = _Path(target)
+        if dest.suffix.lower() not in EXCEL_EXTS:
+            dest = dest.with_suffix(".xlsx")
+        try:
+            self._write_sss_template(dest)
+        except Exception as exc:
+            messagebox.showerror("新建模板失败", f"无法写入模板文件：\n{exc}", parent=self)
+            return
+        self.vars_sss["sss_excel"].set(str(dest))
+        self.sss_form_fields["sss_excel"].set_state("valid", "模板已生成")
+        self._append(f"已生成闪时送模板：{dest}")
+
+    @staticmethod
+    def _write_order_template(dest: object) -> None:
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        # 订单处理是“按需建表”：缺哪张表程序会自动创建，这里预建常用表并写好表头，
+        # Linux 用户无需安装 Excel 即可直接拿去用（LibreOffice/WPS 也可打开）。
+        weekday_headers = ["单号", "姓名", "地址", "电话", "经济/豪华", "总餐次"]
+        weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
+        first = True
+        for name in (*weekdays, "衣锦中餐", "衣锦晚餐", "医学院中餐", "医学院晚餐", "东湖中餐", "东湖晚餐"):
+            ws = wb.active if first else wb.create_sheet(title=name)
+            if first:
+                ws.title = name
+                first = False
+            ws.append(weekday_headers)
+            ws.append([])  # 第 2 行为占位行，数据从第 3 行开始（与程序读写规则一致）
+        wb.save(str(dest))
+        wb.close()
+
+    @staticmethod
+    def _write_sss_template(dest: object) -> None:
+        from openpyxl import Workbook
+
+        wb = Workbook()
+        first = True
+        for name in ("午餐", "晚餐"):
+            ws = wb.active if first else wb.create_sheet(title=name)
+            if first:
+                ws.title = name
+                first = False
+            ws["A1"] = "姓名"
+            ws["B1"] = "门牌号"
+            ws["C1"] = "电话"
+            ws["D1"] = "送达时间"
+            # 第 2 行占位，第 3 行起填数据；示例行方便 Linux 用户照格式填写。
+            ws["A2"] = ""
+            ws["A3"] = "张三"
+            ws["B3"] = "1栋101"
+            ws["C3"] = "13800000000"
+            ws["D3"] = "11:00" if name == "午餐" else "17:00"
+            ws.column_dimensions["A"].width = 12
+            ws.column_dimensions["B"].width = 16
+            ws.column_dimensions["C"].width = 16
+            ws.column_dimensions["D"].width = 12
+        wb.save(str(dest))
+        wb.close()
 
     def _config(self) -> AppConfig:
         try:
