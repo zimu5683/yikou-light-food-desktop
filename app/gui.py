@@ -640,7 +640,8 @@ class App(tk.Tk):
                     release = value
                     if isinstance(release, ReleaseInfo):
                         details = release.body or "（暂无更新说明）"
-                        can_auto_install = os.name == "nt" and getattr(sys, "frozen", False)
+                        can_auto_install = ((os.name == "nt" or sys.platform.startswith("linux"))
+                                            and getattr(sys, "frozen", False))
                         action = "是否立即下载并安装？" if can_auto_install else "是否打开 GitHub Release 下载页面？"
                         prompt = f"发现新版本 {release.tag_name}（当前版本 {__version__}）\n\n更新内容：\n{details}\n\n{action}"
                         if messagebox.askyesno("发现新版本", prompt):

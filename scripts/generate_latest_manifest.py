@@ -105,30 +105,43 @@ def _read_checksum_file(path: Path | None) -> str:
 
 
 def _load_patches(payload: dict) -> list[dict]:
-    """Build the ``patches`` list from dist/patch-meta.json + release assets."""
-    meta_path = os.path.join("dist", "patch-meta.json")
-    if not os.path.isfile(meta_path):
-        return []
-    try:
-        with open(meta_path, encoding="utf-8") as handle:
-            meta = json.load(handle)
-    except (OSError, ValueError):
-        return []
-    name = str(meta.get("name") or "")
+    """Build the ``patches`` list from dist/patch-meta*.json + release assets.
+
+    Windows 与 Linux CI 各写一份元数据（``patch-meta.json`` /
+    ``patch-meta-linux.json``）；内容兼容旧的单一 dict 与新的 list 两种格式。
+    """
     url_by_name = {
         str(item.get("name")): item.get("browser_download_url")
         for item in payload.get("assets", []) if isinstance(item, dict)
     }
-    url = url_by_name.get(name)
-    if not name or not url:
-        return []
-    return [{
-        "name": name,
-        "url": url,
-        "sha256": str(meta.get("sha256") or "").strip().lower(),
-        "from_sha256": str(meta.get("from_sha256") or "").strip().lower(),
-        "target_sha256": str(meta.get("target_sha256") or "").strip().lower(),
-    }]
+    patches: list[dict] = []
+    seen: set[str] = set()
+    for meta_name in ("patch-meta.json", "patch-meta-linux.json"):
+        meta_path = os.path.join("dist", meta_name)
+        if not os.path.isfile(meta_path):
+            continue
+        try:
+            with open(meta_path, encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        entries = meta if isinstance(meta, list) else [meta]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            url = url_by_name.get(name)
+            if not name or not url or name in seen:
+                continue
+            seen.add(name)
+            patches.append({
+                "name": name,
+                "url": url,
+                "sha256": str(entry.get("sha256") or "").strip().lower(),
+                "from_sha256": str(entry.get("from_sha256") or "").strip().lower(),
+                "target_sha256": str(entry.get("target_sha256") or "").strip().lower(),
+            })
+    return patches
 
 
 if __name__ == "__main__":

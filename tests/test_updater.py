@@ -1,6 +1,9 @@
 import io
 import hashlib
 import os
+import shlex
+import shutil
+import tarfile
 import urllib.error
 from pathlib import Path
 
@@ -153,16 +156,275 @@ def test_release_linux_assets_are_selected():
     assert release.linux_checksum_asset["name"] == "yikou-light-food-linux-x64.tar.gz.sha256"
 
 
-def test_linux_download_and_install_is_not_supported(monkeypatch):
-    # Linux 暂不支持自动安装：检查到新版本后由 GUI 引导前往 Release 页面。
+def test_linux_source_mode_cannot_auto_install(monkeypatch):
+    # 源码运行模式下 sys.executable 是 python 解释器，替换它会损坏 Python 安装；
+    # 此时仅提示前往 Release 页面手动下载。
     monkeypatch.setattr("app.updater.sys.platform", "linux")
     monkeypatch.setattr("app.updater.os.name", "posix")
+    monkeypatch.delattr("app.updater.sys.frozen", raising=False)
     release = ReleaseInfo(
         "v2.1.0", "v2.1.0", "", "",
         ({"name": "yikou-light-food-linux-x64.tar.gz", "browser_download_url": "https://github.com/example/yikou-light-food-linux-x64.tar.gz"},),
     )
-    with pytest.raises(UpdateError, match="Windows and macOS"):
+    with pytest.raises(UpdateError, match="源码运行模式"):
         download_and_install(release)
+
+
+def _build_linux_archive(tmp_path: Path, *, payload: bytes = b"#!/bin/sh\necho new\n") -> tuple[bytes, str]:
+    """构造一个假的 Linux 更新包（tar.gz 内含单个可执行文件），返回内容与哈希。"""
+    source = tmp_path / "yikou-light-food"
+    source.write_bytes(payload)
+    source.chmod(0o755)
+    archive_path = tmp_path / "archive.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(source, arcname="yikou-light-food")
+    data = archive_path.read_bytes()
+    return data, hashlib.sha256(data).hexdigest()
+
+
+def _linux_release(archive_sha: str | None) -> ReleaseInfo:
+    asset: dict = {
+        "name": "yikou-light-food-linux-x64.tar.gz",
+        "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v2.2.0/yikou-light-food-linux-x64.tar.gz",
+    }
+    if archive_sha is not None:
+        asset["sha256"] = archive_sha
+    return ReleaseInfo("v2.2.0", "v2.2.0", "", "", (asset,))
+
+
+def _linux_install_env(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    """伪造 frozen 模式与已安装位置，返回 (安装目录, 可执行文件路径)。"""
+    install_dir = tmp_path / "app"
+    install_dir.mkdir()
+    target = install_dir / "yikou-light-food"
+    target.write_bytes(b"old binary")
+    monkeypatch.setattr("app.updater.sys.platform", "linux")
+    monkeypatch.setattr("app.updater.os.name", "posix")
+    monkeypatch.setattr("app.updater.sys.frozen", True, raising=False)
+    monkeypatch.setattr("app.updater.sys.executable", str(target))
+    return install_dir, target
+
+
+def test_linux_download_and_install_replaces_binary_and_relaunches(tmp_path, monkeypatch):
+    # 打包版在 Linux 上应自动下载、校验、解压，并调度退出后的原子替换与重启。
+    archive_bytes, archive_sha = _build_linux_archive(tmp_path)
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append((args, kwargs)))
+
+    result = download_and_install(_linux_release(archive_sha))
+
+    assert result == target.resolve()
+    staged_dir = install_dir / f".yikou-light-food.update-{os.getpid()}"
+    staged_binary = staged_dir / "yikou-light-food"
+    assert staged_binary.is_file()
+    assert os.access(staged_binary, os.X_OK)
+    # Popen 被替换后 shell 不会真的运行，workdir 应留给替换脚本清理。
+    assert (tmp_path / "work").is_dir()
+    assert launched, "应调度替换脚本"
+    args, kwargs = launched[0]
+    assert args[:2] == ["/bin/sh", "-c"]
+    script = args[2]
+    assert f"kill -0 {os.getpid()}" in script
+    assert f"mv -f {shlex.quote(str(staged_binary))} {shlex.quote(str(target.resolve()))}" in script
+    assert "exec" in script
+    assert kwargs["start_new_session"] is True
+    shutil.rmtree(staged_dir)
+
+
+def test_linux_rejects_untrusted_archive_url(tmp_path, monkeypatch):
+    _linux_install_env(tmp_path, monkeypatch)
+    release = ReleaseInfo(
+        "v2.2.0", "v2.2.0", "", "",
+        ({"name": "yikou-light-food-linux-x64.tar.gz",
+          "browser_download_url": "https://evil.example/yikou-light-food-linux-x64.tar.gz"},),
+    )
+    with pytest.raises(UpdateError, match="trusted Linux archive"):
+        download_and_install(release)
+
+
+def test_linux_rejects_checksum_mismatch(tmp_path, monkeypatch):
+    # 哈希不一致必须拒绝安装，且不留下 staging / 临时文件。
+    archive_bytes, _ = _build_linux_archive(tmp_path)
+    install_dir, _target = _linux_install_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+
+    with pytest.raises(UpdateError, match="SHA-256 verification"):
+        download_and_install(_linux_release("0" * 64))
+
+    assert not (tmp_path / "work").exists()
+    assert not list(install_dir.glob(".yikou-light-food.update-*"))
+
+
+def test_linux_rejects_malicious_archive_member(tmp_path, monkeypatch):
+    # 归档内出现 .. 上跳或链接条目时必须拒绝解压。
+    evil_archive = tmp_path / "evil.tar.gz"
+    with tarfile.open(evil_archive, "w:gz") as tar:
+        info = tarfile.TarInfo("../evil.txt")
+        info.size = 1
+        tar.addfile(info, io.BytesIO(b"x"))
+    archive_bytes = evil_archive.read_bytes()
+    install_dir, _target = _linux_install_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+
+    with pytest.raises(UpdateError, match="非法路径条目"):
+        download_and_install(_linux_release(hashlib.sha256(archive_bytes).hexdigest()))
+
+    assert not list(install_dir.glob(".yikou-light-food.update-*"))
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
+                    reason="root 用户不受目录权限限制")
+def test_linux_requires_writable_install_dir(tmp_path, monkeypatch):
+    _linux_install_env(tmp_path, monkeypatch)
+    (tmp_path / "app").chmod(0o555)
+    try:
+        with pytest.raises(UpdateError, match="安装目录不可写"):
+            download_and_install(_linux_release(hashlib.sha256(b"x").hexdigest()))
+    finally:
+        (tmp_path / "app").chmod(0o755)
+
+
+def _linux_patch_release(tmp_path: Path, patch_bytes: bytes, *, from_sha: str, target_sha: str,
+                         patch_sha: str | None = None) -> ReleaseInfo:
+    patch_name = "yikou-light-food-linux-x64-v2.1.1-v2.2.0.patch"
+    patch_path = tmp_path / patch_name
+    patch_path.write_bytes(patch_bytes)
+    return ReleaseInfo(
+        "v2.2.0", "v2.2.0", "", "",
+        ({"name": "yikou-light-food-linux-x64.tar.gz",
+          "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v2.2.0/yikou-light-food-linux-x64.tar.gz"},),
+        ({
+            "name": patch_name,
+            "url": f"https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v2.2.0/{patch_name}",
+            "sha256": patch_sha or hashlib.sha256(patch_bytes).hexdigest(),
+            "from_sha256": from_sha,
+            "target_sha256": target_sha,
+        },),
+    )
+
+
+def test_linux_patch_update_rebuilds_and_relaunches(tmp_path, monkeypatch):
+    # 本地二进制命中补丁基线时走差分更新：下载补丁 → 还原新版 → 校验 → 调度替换。
+    old_binary = b"\x7fELF" + b"old" * 4096
+    new_binary = b"\x7fELF" + b"new" * 4096
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    target.write_bytes(old_binary)
+    patch_bytes = b"FAKE-PATCH-BYTES"
+    release = _linux_patch_release(tmp_path, patch_bytes,
+                                   from_sha=hashlib.sha256(old_binary).hexdigest(),
+                                   target_sha=hashlib.sha256(new_binary).hexdigest())
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr("app.updater.bspatch.apply_file",
+                        lambda old, patch, new: Path(new).write_bytes(new_binary))
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append((args, kwargs)))
+
+    result = download_and_install(release, opener=lambda request, timeout: io.BytesIO(patch_bytes))
+
+    assert result == target.resolve()
+    staged_binary = install_dir / f".yikou-light-food.update-{os.getpid()}" / "yikou-light-food"
+    assert staged_binary.read_bytes() == new_binary
+    assert os.access(staged_binary, os.X_OK)
+    args, kwargs = launched[0]
+    script = args[2]
+    assert f"mv -f {shlex.quote(str(staged_binary))}" in script
+    assert kwargs["start_new_session"] is True
+    shutil.rmtree(install_dir / f".yikou-light-food.update-{os.getpid()}")
+
+
+def test_linux_patch_update_with_real_bsdiff(tmp_path, monkeypatch):
+    # 有 bsdiff4 时做一次真实差分：生成补丁 → 应用 → 校验还原结果逐字节一致。
+    bsdiff4 = pytest.importorskip("bsdiff4")
+    old_binary = (b"\x7fELF" + b"payload-" * 2048) + b"\nold-tail"
+    new_binary = (b"\x7fELF" + b"payload-" * 2048) + b"\nnew-tail-changed"
+    old_path = tmp_path / "old-binary"
+    old_path.write_bytes(old_binary)
+    # 生成补丁需要新旧两个文件；先写出新文件再 diff。
+    (tmp_path / "new-src").write_bytes(new_binary)
+    patch_path = tmp_path / "real.patch"
+    bsdiff4.file_diff(str(old_path), str(tmp_path / "new-src"), str(patch_path))
+    patch_bytes = patch_path.read_bytes()
+
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    target.write_bytes(old_binary)
+    release = _linux_patch_release(tmp_path, patch_bytes,
+                                   from_sha=hashlib.sha256(old_binary).hexdigest(),
+                                   target_sha=hashlib.sha256(new_binary).hexdigest())
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append((args, kwargs)))
+
+    download_and_install(release, opener=lambda request, timeout: io.BytesIO(patch_bytes))
+
+    staged_binary = install_dir / f".yikou-light-food.update-{os.getpid()}" / "yikou-light-food"
+    assert staged_binary.read_bytes() == new_binary
+    assert launched
+
+
+def test_linux_patch_sha_mismatch_is_rejected(tmp_path, monkeypatch):
+    # 补丁哈希不符必须报错并清理，不允许静默回退（与 Windows 行为一致）。
+    old_binary = b"\x7fELF" + b"old" * 4096
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    target.write_bytes(old_binary)
+    patch_bytes = b"FAKE-PATCH-BYTES"
+    release = _linux_patch_release(tmp_path, patch_bytes,
+                                   from_sha=hashlib.sha256(old_binary).hexdigest(),
+                                   target_sha=hashlib.sha256(b"\x7fELFnew"),
+                                   patch_sha="0" * 64)
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+
+    with pytest.raises(UpdateError, match="补丁 SHA-256 校验失败"):
+        download_and_install(release, opener=lambda request, timeout: io.BytesIO(patch_bytes))
+
+    assert not list(install_dir.glob(".yikou-light-food.update-*"))
+    assert not (tmp_path / "work").exists()
+
+
+def test_linux_patch_miss_falls_back_to_full_download(tmp_path, monkeypatch):
+    # 本地二进制不命中任何补丁基线时，回退为全量 tar.gz 下载。
+    archive_bytes, archive_sha = _build_linux_archive(tmp_path)
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    patch_bytes = b"FAKE-PATCH-BYTES"
+    release = _linux_patch_release(tmp_path, patch_bytes,
+                                   from_sha="a" * 64,  # 与本地二进制不符
+                                   target_sha="b" * 64)
+    release = ReleaseInfo(release.tag_name, release.name, release.body, release.html_url,
+                          ({"name": "yikou-light-food-linux-x64.tar.gz",
+                            "browser_download_url": "https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v2.2.0/yikou-light-food-linux-x64.tar.gz",
+                            "sha256": archive_sha},),
+                          release.patches)
+    served = []
+
+    def fake_stream_download(url, destination, **kwargs):
+        served.append(str(url))
+        destination.write_bytes(archive_bytes)
+
+    monkeypatch.setattr("app.updater._stream_download", fake_stream_download)
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    launched = []
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: launched.append((args, kwargs)))
+
+    download_and_install(release)
+
+    assert served == ["https://github.com/zimu5683/yikou-light-food-desktop/releases/download/v2.2.0/yikou-light-food-linux-x64.tar.gz"]
+    staged_binary = install_dir / f".yikou-light-food.update-{os.getpid()}" / "yikou-light-food"
+    assert staged_binary.is_file()
+    assert launched
 
 
 @pytest.mark.skipif(os.name != "nt", reason="automatic installer is Windows-only")

@@ -14,6 +14,7 @@ import hashlib
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import zipfile
@@ -384,10 +385,20 @@ def download_and_install(
 
     Windows locks the running executable, so a short-lived command script does
     the final move and relaunches the updated file after the GUI closes.
-    macOS replaces the whole ``.app`` bundle instead.
+    macOS replaces the whole ``.app`` bundle instead.  Linux ships a single
+    PyInstaller onefile binary inside a tar.gz; a detached shell waits for
+    this process to exit, renames the staged file over it and execs it.
     """
     if sys.platform == "darwin":
         return _download_and_install_macos(
+            release,
+            timeout=timeout,
+            opener=opener,
+            progress_callback=progress_callback,
+            stage_callback=stage_callback,
+        )
+    if sys.platform.startswith("linux"):
+        return _download_and_install_linux(
             release,
             timeout=timeout,
             opener=opener,
@@ -602,27 +613,15 @@ def _schedule_windows_replacement(
     return target
 
 
-def _download_and_apply_patch(
-    release: ReleaseInfo,
+def _download_patch_file(
     patch: dict[str, Any],
-    target: Path,
+    patch_file: Path,
     *,
     timeout: float,
     opener: Callable[..., Any] | None,
     progress_callback: Callable[[int, int | None], None] | None,
-    stage_callback: Callable[[str], None] | None,
-) -> Path:
-    """下载差分补丁，用本地 exe 还原出完整新版，校验后替换并重启。"""
-    patch_file = target.with_name(f".{target.stem}.patch-{os.getpid()}.tmp")
-    temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
-    try:
-        if shutil.disk_usage(target.parent).free < target.stat().st_size + 1_048_576:
-            raise UpdateError("磁盘剩余空间不足，无法安装更新")
-    except OSError as exc:
-        raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
-
-    if stage_callback:
-        stage_callback("下载差分补丁")
+) -> None:
+    """把补丁下载到 patch_file（多候选重试）；失败时清理并抛 UpdateError。"""
     last_error: Exception | None = None
     for candidate in _github_url_candidates(patch["url"]):
         patch_file.unlink(missing_ok=True)
@@ -645,11 +644,35 @@ def _download_and_apply_patch(
             last_error = exc
     if last_error is not None:
         patch_file.unlink(missing_ok=True)
-        temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to download patch: {last_error}") from last_error
 
+
+def _download_and_apply_patch(
+    release: ReleaseInfo,
+    patch: dict[str, Any],
+    target: Path,
+    *,
+    timeout: float,
+    opener: Callable[..., Any] | None,
+    progress_callback: Callable[[int, int | None], None] | None,
+    stage_callback: Callable[[str], None] | None,
+) -> Path:
+    """下载差分补丁，用本地 exe 还原出完整新版，校验后替换并重启。"""
+    patch_file = target.with_name(f".{target.stem}.patch-{os.getpid()}.tmp")
+    temporary = target.with_name(f".{target.stem}.update-{os.getpid()}.tmp")
     try:
-        if hashlib.sha256(patch_file.read_bytes()).hexdigest() != patch["sha256"]:
+        if shutil.disk_usage(target.parent).free < target.stat().st_size + 1_048_576:
+            raise UpdateError("磁盘剩余空间不足，无法安装更新")
+    except OSError as exc:
+        raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
+
+    if stage_callback:
+        stage_callback("下载差分补丁")
+    _download_patch_file(patch, patch_file, timeout=timeout, opener=opener, progress_callback=progress_callback)
+    temporary.unlink(missing_ok=True)
+
+    try:
+        if _sha256_file(patch_file) != patch["sha256"]:
             raise UpdateError("补丁 SHA-256 校验失败")
         if stage_callback:
             stage_callback("应用差分补丁")
@@ -662,7 +685,7 @@ def _download_and_apply_patch(
         patch_file.unlink(missing_ok=True)
 
     try:
-        if hashlib.sha256(temporary.read_bytes()).hexdigest() != patch["target_sha256"]:
+        if _sha256_file(temporary) != patch["target_sha256"]:
             raise UpdateError("还原后的文件 SHA-256 校验失败")
         with temporary.open("rb") as handle:
             if handle.read(2) != b"MZ":
@@ -675,6 +698,75 @@ def _download_and_apply_patch(
         raise UpdateError(f"Unable to verify rebuilt file: {exc}") from exc
 
     return _schedule_windows_replacement(temporary, target, stage_callback)
+
+
+def _download_and_apply_patch_linux(
+    release: ReleaseInfo,
+    patch: dict[str, Any],
+    target: Path,
+    *,
+    timeout: float,
+    opener: Callable[..., Any] | None,
+    progress_callback: Callable[[int, int | None], None] | None,
+    stage_callback: Callable[[str], None] | None,
+) -> Path:
+    """下载差分补丁，用本地二进制还原出完整新版，校验后替换并重启。
+
+    补丁以「解压后的裸 onefile 二进制」为基线：用户本地正好有这个文件，
+    其 SHA-256 应命中补丁的 ``from_sha256``（见 ``_find_applicable_patch``）。
+    还原结果写入安装目录的 staging，退出后原子替换并重启（与全量更新一致）。
+    """
+    install_dir = target.parent
+    workdir = Path(tempfile.mkdtemp(prefix="yikou-light-food-update-"))
+    staging = install_dir / f".{target.stem}.update-{os.getpid()}"
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    elif staging.exists():
+        staging.unlink(missing_ok=True)
+    patch_file = workdir / "update.patch"
+    rebuilt = staging / target.name
+    try:
+        try:
+            # 还原结果与补丁都要占空间，按本地二进制大小的 2 倍预留。
+            if shutil.disk_usage(install_dir).free < target.stat().st_size * 2 + 1_048_576:
+                raise UpdateError("磁盘剩余空间不足，无法安装更新")
+        except OSError as exc:
+            raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
+
+        if stage_callback:
+            stage_callback("下载差分补丁")
+        _download_patch_file(patch, patch_file, timeout=timeout, opener=opener, progress_callback=progress_callback)
+        staging.mkdir(parents=True, exist_ok=True)
+
+        try:
+            if _sha256_file(patch_file) != patch["sha256"]:
+                raise UpdateError("补丁 SHA-256 校验失败")
+            if stage_callback:
+                stage_callback("应用差分补丁")
+            bspatch.apply_file(target, patch_file, rebuilt)
+        except (OSError, ValueError) as exc:
+            raise UpdateError(f"Unable to apply patch: {exc}") from exc
+        finally:
+            patch_file.unlink(missing_ok=True)
+
+        try:
+            if _sha256_file(rebuilt) != patch["target_sha256"]:
+                raise UpdateError("还原后的文件 SHA-256 校验失败")
+            with rebuilt.open("rb") as handle:
+                if handle.read(4) != b"\x7fELF":
+                    raise UpdateError("还原后的文件不是有效的 Linux 可执行文件")
+        except UpdateError:
+            raise
+        except OSError as exc:
+            raise UpdateError(f"Unable to verify rebuilt file: {exc}") from exc
+        rebuilt.chmod(0o755)
+
+        return _schedule_linux_replacement(rebuilt, target, workdir, staging, stage_callback)
+    except BaseException:
+        patch_file.unlink(missing_ok=True)
+        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 
 def _download_and_install_macos(
@@ -816,6 +908,202 @@ def _download_and_install_macos(
         shutil.rmtree(workdir, ignore_errors=True)
         raise UpdateError(f"Unable to start update installer: {exc}") from exc
     return app_bundle
+
+
+def _download_and_install_linux(
+    release: ReleaseInfo,
+    *,
+    timeout: float = 60.0,
+    opener: Callable[..., Any] | None = None,
+    progress_callback: Callable[[int, int | None], None] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
+) -> Path:
+    """Download the Linux tar.gz, verify it, and swap the binary after exit.
+
+    The Linux package is a single PyInstaller onefile executable inside a
+    tar.gz.  Linux does not lock the running binary (rename() over a running
+    executable is allowed), but the safest approach mirrors the macOS helper:
+    a detached shell waits for this process to exit, atomically renames the
+    staged file over the old executable and execs the new version.
+    """
+    if not getattr(sys, "frozen", False):
+        raise UpdateError("源码运行模式不支持自动安装，请前往 GitHub Release 页面下载")
+    asset = release.linux_asset
+    asset_name = str(asset.get("name") if asset else "")
+    url = _asset_url(asset)
+    if not safe_asset_name(asset_name) or not asset_name.lower().endswith(".tar.gz") or not _trusted_url(url):
+        raise UpdateError("Release does not contain a trusted Linux archive")
+    target = Path(sys.executable).resolve()
+    install_dir = target.parent
+    if not install_dir.exists() or not os.access(install_dir, os.W_OK):
+        raise UpdateError("安装目录不可写，请将程序移动到可写目录后重试")
+    # 优先走差分更新：本地二进制的 SHA-256 命中补丁基线时只需下载小补丁。
+    patch = _find_applicable_patch(release, target)
+    if patch is not None:
+        return _download_and_apply_patch_linux(
+            release, patch, target,
+            timeout=timeout, opener=opener,
+            progress_callback=progress_callback, stage_callback=stage_callback,
+        )
+    expected_size: int | None = None
+    try:
+        expected_size = int(asset.get("size")) if asset and asset.get("size") is not None else None
+    except (TypeError, ValueError):
+        expected_size = None
+    if expected_size and expected_size > MAX_UPDATE_SIZE:
+        raise UpdateError("更新资源大小异常")
+    try:
+        # 预留下载归档、解压出的可执行文件和余量；归档是 gzip 压缩的，
+        # 解压后的文件更大，按归档大小的 4 倍预留是保守估计。
+        required_space = (expected_size or 100_000_000) * 4 + 1_048_576
+        if shutil.disk_usage(install_dir).free < required_space:
+            raise UpdateError("磁盘剩余空间不足，无法安装更新")
+    except OSError as exc:
+        raise UpdateError(f"无法检查磁盘空间：{exc}") from exc
+
+    workdir = Path(tempfile.mkdtemp(prefix="yikou-light-food-update-"))
+    staging = install_dir / f".{target.stem}.update-{os.getpid()}"
+    archive = workdir / asset_name
+    # 上次更新中断可能留下同名 staging；清掉避免解压冲突。
+    if staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    elif staging.exists():
+        staging.unlink(missing_ok=True)
+    try:
+        if stage_callback:
+            stage_callback("下载更新")
+        last_error: Exception | None = None
+        for candidate in _github_url_candidates(url):
+            archive.unlink(missing_ok=True)
+            try:
+                _stream_download(
+                    candidate,
+                    archive,
+                    timeout=timeout,
+                    opener=opener or urlopen,
+                    expected_size=expected_size,
+                    progress_callback=progress_callback,
+                )
+                last_error = None
+                break
+            except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
+                last_error = exc
+        if last_error is not None:
+            raise UpdateError(f"Unable to download update: {last_error}") from last_error
+
+        checksum_asset = release.linux_checksum_asset
+        checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
+        # latest.json 内嵌的官方哈希：GitHub 直连不可达（镜像存在的场景）时，
+        # 校验文件同样拉不到，此时回退到清单内嵌的同一 SHA-256。
+        embedded_hash = _embedded_asset_sha256(release.linux_asset)
+        try:
+            if stage_callback:
+                stage_callback("校验安装包")
+            if _trusted_url(checksum_url):
+                try:
+                    checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+                    with (opener or urlopen)(checksum_request, timeout=timeout) as response:
+                        expected_hash = response.read().decode("ascii").strip().split()[0].lower()
+                except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+                    expected_hash = embedded_hash
+                    if not expected_hash:
+                        raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+            else:
+                expected_hash = embedded_hash
+                if not expected_hash:
+                    raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                raise ValueError("invalid SHA-256")
+            actual_hash = _sha256_file(archive)
+            if actual_hash != expected_hash:
+                raise UpdateError("Downloaded update failed SHA-256 verification")
+        except UpdateError:
+            raise
+        except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+            raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+
+        if stage_callback:
+            stage_callback("解压更新")
+        staged_binary = _extract_linux_binary(archive, staging)
+
+        return _schedule_linux_replacement(staged_binary, target, workdir, staging, stage_callback)
+    except BaseException:
+        shutil.rmtree(workdir, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+
+def _extract_linux_binary(archive: Path, destination: Path) -> Path:
+    """解压 release tar.gz 到 destination，返回包内的应用可执行文件。
+
+    解压前逐个校验成员：拒绝绝对路径、``..`` 上跳与链接/设备等特殊条目；
+    再交给 ``tarfile`` 的 ``data`` 过滤器兜底（Python 3.10.12+/3.12+ 可用，
+    更旧的解释器上成员已校验过，直接解压也是安全的）。
+    """
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        members = tar.getmembers()
+        for member in members:
+            name = str(member.name or "")
+            if not name or name.startswith("/") or ".." in Path(name).parts:
+                raise UpdateError("更新包包含非法路径条目")
+            if member.issym() or member.islnk() or not (member.isreg() or member.isdir()):
+                raise UpdateError("更新包含有意外条目类型")
+        try:
+            tar.extractall(destination, members=members, filter="data")
+        except TypeError:  # Python < 3.12 无过滤参数
+            tar.extractall(destination, members=members)
+    binaries = [path for path in sorted(destination.rglob("yikou-light-food")) if path.is_file()]
+    if not binaries:
+        raise UpdateError("更新包中未找到应用可执行文件")
+    if len(binaries) > 1:
+        raise UpdateError("更新包结构异常")
+    binary = binaries[0]
+    # data 过滤器会保留执行位，但显式 chmod 不依赖过滤器行为。
+    binary.chmod(0o755)
+    return binary
+
+
+def _schedule_linux_replacement(
+    staged_binary: Path,
+    target: Path,
+    workdir: Path,
+    staging_dir: Path,
+    stage_callback: Callable[[str], None] | None = None,
+    *,
+    pid: int | None = None,
+    launcher: Callable[..., Any] | None = None,
+) -> Path:
+    """Spawn a detached shell that swaps in the new binary after exit.
+
+    The shell waits for the current process (``pid``) to disappear, renames
+    the staged file over the installed executable (atomic, same filesystem)
+    and execs it.  Staging inside the install directory keeps the rename on
+    one filesystem; the temp workdir is removed either way.
+    """
+    if stage_callback:
+        stage_callback("准备重启")
+    popen = launcher or subprocess.Popen
+    pid = os.getpid() if pid is None else pid
+    installed = shlex.quote(str(target))
+    temp = f"{shlex.quote(str(workdir))} {shlex.quote(str(staging_dir))}"
+    script = (
+        f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+        f"if mv -f {shlex.quote(str(staged_binary))} {installed}; then "
+        f"rm -rf {temp} & exec {installed}; fi; rm -rf {temp}"
+    )
+    try:
+        popen(
+            ["/bin/sh", "-c", script],
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        raise UpdateError(f"Unable to start update installer: {exc}") from exc
+    return target
 
 
 def apply_pending_update(

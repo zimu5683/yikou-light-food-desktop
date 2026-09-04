@@ -53,7 +53,7 @@ jobs:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
           python -m pip install bsdiff4
-          python scripts/generate_patch.py
+          python scripts/generate_patch.py windows
 
       - name: Create release notes
         shell: pwsh
@@ -207,6 +207,17 @@ jobs:
           path: |
             yikou-light-food-linux-x64.tar.gz
             yikou-light-food-linux-x64.tar.gz.sha256
+      # 差分补丁以「解压后的裸二进制」为基线（用户本地持有的就是该文件）。
+      # 首个版本没有上一版可对照，脚本会跳过且不写元数据。
+      - name: Generate differential patch
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+        run: |
+          python3 -m pip install bsdiff4
+          python3 scripts/generate_patch.py linux
       - name: Publish Linux tarball to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -215,13 +226,22 @@ jobs:
             yikou-light-food-linux-x64.tar.gz
             yikou-light-food-linux-x64.tar.gz.sha256
           fail_on_unmatched_files: true
+      # 首个版本没有补丁，此处不做严格匹配。
+      - name: Publish Linux patch to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.patch
+          fail_on_unmatched_files: false
       - name: Upload checksum metadata for manifest
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
           name: linux-release-meta
-          path: yikou-light-food-linux-x64.tar.gz.sha256
-          if-no-files-found: error
+          path: |
+            yikou-light-food-linux-x64.tar.gz.sha256
+            dist/patch-meta-linux.json
+          if-no-files-found: warn
 
   # latest.json needs the Windows checksum/patch metadata, the macOS archive
   # checksum and the Linux archive checksum, so it runs as a job that depends

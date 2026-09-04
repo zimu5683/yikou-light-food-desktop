@@ -51,7 +51,7 @@ chmod +x yikou-light-food
 ./yikou-light-food
 ```
 
-Linux 版同样具备更新检查：发现新版本后会提示前往 GitHub Release 页面下载新的 tar.gz，按上面的步骤覆盖解压即可。
+Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Release，发现新版本后可以直接下载、校验并自动替换重启（需程序所在目录可写，失败时仍会引导前往 Release 页面手动下载）。
 
 浏览器方面建议安装系统版 Microsoft Edge（`microsoft-edge-stable`）或 Google Chrome（`google-chrome-stable`），程序会自动识别；也可点击“安装 / 检查浏览器”下载 Playwright Chromium（需要系统已具备常见运行库，缺失时可参照 Playwright 文档安装依赖）。
 
@@ -100,6 +100,6 @@ git tag v1.1.0
 git push origin main --tags
 ```
 
-推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 打包版可校验、下载并自动安装，macOS 与 Linux 用户收到提示后从 Release 页面下载新版安装包，源码运行模式也只提示前往 Release 页面。
+推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 与 Linux 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版安装包，源码运行模式也只提示前往 Release 页面。Linux 自动更新会把新版 tar.gz 解压到程序目录下的 `.yikou-light-food.update-<pid>/` 暂存目录，待本进程退出后由后台脚本原子替换可执行文件并重启，安装目录不可写时回退为提示手动下载。
 
-更新包下载后会用官方 SHA-256 校验，校验文件优先从 GitHub 直接拉取；GitHub 直连不可达时改用 `latest.json` 内嵌的同一官方哈希（发布工作流会同时写入两处）。注意：若所使用的下载镜像被完全控制，内嵌回退在理论上可被绕过，彻底方案是为 exe 做代码签名。
+更新包下载后会用官方 SHA-256 校验，校验文件优先从 GitHub 直接拉取；GitHub 直连不可达时改用 `latest.json` 内嵌的同一官方哈希（发布工作流会同时写入两处）。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁（Linux 补丁以「解压后的裸二进制」为基线，正是用户本地持有的文件）：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。注意：若所使用的下载镜像被完全控制，内嵌回退在理论上可被绕过，彻底方案是为 exe 做代码签名。
