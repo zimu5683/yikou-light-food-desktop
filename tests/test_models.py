@@ -42,7 +42,7 @@ def test_save_workbook_retries_after_locked_file():
 
 
 def test_order_log_contains_order_details():
-    from app.automation import _format_order_meals
+    from app.automation import _format_order_meals, _format_order_summary
 
     order = OrderInfo(
         order_no="W8",
@@ -50,6 +50,7 @@ def test_order_log_contains_order_details():
         lunch=[MealInfo(total_meals=6, grade="经济", count=2, meal_type="午餐")],
     )
     assert "午餐经济6餐 x2" in _format_order_meals(order)
+    assert _format_order_summary(order) == "W8｜测试用户｜未填写｜未填写｜午餐经济6餐 x2"
 
 
 def test_new_config_has_no_implicit_current_directory_workbook():

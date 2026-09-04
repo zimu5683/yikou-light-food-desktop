@@ -760,23 +760,25 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 login_step = _locator_step(locators, "登录成功")
                 page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
 
-                _navigate(page, "门店地址", locators, base_url, timeout, progress_callback)
-                _navigate(page, "订单菜单", locators, base_url, timeout, progress_callback)
+                # Navigation and locator recovery are implementation details;
+                # only the order-level status is shown in the normal log.
+                _navigate(page, "门店地址", locators, base_url, timeout, None)
+                _navigate(page, "订单菜单", locators, base_url, timeout, None)
                 # 站点数据层不稳定（Tab 点击后表格可能长时间空白），最多重试三轮导航。
                 last_table_error: Exception | None = None
                 for _ in range(3):
                     try:
-                        _navigate(page, "外送订单", locators, base_url, timeout, progress_callback)
+                        _navigate(page, "外送订单", locators, base_url, timeout, None)
                         page.wait_for_load_state("networkidle")
                         _wait_for_order_table(page, timeout)
                         last_table_error = None
                         break
                     except Exception as exc:
                         last_table_error = exc
-                        _emit(progress_callback, f"订单表格未就绪，重试：{exc}")
+                        _emit(progress_callback, "订单列表暂未就绪，正在重试")
                 if last_table_error is not None:
                     raise last_table_error
-                _emit(progress_callback, "登录成功，开始搜索订单")
+                _emit(progress_callback, "登录成功，开始处理订单")
                 list_url = page.url
                 for number in range(order_count, 0, -1):
                     if stop_event.is_set():
@@ -785,28 +787,26 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                     order: OrderInfo | None = None
                     occurrence = 0
                     while not stop_event.is_set():
-                        _emit(progress_callback, f"搜索 {code}")
                         try:
-                            _ensure_waimai_tab(page, locators, base_url, timeout, progress_callback, list_url)
+                            _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
                             try:
-                                cell = _find_order_cell(page, code, config, progress_callback, occurrence=occurrence)
+                                cell = _find_order_cell(page, code, config, None, occurrence=occurrence)
                             except LookupError:
                                 if occurrence:
-                                    _emit(progress_callback, f"{code} 没有下单日期为 {selected_date.isoformat()} 的订单，未写入 Excel")
+                                    _emit(progress_callback, f"{code} 没有目标日期订单，未写入 Excel")
                                     break
                                 raise
                             try:
                                 list_url = page.url
                             except Exception:
                                 list_url = ""
-                            _open_detail(page, code, cell, config, progress_callback, timeout, list_url, occurrence)
-                            _wait_for_detail(page, timeout, progress_callback)
+                            _open_detail(page, code, cell, config, None, timeout, list_url, occurrence)
+                            _wait_for_detail(page, timeout, None)
                             try:
                                 detail_url = page.url
                             except Exception:
                                 detail_url = ""
-                            _emit(progress_callback, f"{code} 已进入详情：{detail_url}")
-                            candidate = _read_order(page, code, timeout, locators, progress_callback, detail_url)
+                            candidate = _read_order(page, code, timeout, locators, None, detail_url)
                             if candidate is None:
                                 _save_failure_snapshot(page, f"详情空数据_{code}")
                                 raise LookupError(
@@ -814,31 +814,26 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                                     f"已放弃本次写入（快照见 logs 目录）")
                             created_date = parse_order_created_date(candidate.metadata.get("created_at"))
                             if created_date is None:
-                                _emit(progress_callback, f"{code} 缺少下单日期，跳过以避免误取历史订单")
+                                _emit(progress_callback, f"{code} 缺少下单日期，已跳过")
                                 occurrence += 1
-                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=progress_callback)
+                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
                                 continue
                             if created_date != selected_date:
-                                _emit(progress_callback, f"{code} 下单日期为 {created_date.isoformat()}，目标日期为 {selected_date.isoformat()}，跳过历史/非目标订单")
+                                _emit(progress_callback, f"{code} 跳过 {created_date.isoformat()} 订单（目标 {selected_date.isoformat()}）")
                                 occurrence += 1
-                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=progress_callback)
+                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
                                 continue
-                            _emit(progress_callback, f"{code} 找到目标日期订单：{selected_date.isoformat()}")
 
                             # Do not mutate the workbook until the browser has
                             # safely returned to the order list.  A retry can
                             # therefore never duplicate partially written rows.
-                            if not _back_to_order_list(page, timeout, list_url, reason="返回", callback=progress_callback):
+                            if not _back_to_order_list(page, timeout, list_url, reason="返回", callback=None):
                                 raise LookupError(f"订单 {code} 已读取但无法返回订单列表")
                             order = candidate
                             break
                         except Exception as exc:
-                            try:
-                                here = page.url
-                            except Exception:
-                                here = "未知"
                             _recover_order_table(page, timeout, list_url)
-                            _emit(progress_callback, f"{code} 本次异常（当前地址：{here}）：{exc}")
+                            _emit(progress_callback, f"{code} 处理失败：{exc}")
                             decision = "skip"
                             if order_decision_callback:
                                 decision = order_decision_callback(code, str(exc)).lower()
@@ -856,17 +851,16 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                         break
                     processed += 1
                     if order is None:
+                        _emit(progress_callback, "-------")
                         continue
                     for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
                         for meal in meals:
                             for _ in range(max(1, meal.count)):
                                 _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
                     meal_text = _format_order_meals(order)
-                    _emit(progress_callback, (
-                        f"订单详情：订单号={order.order_no}，姓名={order.name or '未填写'}，"
-                        f"电话={order.phone or '未填写'}，地址={order.address or '未填写'}，餐品={meal_text}"
-                    ))
+                    _emit(progress_callback, _format_order_summary(order, meal_text))
                     found += 1
+                    _emit(progress_callback, "-------")
             finally:
                 browser.close()
         _save_workbook_with_retry(wb, excel_path, save_decision_callback)
@@ -899,6 +893,18 @@ def _format_order_meals(order: OrderInfo) -> str:
             total = f"{meal.total_meals}餐" if meal.total_meals else "餐品"
             parts.append(f"{meal_type}{grade}{total} x{meal.count}")
     return "、".join(parts) if parts else "未识别"
+
+
+def _format_order_summary(order: OrderInfo, meal_text: str | None = None) -> str:
+    """Render one compact, user-facing line for a successfully read order."""
+    meals = meal_text if meal_text is not None else _format_order_meals(order)
+    return "｜".join((
+        order.order_no or "未知订单",
+        order.name or "未填写",
+        order.phone or "未填写",
+        order.address or "未填写",
+        meals,
+    ))
 
 
 def _wait_for_order_table(page: Any, timeout: int) -> None:
