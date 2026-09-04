@@ -77,7 +77,10 @@ def test_find_order_cell_traverses_pagination():
         def first(self):
             return self
 
-        def filter(self, **_kwargs):
+        def filter(self, **kwargs):
+            if "has_text" in kwargs and "W" not in kwargs["has_text"].pattern:
+                self.kind = "page-number"
+                self.target = int(kwargs["has_text"].pattern.replace("^\\s*", "").replace("\\s*$", ""))
             return self
 
         def is_visible(self):
@@ -87,6 +90,8 @@ def test_find_order_cell_traverses_pagination():
             return None
 
         def count(self):
+            if self.kind == "page-number":
+                return 1
             return int(self.kind == "cell" and self.page.page_number == 2)
 
         def wait_for(self, **_kwargs):
@@ -95,8 +100,10 @@ def test_find_order_cell_traverses_pagination():
         def is_disabled(self):
             return False
 
-        def click(self):
-            if self.kind == "next":
+        def click(self, **_kwargs):
+            if self.kind == "page-number":
+                self.page.page_number = self.target
+            elif self.kind == "next":
                 self.page.page_number += 1
 
     class Page:
@@ -122,8 +129,9 @@ def test_find_order_cell_traverses_pagination():
         order_search_attempts=1,
         max_page_search=3,
     )
-    cell = automation._find_order_cell(page, "W1", config, None)
+    cell, found_page = automation._find_order_cell(page, "W1", config, None)
     assert cell.count() == 1
+    assert found_page == 2
     assert page.page_number == 2
 
 
@@ -137,10 +145,15 @@ def test_find_order_cell_skips_checked_occurrence_across_pages():
         def first(self):
             return self
 
-        def filter(self, **_kwargs):
+        def filter(self, **kwargs):
+            if "has_text" in kwargs and "W" not in kwargs["has_text"].pattern:
+                self.kind = "page-number"
+                self.target = int(kwargs["has_text"].pattern.replace("^\\s*", "").replace("\\s*$", ""))
             return self
 
         def count(self):
+            if self.kind == "page-number":
+                return 1
             return int(self.kind == "cell")
 
         def wait_for(self, **_kwargs):
@@ -155,8 +168,10 @@ def test_find_order_cell_skips_checked_occurrence_across_pages():
         def is_disabled(self):
             return False
 
-        def click(self):
-            if self.kind == "next":
+        def click(self, **_kwargs):
+            if self.kind == "page-number":
+                self.page.page_number = self.target
+            elif self.kind == "next":
                 self.page.page_number += 1
 
     class Page:
@@ -179,12 +194,163 @@ def test_find_order_cell_skips_checked_occurrence_across_pages():
     config = SimpleNamespace(order_search_timeout_ms=1000, retry_wait_ms=200,
                              order_search_attempts=1, max_page_search=3)
     page = Page()
-    automation._find_order_cell(page, "W1", config, None, occurrence=1)
+    cell, found_page = automation._find_order_cell(page, "W1", config, None, occurrence=1)
+    assert cell.count() == 1
+    assert found_page == 2
     assert page.page_number == 2
 
 
-def test_ensure_waimai_tab_recovers_bounce_by_direct_goto(monkeypatch):
-    """被 SPA 弹回 #/home 后，必须先直达回列表页再点 Tab（Tab 在首页不存在）。"""
+def test_find_order_cell_starts_from_requested_page_and_wraps_to_first():
+    class Locator:
+        def __init__(self, page, kind):
+            self.page = page
+            self.kind = kind
+
+        @property
+        def first(self):
+            return self
+
+        def filter(self, **kwargs):
+            if "has_text" in kwargs and "W" not in kwargs["has_text"].pattern:
+                self.kind = "page-number"
+                self.target = int(kwargs["has_text"].pattern.replace("^\\s*", "").replace("\\s*$", ""))
+            return self
+
+        def count(self):
+            if self.kind == "page-number":
+                return 1
+            if self.kind == "cell":
+                return int(self.page.page_number == 1)
+            return 1
+
+        def wait_for(self, **_kwargs):
+            return None
+
+        def is_visible(self):
+            return self.kind == "first-page" and self.page.page_number != 1
+
+        def get_attribute(self, name):
+            if self.kind == "first-page" and name == "class":
+                return ""
+            return None
+
+        def is_disabled(self):
+            return self.kind == "next" and self.page.page_number >= 3
+
+        def click(self, **_kwargs):
+            if self.kind == "page-number":
+                self.page.page_number = self.target
+            elif self.kind == "first-page":
+                self.page.page_number = 1
+            elif self.kind == "next":
+                self.page.page_number += 1
+
+    class Page:
+        def __init__(self):
+            self.page_number = 1
+
+        def locator(self, selector):
+            if "li.number" in selector:
+                return Locator(self, "first-page")
+            if "btn-next" in selector:
+                return Locator(self, "next")
+            return Locator(self, "cell")
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+    config = SimpleNamespace(order_search_timeout_ms=1000, retry_wait_ms=200,
+                             order_search_attempts=1, max_page_search=3)
+    page = Page()
+    cell, found_page = automation._find_order_cell(page, "W1", config, None, start_page=2)
+    assert cell.count() == 1
+    assert found_page == 1
+    assert page.page_number == 1
+
+
+def test_find_order_cell_resets_to_first_page_when_every_page_misses():
+    class Locator:
+        def __init__(self, page, kind):
+            self.page = page
+            self.kind = kind
+
+        @property
+        def first(self):
+            return self
+
+        def filter(self, **kwargs):
+            if "has_text" in kwargs and "W" not in kwargs["has_text"].pattern:
+                self.kind = "page-number"
+                self.target = int(kwargs["has_text"].pattern.replace("^\\s*", "").replace("\\s*$", ""))
+            return self
+
+        def count(self):
+            if self.kind == "page-number":
+                return 1
+            return 0 if self.kind == "cell" else 1
+
+        def wait_for(self, **_kwargs):
+            return None
+
+        def is_visible(self):
+            return self.kind == "first-page" and self.page.page_number != 1
+
+        def get_attribute(self, _name):
+            return "" if self.kind == "first-page" else None
+
+        def is_disabled(self):
+            return self.kind == "next" and self.page.page_number >= 2
+
+        def click(self, **_kwargs):
+            if self.kind == "page-number":
+                self.page.page_number = self.target
+            elif self.kind == "first-page":
+                self.page.page_number = 1
+            elif self.kind == "next":
+                self.page.page_number += 1
+
+    class Page:
+        def __init__(self):
+            self.page_number = 1
+
+        def locator(self, selector):
+            if "li.number" in selector:
+                return Locator(self, "first-page")
+            if "btn-next" in selector:
+                return Locator(self, "next")
+            return Locator(self, "cell")
+
+        def wait_for_timeout(self, _milliseconds):
+            return None
+
+        def wait_for_load_state(self, *_args, **_kwargs):
+            return None
+
+    import pytest
+
+    config = SimpleNamespace(order_search_timeout_ms=1000, retry_wait_ms=200,
+                             order_search_attempts=1, max_page_search=2)
+    page = Page()
+    with pytest.raises(automation.OrderSearchNotFound):
+        automation._find_order_cell(page, "W9", config, None, start_page=2)
+    assert page.page_number == 1
+
+
+def test_order_page_jump_sequence_uses_even_page_anchors():
+    assert automation._order_page_jump_sequence(1) == [1]
+    assert automation._order_page_jump_sequence(6) == [6]
+    assert automation._order_page_jump_sequence(7) == [6, 7]
+    assert automation._order_page_jump_sequence(8) == [6, 8]
+    assert automation._order_page_jump_sequence(10) == [6, 8, 10]
+    assert automation._order_page_jump_sequence(11) == [6, 8, 10, 11]
+    assert automation._order_page_jump_sequence(20) == [6, 8, 10, 12, 14, 16, 18, 20]
+
+
+def test_ensure_waimai_tab_always_resets_list_and_clicks_tab(monkeypatch):
+    """每次进入订单列表都固定直达并点击外送订单，不再检查 Tab 状态。"""
     class Page:
         def __init__(self):
             self.url = "https://m.icall.me/admin/#/home"
@@ -204,20 +370,20 @@ def test_ensure_waimai_tab_recovers_bounce_by_direct_goto(monkeypatch):
     assert navigated == ["外送订单"]
 
 
-def test_ensure_waimai_tab_skips_work_when_active(monkeypatch):
-    """Tab 已选中时零操作：既不 goto 也不点击，避免触发表格重刷。"""
+def test_ensure_waimai_tab_does_not_inspect_active_state(monkeypatch):
+    """即使调用方认为 Tab 已选中，也仍固定回列表并点击一次。"""
 
     class Page:
         url = "https://m.icall.me/admin/#/order/takeOutList"
 
-        def goto(self, *_args, **_kwargs):
-            raise AssertionError("不应 goto")
+        def goto(self, target, **_kwargs):
+            self.url = target
 
-    monkeypatch.setattr(automation, "_waimai_tab_active", lambda _page: True)
-    monkeypatch.setattr(automation, "_navigate",
-                        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不应点击 Tab")))
+    clicked = []
+    monkeypatch.setattr(automation, "_navigate", lambda *args, **_kwargs: clicked.append(args[1]))
     automation._ensure_waimai_tab(Page(), None, "https://m.icall.me/admin/#", 1000, None,
                                   "https://m.icall.me/admin/#/order/takeOutList")
+    assert clicked == ["外送订单"]
 
 
 def test_read_order_retries_once_after_bounce(monkeypatch):

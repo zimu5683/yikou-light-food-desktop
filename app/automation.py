@@ -44,6 +44,7 @@ except ImportError:  # pragma: no cover - allows ``python app/automation.py``
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
 MAX_PAGE_SEARCH = 20
+PAGE_JUMP_THRESHOLD = 6
 SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 HISTORICAL_SHEET_HEADERS = (
@@ -121,6 +122,10 @@ class LocatorError(RuntimeError):
     log directory before this error is raised, so the site change can be
     fixed by editing the locator configuration instead of the code.
     """
+
+
+class OrderSearchNotFound(LookupError):
+    """Raised when every order-list page was searched without a match."""
 
 
 def detect_browsers() -> dict[str, str | None]:
@@ -762,15 +767,14 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
 
                 # Navigation and locator recovery are implementation details;
                 # only the order-level status is shown in the normal log.
-                _navigate(page, "门店地址", locators, base_url, timeout, None)
-                _navigate(page, "订单菜单", locators, base_url, timeout, None)
-                # 站点数据层不稳定（Tab 点击后表格可能长时间空白），最多重试三轮导航。
+                list_url = f"{base_url}order/takeOutList"
+                # Always start from the known order-list route and explicitly
+                # select 外送订单.  The site frequently remounts the SPA and
+                # leaves the previously selected tab in an unknown state.
                 last_table_error: Exception | None = None
                 for _ in range(3):
                     try:
-                        _navigate(page, "外送订单", locators, base_url, timeout, None)
-                        page.wait_for_load_state("networkidle")
-                        _wait_for_order_table(page, timeout)
+                        _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
                         last_table_error = None
                         break
                     except Exception as exc:
@@ -779,28 +783,35 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 if last_table_error is not None:
                     raise last_table_error
                 _emit(progress_callback, "登录成功，开始处理订单")
-                list_url = page.url
+                current_page = 1
+                list_ready = True
                 for number in range(order_count, 0, -1):
                     if stop_event.is_set():
                         break
                     code = f"W{number}"
                     order: OrderInfo | None = None
                     occurrence = 0
+                    start_page = current_page
                     while not stop_event.is_set():
                         try:
-                            _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
+                            if not list_ready:
+                                _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
+                                list_ready = True
                             try:
-                                cell = _find_order_cell(page, code, config, None, occurrence=occurrence)
-                            except LookupError:
-                                if occurrence:
-                                    _emit(progress_callback, f"{code} 没有目标日期订单，未写入 Excel")
-                                    break
-                                raise
-                            try:
-                                list_url = page.url
-                            except Exception:
-                                list_url = ""
-                            _open_detail(page, code, cell, config, None, timeout, list_url, occurrence)
+                                cell, found_page = _find_order_cell(
+                                    page, code, config, None,
+                                    occurrence=occurrence, start_page=start_page,
+                                )
+                            except OrderSearchNotFound:
+                                _emit(progress_callback, f"{code} 没有目标日期订单，未写入 Excel")
+                                current_page = 1
+                                _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
+                                list_ready = True
+                                break
+                            _open_detail(
+                                page, code, cell, config, None, timeout, list_url,
+                                occurrence, start_page,
+                            )
                             _wait_for_detail(page, timeout, None)
                             try:
                                 detail_url = page.url
@@ -816,12 +827,16 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                             if created_date is None:
                                 _emit(progress_callback, f"{code} 缺少下单日期，已跳过")
                                 occurrence += 1
+                                start_page = found_page
                                 _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
+                                list_ready = False
                                 continue
                             if created_date != selected_date:
                                 _emit(progress_callback, f"{code} 跳过 {created_date.isoformat()} 订单（目标 {selected_date.isoformat()}）")
                                 occurrence += 1
+                                start_page = found_page
                                 _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
+                                list_ready = False
                                 continue
 
                             # Do not mutate the workbook until the browser has
@@ -830,9 +845,12 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                             if not _back_to_order_list(page, timeout, list_url, reason="返回", callback=None):
                                 raise LookupError(f"订单 {code} 已读取但无法返回订单列表")
                             order = candidate
+                            current_page = found_page
+                            list_ready = False
                             break
                         except Exception as exc:
                             _recover_order_table(page, timeout, list_url)
+                            list_ready = False
                             _emit(progress_callback, f"{code} 处理失败：{exc}")
                             decision = "skip"
                             if order_decision_callback:
@@ -960,43 +978,15 @@ def _waimai_tab_active(page: Any) -> bool:
 def _ensure_waimai_tab(page: Any, locators: dict[str, Any] | None, base_url: str,
                         timeout: int, callback: Callable[[str], Any] | None,
                         list_url: str = "") -> None:
-    """每次搜索前确认停在 外送订单 Tab 上：只验证，不盲点。
-
-    列表页是 自提订单/外送订单/店内订单… 多 Tab，任何重载或路由 remount
-    都会把它重置回默认的 自提订单（W 单全在外送订单下），而表格等待在
-    错误 Tab 上也能通过。之前“每单前重点一次 Tab”会在已选中的 Tab 上
-    触发表格重刷，正好撞上紧随其后的行定位——这就是首单 W8 也失败的
-    regression。MISS 时才点，命中则零操作。
-
-    站点 SPA 会不定期把页面弹回 #/home（列表默认 Tab 和详情页都可能中招），
-    此时 Tab 根本不存在，直接找 Tab 必然报“页面定位失败：外送订单”。
-    所以恢复必须先 goto 回记录的列表地址，再点 Tab。
-    """
-    try:
-        url = page.url
-    except Exception:
-        url = ""
-    on_list = "takeOutList" in (url or "")
-    if not on_list and list_url:
-        _emit(callback, f"页面被弹离订单列表（当前 {url or '未知'}），直达回列表页")
-        try:
-            page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
-        except Exception as exc:
-            _emit(callback, f"回列表页直达失败：{exc}")
-    elif not on_list and "/order" not in (url or ""):
-        _emit(callback, f"当前不在订单列表页（{url or '未知'}），回到外送订单")
-    try:
-        if on_list and _waimai_tab_active(page):
-            return
-    except Exception:
-        pass
-    _emit(callback, "外送订单 Tab 未确认选中，重新点击")
+    """Reset to the order-list route and explicitly select 外送订单."""
+    if list_url:
+        page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
     _navigate(page, "外送订单", locators, base_url, timeout, callback)
 
 
 def _open_detail(page: Any, code: str, cell: Any, config: Any,
                   callback: Callable[[str], Any] | None, timeout: int,
-                  list_url: str = "", occurrence: int = 0) -> None:
+                  list_url: str = "", occurrence: int = 0, start_page: int = 1) -> None:
     """点击详情并验证地址真的进了 detail 路由；没点开就明错，绝不执行返回。
 
     点击落在表格重渲染间隙时会丢失（地址不变、无新历史），此时若执行
@@ -1029,7 +1019,10 @@ def _open_detail(page: Any, code: str, cell: Any, config: Any,
                 try:
                     if list_url and "takeOutList" not in (now or ""):
                         page.goto(list_url, timeout=timeout, wait_until="domcontentloaded")
-                    cell = _find_order_cell(page, code, config, callback, occurrence=occurrence)
+                    cell, _ = _find_order_cell(
+                        page, code, config, callback,
+                        occurrence=occurrence, start_page=start_page,
+                    )
                 except Exception:
                     pass
                 continue
@@ -1129,16 +1122,7 @@ def _back_to_order_list(page: Any, timeout: int, list_url: str, reason: str = "�
         return False
 
 
-def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None,
-                     occurrence: int = 0) -> Any:
-    """Find an exact order number, retrying renders and traversing pages."""
-    timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
-    pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
-    attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
-    max_pages = max(1, int(getattr(config, "max_page_search", MAX_PAGE_SEARCH)))
-
-    # Searches should always start from page one; after returning from details
-    # the SPA may otherwise leave the pagination on the previous order's page.
+def _go_to_first_order_page(page: Any, pause: int) -> None:
     first_page = page.locator('.el-pagination li.number').filter(has_text=re.compile(r'^\s*1\s*$')).first
     try:
         if first_page.is_visible() and "active" not in (first_page.get_attribute("class") or ""):
@@ -1147,44 +1131,88 @@ def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str]
     except Exception:
         pass
 
-    last_error: Exception | None = None
-    for page_number in range(1, max_pages + 1):
-        matches = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
-            has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
-        )
-        for attempt in range(1, attempts + 1):
-            try:
-                count = matches.count()
-                if count > occurrence:
-                    cell = matches.first if occurrence == 0 else matches.nth(occurrence)
-                    cell.wait_for(state="visible", timeout=timeout)
-                    return cell
-                raise LookupError(f"订单 {code} 不在第 {page_number} 页")
-            except Exception as exc:
-                last_error = exc
-                if attempt < attempts:
-                    _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
-                    page.wait_for_timeout(pause)
 
-        if page_number >= max_pages:
-            break
-        # ``occurrence`` counts matching rows across all previous pages.
-        # Subtract this page before looking at the next page.
-        occurrence = max(0, occurrence - matches.count())
-        next_button = page.locator('.el-pagination button.btn-next, button.btn-next').first
+def _click_order_page_number(page: Any, page_number: int, timeout: int, pause: int) -> bool:
+    button = page.locator('.el-pagination li.number').filter(
+        has_text=re.compile(rf'^\s*{page_number}\s*$')
+    ).first
+    try:
+        button.wait_for(state="visible", timeout=timeout)
+        button.click(timeout=timeout)
+        page.wait_for_load_state("domcontentloaded", timeout=min(timeout, 5000))
+        page.wait_for_timeout(pause)
+        return True
+    except Exception:
         try:
-            disabled = next_button.is_disabled() or next_button.get_attribute("disabled") is not None
-            disabled = disabled or "disabled" in (next_button.get_attribute("class") or "").lower()
-            if disabled:
-                break
-            _emit(callback, f"{code} 当前页未找到，继续搜索第 {page_number + 1} 页")
-            next_button.click()
+            button = page.locator(
+                f'//div[contains(@class,"el-pagination")]//li[contains(@class,"number") and normalize-space()="{page_number}"]'
+            ).first
+            button.wait_for(state="visible", timeout=timeout)
+            button.click(timeout=timeout)
+            page.wait_for_load_state("domcontentloaded", timeout=min(timeout, 5000))
             page.wait_for_timeout(pause)
-            _wait_for_order_table(page, timeout)
-        except Exception as exc:
-            last_error = exc
-            break
-    raise last_error or TimeoutError(f"订单 {code} 未找到")
+            return True
+        except Exception:
+            return False
+
+
+def _order_page_jump_sequence(target_page: int) -> list[int]:
+    target_page = max(1, int(target_page))
+    if target_page <= PAGE_JUMP_THRESHOLD:
+        return [target_page]
+    return [*range(PAGE_JUMP_THRESHOLD, target_page, 2), target_page]
+
+
+def _jump_to_order_page(page: Any, target_page: int, timeout: int, pause: int,
+                        callback: Callable[[str], Any] | None = None) -> bool:
+    """Reach a page using the pagination control's visible jump sequence.
+
+    Element Plus hides later page buttons behind an ellipsis.  Clicking 6,
+    then 8, then 10, and so on makes the next target button visible, matching
+    the navigation sequence used by the original automation.
+    """
+    _go_to_first_order_page(page, pause)
+    for page_number in _order_page_jump_sequence(target_page):
+        if not _click_order_page_number(page, page_number, timeout, pause):
+            _emit(callback, f"无法跳转到第 {page_number} 页")
+            return False
+    return True
+
+
+def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str], Any] | None,
+                     occurrence: int = 0, start_page: int = 1) -> tuple[Any, int]:
+    """Find an exact order number, starting at a remembered page and wrapping once."""
+    timeout = max(1000, int(getattr(config, "order_search_timeout_ms", 8000)))
+    pause = max(200, int(getattr(config, "retry_wait_ms", 1000)))
+    attempts = max(1, int(getattr(config, "order_search_attempts", 3)))
+    max_pages = max(1, int(getattr(config, "max_page_search", MAX_PAGE_SEARCH)))
+
+    start_page = max(1, min(int(start_page), max_pages))
+    remaining = max(0, int(occurrence))
+    last_error: Exception | None = None
+    for targets in (range(start_page, max_pages + 1), range(1, start_page)):
+        for page_number in targets:
+            if not _jump_to_order_page(page, page_number, timeout, pause, callback):
+                break
+            matches = page.locator('.el-table__body-wrapper tbody tr:visible td, table tbody tr:visible td').filter(
+                has_text=re.compile(rf'^\s*{re.escape(code)}\s*$')
+            )
+            for attempt in range(1, attempts + 1):
+                try:
+                    count = matches.count()
+                    if count > remaining:
+                        cell = matches.first if remaining == 0 else matches.nth(remaining)
+                        cell.wait_for(state="visible", timeout=timeout)
+                        return cell, page_number
+                    raise LookupError(f"订单 {code} 不在第 {page_number} 页")
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < attempts:
+                        _emit(callback, f"{code} 页面仍在刷新，{pause / 1000:g} 秒后重试 ({attempt}/{attempts - 1})")
+                        page.wait_for_timeout(pause)
+
+            remaining = max(0, remaining - matches.count())
+    raise OrderSearchNotFound(f"订单 {code} 未找到（已搜索全部订单页）") from last_error
 
 
 __all__ = ["run_job", "ensure_browser", "detect_browsers", "BrowserNotFoundError", "LocatorError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]
