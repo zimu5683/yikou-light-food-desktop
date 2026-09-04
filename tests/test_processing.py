@@ -1,6 +1,8 @@
 """processing 纯函数的单元测试：收货人解析、楼栋判定与地址段提取。"""
 from __future__ import annotations
 
+import datetime as dt
+
 from openpyxl import Workbook
 
 from app.models import MealInfo, OrderInfo
@@ -93,3 +95,20 @@ def test_get_first_empty_row_skips_leading_placeholder_rows():
     ws["A1"] = "表头"
     ws["A2"] = "占位"
     assert get_first_empty_row(ws) == 3
+
+
+def test_historical_order_writes_to_a_dated_sheet():
+    from app.automation import _write_order
+
+    workbook = Workbook()
+    order = OrderInfo(order_no="W2", name="张三", address="大西A101", phone="13800000001")
+    meal = MealInfo(total_meals=6, grade="经济", count=1, meal_type="午餐")
+    target_date = dt.date(2026, 9, 3)
+
+    _write_order(workbook, order, meal, "午餐", target_date=target_date, today=dt.date(2026, 9, 4))
+    sheet = workbook["2026年9月3日 周四"]
+
+    assert [sheet.cell(1, column).value for column in range(1, 5)] == ["取单号", "姓名", "地址", "电话"]
+    assert [sheet.cell(2, column).value for column in range(1, 5)] == ["W2", "张三", "大西A101", "13800000001"]
+    assert sheet.cell(2, 8).value == 1  # 周四
+    assert sheet.cell(2, 12).value == "午餐"

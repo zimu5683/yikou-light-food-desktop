@@ -50,6 +50,8 @@ class AppConfig:
     order_search_timeout_ms: int = 8000
     retry_wait_ms: int = 1000
     order_search_attempts: int = 3
+    # Empty means "today". The GUI validates the YYYY-MM-DD form before a run.
+    order_date: str = ""
     split_ratio: float = 0.38
     # 闪时送（sss）下单任务的独立配置，与管理后台订单处理互不影响。
     sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout"
@@ -64,6 +66,7 @@ class AppConfig:
                  max_page_search: int = 20, element_timeout_ms: int = 8000,
                  network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
                  retry_wait_ms: int = 1000, order_search_attempts: int = 3,
+                 order_date: str = "",
                  split_ratio: float = 0.38,
                  sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout",
                  sss_account: str = "",
@@ -88,6 +91,7 @@ class AppConfig:
         self.order_search_timeout_ms = order_search_timeout_ms
         self.retry_wait_ms = retry_wait_ms
         self.order_search_attempts = order_search_attempts
+        self.order_date = str(order_date or "").strip()
         self.split_ratio = clamp_split_ratio(split_ratio)
         self.sss_url = sss_url
         self.sss_account = sss_account

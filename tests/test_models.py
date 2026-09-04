@@ -56,6 +56,14 @@ def test_new_config_has_no_implicit_current_directory_workbook():
     assert AppConfig().excel_path is None
 
 
+def test_config_persists_order_date(tmp_path):
+    config = AppConfig(order_date="2026-09-03")
+    path = tmp_path / "config.json"
+    config.save(path)
+    loaded = AppConfig.load(path)
+    assert loaded.order_date == "2026-09-03"
+
+
 def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
     from app.automation import _load_order_workbook
 

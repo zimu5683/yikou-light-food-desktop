@@ -1,6 +1,7 @@
 """Tkinter user interface for the order processor."""
 from __future__ import annotations
 
+import datetime as _dt
 import queue
 import os
 import sys
@@ -9,7 +10,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, font as tkfont, messagebox, ttk
 
-from .automation import BrowserNotFoundError, ensure_browser, run_job
+from .automation import BrowserNotFoundError, ensure_browser, parse_target_date, run_job
 from .config import AppConfig, clamp_split_ratio
 from .credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
@@ -32,6 +33,105 @@ EXCEL_FILETYPES: tuple[tuple[str, str | tuple[str, ...]], ...] = (
     ("所有文件 (*)", "*"),
 )
 EXCEL_EXTS = {".xlsx", ".xlsm"}
+
+
+class _DatePickerPopup(tk.Toplevel):
+    """A single-month, dependency-free calendar for one target date."""
+
+    def __init__(self, owner: "App", anchor: tk.Widget, selected: _dt.date) -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.anchor = anchor
+        self.pending = selected
+        self.today = _dt.date.today()
+        self.month = selected.replace(day=1)
+        self.configure(bg=TOKENS.surface, bd=1, highlightthickness=1, highlightbackground=TOKENS.border)
+        self.overrideredirect(True)
+        self.transient(owner)
+        self._render()
+        self.update_idletasks()
+        x = max(0, min(anchor.winfo_rootx(), owner.winfo_screenwidth() - self.winfo_reqwidth() - 8))
+        y = min(anchor.winfo_rooty() + anchor.winfo_height() + 2,
+                owner.winfo_screenheight() - self.winfo_reqheight() - 8)
+        self.geometry(f"+{x}+{y}")
+        self.grab_set()
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _render(self) -> None:
+        for child in self.winfo_children():
+            child.destroy()
+        header = tk.Frame(self, bg=TOKENS.surface)
+        header.pack(fill="x", padx=12, pady=(10, 6))
+        tk.Button(header, text="<", command=lambda: self._change_month(-1), relief="flat", bd=0,
+                  bg=TOKENS.surface_muted, fg=TOKENS.primary, activebackground=TOKENS.green_light,
+                  font=(FONT_FAMILY, 9, "bold"), padx=8, pady=3).pack(side="left")
+        tk.Label(header, text=f"{self.month.year} 年 {self.month.month} 月", bg=TOKENS.surface, fg=TOKENS.text,
+                 font=(FONT_FAMILY, 11, "bold")).pack(side="left", expand=True)
+        next_button = tk.Button(header, text=">", command=lambda: self._change_month(1), relief="flat", bd=0,
+                                bg=TOKENS.surface_muted, fg=TOKENS.primary, activebackground=TOKENS.green_light,
+                                font=(FONT_FAMILY, 9, "bold"), padx=8, pady=3)
+        if self._add_months(self.month, 1) > self.today.replace(day=1):
+            next_button.configure(state="disabled", fg=TOKENS.text_soft)
+        next_button.pack(side="right")
+
+        calendar = tk.Frame(self, bg=TOKENS.surface)
+        calendar.pack(fill="both", padx=12, pady=(0, 10))
+        self._render_month(calendar, self.month)
+
+        footer = tk.Frame(self, bg=TOKENS.surface, highlightthickness=1, highlightbackground=TOKENS.border_soft)
+        footer.pack(fill="x")
+        tk.Button(footer, text="清空", command=self._clear, relief="flat", bd=0,
+                  bg=TOKENS.surface, fg=TOKENS.text_soft, activebackground=TOKENS.surface_muted,
+                  font=(FONT_FAMILY, 9), padx=14, pady=8).pack(side="left", padx=5)
+        tk.Button(footer, text="确定", command=self._confirm, relief="flat", bd=0,
+                  bg=TOKENS.accent, fg=TOKENS.text_on_dark, activebackground=TOKENS.uplift,
+                  activeforeground=TOKENS.text_on_dark, font=(FONT_FAMILY, 9, "bold"), padx=16, pady=8).pack(side="right", padx=5)
+
+    @staticmethod
+    def _add_months(value: _dt.date, delta: int) -> _dt.date:
+        index = value.year * 12 + value.month - 1 + delta
+        return _dt.date(index // 12, index % 12 + 1, 1)
+
+    def _render_month(self, master: tk.Misc, month: _dt.date) -> None:
+        panel = tk.Frame(master, bg=TOKENS.surface)
+        panel.pack()
+        for index, day_name in enumerate(("日", "一", "二", "三", "四", "五", "六")):
+            tk.Label(panel, text=day_name, width=3, bg=TOKENS.surface, fg=TOKENS.text_soft,
+                     font=(FONT_FAMILY, 9, "bold")).grid(row=0, column=index, padx=2, pady=(0, 3))
+        first_cell = (month.weekday() + 1) % 7
+        start = month - _dt.timedelta(days=first_cell)
+        for index in range(42):
+            value = start + _dt.timedelta(days=index)
+            row, cell_column = divmod(index, 7)
+            in_month = value.month == month.month
+            selectable = in_month and value <= self.today
+            button = tk.Button(panel, text=str(value.day), width=3, relief="flat", bd=0,
+                               command=lambda day=value: self._select(day), font=(FONT_FAMILY, 9),
+                               bg=TOKENS.accent if value == self.pending else TOKENS.surface,
+                               fg=TOKENS.text_on_dark if value == self.pending else (TOKENS.text if selectable else TOKENS.text_soft),
+                               activebackground=TOKENS.uplift, activeforeground=TOKENS.text_on_dark)
+            if not selectable:
+                button.configure(state="disabled", bg=TOKENS.surface, disabledforeground=TOKENS.text_soft)
+            button.grid(row=row + 1, column=cell_column, padx=2, pady=1)
+
+    def _change_month(self, delta: int) -> None:
+        self.month = self._add_months(self.month, delta)
+        self._render()
+
+    def _select(self, value: _dt.date) -> None:
+        self.pending = value
+        self._render()
+
+    def _clear(self) -> None:
+        self.pending = None
+        self._render()
+
+    def _confirm(self) -> None:
+        if self.pending is None:
+            self.owner._clear_order_date()
+        else:
+            self.owner._set_order_date(self.pending)
+        self.destroy()
 
 
 class App(tk.Tk):
@@ -211,8 +311,22 @@ class App(tk.Tk):
                                                 bg=TOKENS.surface)
         self.excel_template_button.grid(row=0, column=2, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
 
+        date_row = tk.Frame(body, bg=TOKENS.surface)
+        date_row.grid(row=4, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        date_row.columnconfigure(0, weight=1)
+        self.order_date = tk.StringVar()
+        self.order_date_field = FormField(date_row, "目标日期", self.order_date,
+                                          helper="留空默认今天；只允许选择今天或过去日期")
+        self.order_date_field.grid(row=0, column=0, sticky="ew")
+        self.order_date_field.entry.bind("<Button-1>", self._open_order_date_picker, add="+")
+        self.order_date_button = tk.Button(date_row, text="日历", command=self._open_order_date_picker,
+                                           relief="flat", bd=0, bg=TOKENS.surface_muted, fg=TOKENS.primary,
+                                           activebackground=TOKENS.green_light, font=(FONT_FAMILY, 9, "bold"),
+                                           padx=10, pady=7)
+        self.order_date_button.grid(row=0, column=1, sticky="s", padx=(TOKENS.space_2, 0), pady=(20, 0))
+
         order_row = tk.Frame(body, bg=TOKENS.surface)
-        order_row.grid(row=4, column=0, sticky="ew", pady=(0, TOKENS.space_3))
+        order_row.grid(row=5, column=0, sticky="ew", pady=(0, TOKENS.space_3))
         order_row.columnconfigure(0, weight=1)
         tk.Label(order_row, text="待处理订单数", bg=TOKENS.surface, fg=TOKENS.text,
                  font=(FONT_FAMILY, 10, "bold"), anchor="w").grid(row=0, column=0, sticky="w")
@@ -225,10 +339,10 @@ class App(tk.Tk):
         self.order_spinbox.grid(row=0, column=1, sticky="e", ipady=6)
         self.order_error = tk.Label(body, text="", bg=TOKENS.surface, fg=TOKENS.error,
                                     font=(FONT_FAMILY, 9), anchor="w")
-        self.order_error.grid(row=5, column=0, sticky="ew")
+        self.order_error.grid(row=6, column=0, sticky="ew")
 
         remember_row = tk.Frame(body, bg=TOKENS.surface)
-        remember_row.grid(row=6, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        remember_row.grid(row=7, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
         self.remember = tk.BooleanVar(value=True)
         tk.Checkbutton(remember_row, text="保存到系统凭据管理器", variable=self.remember,
                        bg=TOKENS.surface, fg=TOKENS.text_soft, activebackground=TOKENS.surface,
@@ -236,7 +350,7 @@ class App(tk.Tk):
                        highlightthickness=0).pack(side="left")
 
         actions = tk.Frame(body, bg=TOKENS.surface)
-        actions.grid(row=7, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
+        actions.grid(row=8, column=0, sticky="ew", pady=(TOKENS.space_2, TOKENS.space_3))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
         self.order_start_button = PillButton(actions, "开始处理", self.start, variant="primary")
@@ -247,7 +361,7 @@ class App(tk.Tk):
 
         tools = tk.Frame(body, bg=TOKENS.surface)
         self.tools = tools
-        tools.grid(row=8, column=0, sticky="ew")
+        tools.grid(row=9, column=0, sticky="ew")
         self.tool_buttons = [
             PillButton(tools, "检查浏览器", self.install_browser, variant="outline"),
             PillButton(tools, "清除密码", self.clear_password, variant="outline"),
@@ -469,6 +583,7 @@ class App(tk.Tk):
         self.vars["url"].set(config.target_url)
         self.vars["phone"].set(config.phone_number)
         self.vars["excel"].set(str(config.excel_path) if config.excel_path else "")
+        self.order_date.set(config.order_date or _dt.date.today().isoformat())
         self.password.set(get_password(config.phone_number) or "")
         self.vars_sss["sss_url"].set(config.sss_url)
         self.vars_sss["sss_account"].set(config.sss_account)
@@ -640,7 +755,8 @@ class App(tk.Tk):
         except ValueError as exc:
             raise ValueError("待处理订单数必须是大于等于 1 的整数") from exc
         return AppConfig(target_url=self.vars["url"].get().strip(), phone_number=self.vars["phone"].get().strip(),
-                         excel_path=self.vars["excel"].get().strip(), browser_mode="auto")
+                         excel_path=self.vars["excel"].get().strip(), order_date=self.order_date.get().strip(),
+                         browser_mode="auto")
 
     def _config_sss(self) -> AppConfig:
         return AppConfig(
@@ -691,11 +807,41 @@ class App(tk.Tk):
             valid = False
         else:
             self.form_fields["excel"].set_state("valid", "文件已准备")
+        try:
+            selected_date = parse_target_date(config.order_date)
+        except ValueError as exc:
+            self.order_date_field.set_state("invalid", str(exc))
+            valid = False
+        else:
+            date_message = "未设置，默认今天" if not config.order_date else f"将筛选 {selected_date.isoformat()} 的订单"
+            self.order_date_field.set_state("valid", date_message)
         if not valid:
             self._set_status("error")
             return None
         self.order_spinbox.configure(highlightbackground=TOKENS.border, highlightcolor=TOKENS.focus)
         return config, count
+
+    def _open_order_date_picker(self, _event: tk.Event[tk.Misc] | None = None) -> str | None:
+        try:
+            selected = parse_target_date(self.order_date.get())
+        except ValueError:
+            selected = _dt.date.today()
+        existing = getattr(self, "_order_date_popup", None)
+        if existing is not None:
+            try:
+                existing.destroy()
+            except tk.TclError:
+                pass
+        self._order_date_popup = _DatePickerPopup(self, self.order_date_field.entry, selected)
+        return "break" if _event is not None else None
+
+    def _set_order_date(self, value: _dt.date) -> None:
+        self.order_date.set(value.isoformat())
+        self.order_date_field.set_state("valid", f"将筛选 {value.isoformat()} 的订单")
+
+    def _clear_order_date(self) -> None:
+        self.order_date.set("")
+        self.order_date_field.set_state("neutral", "留空默认今天；只允许选择今天或过去日期")
 
     def _validate_sss_form(self) -> AppConfig | None:
         """Validate 闪时送 inputs and render semantic field states before starting."""

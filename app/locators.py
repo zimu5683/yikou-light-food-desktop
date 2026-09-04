@@ -79,8 +79,18 @@ DEFAULT_LOCATORS: Dict[str, Any] = {
     "labels": {
         "收货人": {
             "candidates": [
-                {"text_re": "收货人|收件人|联系人"},
+                {"text_re": "收货人|收件人|联系人|下单人"},
                 {"text_re": "Receiver|Contact"},
+            ],
+        },
+        "下单人": {
+            "candidates": [
+                {"text_re": "下单人|收货人|收件人"},
+            ],
+        },
+        "联系电话": {
+            "candidates": [
+                {"text_re": "联系电话|联系人电话|电话"},
             ],
         },
         "配送地址": {
