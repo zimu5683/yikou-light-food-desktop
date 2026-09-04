@@ -233,15 +233,24 @@ jobs:
         with:
           files: dist/*.patch
           fail_on_unmatched_files: false
+      # 上传前先把元数据归拢到一个平铺目录：upload-artifact 会按多个 path
+      # 的公共父目录保留结构，混用仓库根文件与 dist/ 下文件会让 meta 在
+      # 清单任务下载后落在 dist/dist/ 下而读不到。
+      - name: Stage Linux release metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          mkdir -p linux-release-meta
+          cp yikou-light-food-linux-x64.tar.gz.sha256 linux-release-meta/
+          if [ -f dist/patch-meta-linux.json ]; then
+            cp dist/patch-meta-linux.json linux-release-meta/
+          fi
       - name: Upload checksum metadata for manifest
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v7
         with:
           name: linux-release-meta
-          path: |
-            yikou-light-food-linux-x64.tar.gz.sha256
-            dist/patch-meta-linux.json
-          if-no-files-found: warn
+          path: linux-release-meta
+          if-no-files-found: error
 
   # latest.json needs the Windows checksum/patch metadata, the macOS archive
   # checksum and the Linux archive checksum, so it runs as a job that depends
