@@ -11,6 +11,13 @@ import pytest
 
 from app.updater import ReleaseInfo, UpdateError, apply_pending_update, check_for_update, compare_versions, download_and_install
 
+_linux_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="Linux 更新流程测试会把全局 os.name 补丁成 posix，"
+           "在 Windows 上会产生跨平台路径残留并击穿 pytest，仅在有真实 posix 语义的系统运行",
+)
+
+
 
 def test_compare_versions_handles_release_and_prerelease():
     assert compare_versions("v1.2.0", "1.1.9") > 0
@@ -156,6 +163,7 @@ def test_release_linux_assets_are_selected():
     assert release.linux_checksum_asset["name"] == "yikou-light-food-linux-x64.tar.gz.sha256"
 
 
+@_linux_only
 def test_linux_source_mode_cannot_auto_install(monkeypatch):
     # 源码运行模式下 sys.executable 是 python 解释器，替换它会损坏 Python 安装；
     # 此时仅提示前往 Release 页面手动下载。
@@ -205,6 +213,7 @@ def _linux_install_env(tmp_path, monkeypatch) -> tuple[Path, Path]:
     return install_dir, target
 
 
+@_linux_only
 def test_linux_download_and_install_replaces_binary_and_relaunches(tmp_path, monkeypatch):
     # 打包版在 Linux 上应自动下载、校验、解压，并调度退出后的原子替换与重启。
     archive_bytes, archive_sha = _build_linux_archive(tmp_path)
@@ -236,6 +245,7 @@ def test_linux_download_and_install_replaces_binary_and_relaunches(tmp_path, mon
     shutil.rmtree(staged_dir)
 
 
+@_linux_only
 def test_linux_rejects_untrusted_archive_url(tmp_path, monkeypatch):
     _linux_install_env(tmp_path, monkeypatch)
     release = ReleaseInfo(
@@ -247,6 +257,7 @@ def test_linux_rejects_untrusted_archive_url(tmp_path, monkeypatch):
         download_and_install(release)
 
 
+@_linux_only
 def test_linux_rejects_checksum_mismatch(tmp_path, monkeypatch):
     # 哈希不一致必须拒绝安装，且不留下 staging / 临时文件。
     archive_bytes, _ = _build_linux_archive(tmp_path)
@@ -263,6 +274,7 @@ def test_linux_rejects_checksum_mismatch(tmp_path, monkeypatch):
     assert not list(install_dir.glob(".yikou-light-food.update-*"))
 
 
+@_linux_only
 def test_linux_rejects_malicious_archive_member(tmp_path, monkeypatch):
     # 归档内出现 .. 上跳或链接条目时必须拒绝解压。
     evil_archive = tmp_path / "evil.tar.gz"
@@ -285,6 +297,7 @@ def test_linux_rejects_malicious_archive_member(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0,
                     reason="root 用户不受目录权限限制")
+@_linux_only
 def test_linux_requires_writable_install_dir(tmp_path, monkeypatch):
     _linux_install_env(tmp_path, monkeypatch)
     (tmp_path / "app").chmod(0o555)
@@ -314,6 +327,7 @@ def _linux_patch_release(tmp_path: Path, patch_bytes: bytes, *, from_sha: str, t
     )
 
 
+@_linux_only
 def test_linux_patch_update_rebuilds_and_relaunches(tmp_path, monkeypatch):
     # 本地二进制命中补丁基线时走差分更新：下载补丁 → 还原新版 → 校验 → 调度替换。
     old_binary = b"\x7fELF" + b"old" * 4096
@@ -344,6 +358,7 @@ def test_linux_patch_update_rebuilds_and_relaunches(tmp_path, monkeypatch):
     shutil.rmtree(install_dir / f".yikou-light-food.update-{os.getpid()}")
 
 
+@_linux_only
 def test_linux_patch_update_with_real_bsdiff(tmp_path, monkeypatch):
     # 有 bsdiff4 时做一次真实差分：生成补丁 → 应用 → 校验还原结果逐字节一致。
     bsdiff4 = pytest.importorskip("bsdiff4")
@@ -374,6 +389,7 @@ def test_linux_patch_update_with_real_bsdiff(tmp_path, monkeypatch):
     assert launched
 
 
+@_linux_only
 def test_linux_patch_sha_mismatch_is_rejected(tmp_path, monkeypatch):
     # 补丁哈希不符必须报错并清理，不允许静默回退（与 Windows 行为一致）。
     old_binary = b"\x7fELF" + b"old" * 4096
@@ -394,6 +410,7 @@ def test_linux_patch_sha_mismatch_is_rejected(tmp_path, monkeypatch):
     assert not (tmp_path / "work").exists()
 
 
+@_linux_only
 def test_linux_patch_miss_falls_back_to_full_download(tmp_path, monkeypatch):
     # 本地二进制不命中任何补丁基线时，回退为全量 tar.gz 下载。
     archive_bytes, archive_sha = _build_linux_archive(tmp_path)
