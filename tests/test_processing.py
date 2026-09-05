@@ -112,3 +112,30 @@ def test_historical_order_writes_to_a_dated_sheet():
     assert [sheet.cell(2, column).value for column in range(1, 5)] == ["W2", "张三", "大西A101", "13800000001"]
     assert sheet.cell(2, 8).value == 1  # 周四
     assert sheet.cell(2, 12).value == "午餐"
+
+
+def test_group_orders_by_pick_keeps_api_order_and_skips_empty_pick_no():
+    from app.automation import _group_orders_by_pick
+
+    rows = [
+        {"order_id": "3", "pick_no": "W1", "date": dt.date(2026, 9, 3)},
+        {"order_id": "2", "pick_no": "", "date": dt.date(2026, 9, 3)},
+        {"order_id": "1", "pick_no": "W8", "date": dt.date(2026, 7, 6)},
+    ]
+    grouped = _group_orders_by_pick(rows)
+    assert set(grouped) == {"W1", "W8"}
+    assert grouped["W1"][0]["order_id"] == "3"
+
+
+def test_group_orders_by_pick_groups_repeated_pick_numbers_across_days():
+    """取单号跨天重复：同号不同日期的行都保留，顺序与新单在前一致。"""
+    from app.automation import _group_orders_by_pick
+
+    rows = [
+        {"order_id": "30", "pick_no": "W2", "date": dt.date(2026, 9, 3)},
+        {"order_id": "7", "pick_no": "W2", "date": dt.date(2026, 7, 6)},
+        {"order_id": "6", "pick_no": "W1", "date": dt.date(2026, 7, 6)},
+    ]
+    grouped = _group_orders_by_pick(rows)
+    assert [r["order_id"] for r in grouped["W2"]] == ["30", "7"]
+    assert [r["order_id"] for r in grouped["W1"]] == ["6"]

@@ -589,15 +589,20 @@ def _detail_api_json(page: Any, detail_url: str) -> dict[str, Any] | None:
 
 
 def _order_from_api(page: Any, code: str, detail_url: str) -> OrderInfo | None:
-    """从详情接口 JSON 构造订单；接口不可用或字段全空时返回 None。
+    """从详情接口 JSON 构造订单；接口不可用时返回 None。"""
+    data = _detail_api_json(page, detail_url)
+    if not data:
+        return None
+    return _order_from_api_data(code, data)
+
+
+def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
+    """把 /channel/order/{id} 的 data 字段解析为订单；字段全空时返回 None。
 
     字段映射与页面渲染一致：address.contact=收货人、address.mobile=电话、
     address.address+description=配送地址、goods[].name/num=商品与数量
     （名称自带（午餐）/（晚餐）标签）、attrData.matal=商品备注。
     """
-    data = _detail_api_json(page, detail_url)
-    if not data:
-        return None
     address_info = data.get("address") or {}
     address = " ".join(str(address_info.get(k) or "").strip() for k in ("address", "description")).strip()
     name = str(address_info.get("contact") or "").strip()
@@ -620,8 +625,7 @@ def _order_from_api(page: Any, code: str, detail_url: str) -> OrderInfo | None:
     elif base == "衣锦":
         address = get_yijin_address_from_product_note(" ".join(notes))
     metadata = {
-        "order_id": re.search(r"[?&]id=(\d+)", detail_url or "").group(1)
-        if re.search(r"[?&]id=(\d+)", detail_url or "") else "",
+        "order_id": str(data.get("id") or ""),
         "created_at": next((data.get(key) for key in
                              ("created_at", "createdAt", "create_time", "createTime", "order_time", "orderTime")
                              if data.get(key) not in (None, "")), None),
@@ -632,6 +636,101 @@ def _order_from_api(page: Any, code: str, detail_url: str) -> OrderInfo | None:
     if not (name or phone or address or candidate.lunch or candidate.dinner):
         return None
     return candidate
+
+
+def _api_get_json(page: Any, path: str) -> dict[str, Any]:
+    """在已登录会话内带鉴权 GET 站点接口，返回解析后的 JSON。
+
+    鉴权走 Bearer token（localStorage.layout_token）+ uniacid 头，与
+    _detail_api_json 相同；401 视为会话失效直接报错。
+    """
+    script = (
+        "async (path) => {"
+        "const r = await fetch(path, {credentials: 'include',"
+        "headers: {'authorization': `Bearer ${localStorage.layout_token}`,"
+        "'uniacid': localStorage.layout_uniacid || ''}});"
+        "return JSON.stringify({http: r.status, body: await r.text()});"
+        "}"
+    )
+    try:
+        envelope = json.loads(page.evaluate(script, path))
+    except Exception as exc:
+        raise RuntimeError(f"接口 {path} 请求失败：{exc}") from exc
+    try:
+        payload = json.loads(envelope.get("body") or "")
+    except ValueError as exc:
+        raise RuntimeError(f"接口 {path} 返回非 JSON（HTTP {envelope.get('http')}）") from exc
+    if envelope.get("http") == 401 or payload.get("code") == 401:
+        raise RuntimeError("登录会话已失效（接口 401），请重新运行程序")
+    code = payload.get("code")
+    if code not in (200, None):
+        raise RuntimeError(f"接口 {path} 返回异常：{payload.get('msg') or code}")
+    return payload
+
+
+def _api_list_waimai_orders(page: Any, selected_date: _dt.date,
+                            callback: Callable[[str], Any] | None = None,
+                            page_size: int = 50, max_pages: int = 200) -> list[dict[str, Any]]:
+    """分页拉取外送订单（scene=1，新单在前），整页早于目标日期即停。
+
+    站点 DOM 列表在程序化访问下会被弹回 #/home、表格随机渲染为空，而该
+    接口返回完整数据；取单号跨天重复，日期过滤由调用侧完成。
+    """
+    rows: list[dict[str, Any]] = []
+    for page_no in range(1, max_pages + 1):
+        payload = _api_get_json(
+            page,
+            "/channel/order?scene=1&storeId=&orderSn=&userKeyword=&state=&payType=&source="
+            f"&pageNo={page_no}&pageSize={page_size}&startTime=&endTime=",
+        )
+        data = payload.get("data") or {}
+        batch = data.get("list") or []
+        if not batch:
+            break
+        for item in batch:
+            created = item.get("created_at")
+            rows.append({
+                "order_id": str(item.get("id") or ""),
+                "pick_no": str(item.get("pickNo") or "").strip(),
+                "store_id": str(item.get("storeId") or ""),
+                "created_at": created,
+                "date": parse_order_created_date(created),
+            })
+        total = data.get("total")
+        oldest = rows[-1]["date"]
+        if (oldest is not None and oldest < selected_date) \
+                or (isinstance(total, int) and page_no * page_size >= total):
+            break
+    _emit(callback, f"接口读取外送订单 {len(rows)} 笔（新单在前）")
+    return rows
+
+
+def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """按取单号分组（保持接口的新单在前顺序）；无取单号的忽略。"""
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        pick = str(row.get("pick_no") or "").strip()
+        if pick:
+            grouped.setdefault(pick, []).append(row)
+    return grouped
+
+
+def _order_detail_by_id(page: Any, code: str, order_id: str, store_id: str) -> OrderInfo | None:
+    """直接从详情接口读取订单，偶发失败自动重试一次。"""
+    for attempt in range(2):
+        try:
+            payload = _api_get_json(page, f"/channel/order/{order_id}?storeId={store_id}")
+            data = payload.get("data")
+        except RuntimeError:
+            data = None
+        if isinstance(data, dict):
+            order = _order_from_api_data(code, data)
+            if order is not None:
+                order.metadata["order_id"] = order_id
+                return order
+        if attempt == 0:
+            page.wait_for_timeout(1000)
+    return None
 
 
 def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | None,
@@ -746,7 +845,6 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
             try:
                 _emit(progress_callback, "正在登录...")
                 page.goto(getattr(config, "target_url", getattr(config, "url", "")), timeout=timeout, wait_until="networkidle")
-                base_url = _base_url(config)
 
                 account_input, _ = _find_by_candidates(page, _locator_step(locators, "login_account_input"), timeout)
                 if account_input is None:
@@ -765,106 +863,54 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
                 login_step = _locator_step(locators, "登录成功")
                 page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
 
-                # Navigation and locator recovery are implementation details;
-                # only the order-level status is shown in the normal log.
-                list_url = f"{base_url}order/takeOutList"
-                # Always start from the known order-list route and explicitly
-                # select 外送订单.  The site frequently remounts the SPA and
-                # leaves the previously selected tab in an unknown state.
-                last_table_error: Exception | None = None
-                for _ in range(3):
-                    try:
-                        _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
-                        last_table_error = None
-                        break
-                    except Exception as exc:
-                        last_table_error = exc
-                        _emit(progress_callback, "订单列表暂未就绪，正在重试")
-                if last_table_error is not None:
-                    raise last_table_error
+                # 站点 SPA 在程序化操作节奏下会把页面弹回 #/home、把已渲染
+                # 的表格随机清空（2026-09-05 实测：接口返回 6150 笔订单而
+                # DOM 表格为 0 行），因此列表与详情一律直接走后端接口，
+                # 界面只负责登录与产生会话 token。
                 _emit(progress_callback, "登录成功，开始处理订单")
-                current_page = 1
-                list_ready = True
+                rows = _api_list_waimai_orders(page, selected_date, progress_callback)
+                rows_by_pick = _group_orders_by_pick(rows)
                 for number in range(order_count, 0, -1):
                     if stop_event.is_set():
                         break
                     code = f"W{number}"
                     order: OrderInfo | None = None
-                    occurrence = 0
-                    start_page = current_page
-                    while not stop_event.is_set():
+                    entries = rows_by_pick.get(code, [])
+                    candidates = [e for e in entries if e["date"] == selected_date]
+                    if not candidates:
+                        if entries:
+                            dates = "、".join(sorted({e["date"].isoformat() for e in entries if e["date"]}))
+                            _emit(progress_callback,
+                                  f"{code} 只有 {dates} 的订单，没有 {selected_date.isoformat()} 的订单，未写入 Excel")
+                        else:
+                            _emit(progress_callback, f"{code} 不在订单列表中，未写入 Excel")
+                        processed += 1
+                        _emit(progress_callback, "-------")
+                        continue
+                    while candidates and not stop_event.is_set():
+                        entry = candidates.pop(0)
                         try:
-                            if not list_ready:
-                                _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
-                                list_ready = True
-                            try:
-                                cell, found_page = _find_order_cell(
-                                    page, code, config, None,
-                                    occurrence=occurrence, start_page=start_page,
-                                )
-                            except OrderSearchNotFound:
-                                _emit(progress_callback, f"{code} 没有目标日期订单，未写入 Excel")
-                                current_page = 1
-                                _ensure_waimai_tab(page, locators, base_url, timeout, None, list_url)
-                                list_ready = True
-                                break
-                            _open_detail(
-                                page, code, cell, config, None, timeout, list_url,
-                                occurrence, start_page,
-                            )
-                            _wait_for_detail(page, timeout, None)
-                            try:
-                                detail_url = page.url
-                            except Exception:
-                                detail_url = ""
-                            candidate = _read_order(page, code, timeout, locators, None, detail_url)
-                            if candidate is None:
-                                _save_failure_snapshot(page, f"详情空数据_{code}")
+                            order = _order_detail_by_id(page, code, entry["order_id"], entry["store_id"])
+                            if order is None:
                                 raise LookupError(
-                                    f"订单 {code} 详情页未读到姓名/电话/地址/餐品，疑似页面改版或详情被弹回首页，"
-                                    f"已放弃本次写入（快照见 logs 目录）")
-                            created_date = parse_order_created_date(candidate.metadata.get("created_at"))
-                            if created_date is None:
-                                _emit(progress_callback, f"{code} 缺少下单日期，已跳过")
-                                occurrence += 1
-                                start_page = found_page
-                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
-                                list_ready = False
-                                continue
-                            if created_date != selected_date:
-                                _emit(progress_callback, f"{code} 跳过 {created_date.isoformat()} 订单（目标 {selected_date.isoformat()}）")
-                                occurrence += 1
-                                start_page = found_page
-                                _back_to_order_list(page, timeout, list_url, reason="跳过", callback=None)
-                                list_ready = False
-                                continue
-
-                            # Do not mutate the workbook until the browser has
-                            # safely returned to the order list.  A retry can
-                            # therefore never duplicate partially written rows.
-                            if not _back_to_order_list(page, timeout, list_url, reason="返回", callback=None):
-                                raise LookupError(f"订单 {code} 已读取但无法返回订单列表")
-                            order = candidate
-                            current_page = found_page
-                            list_ready = False
-                            break
+                                    f"订单 {code}（接口编号 {entry['order_id']}）未读到姓名/电话/地址/餐品")
                         except Exception as exc:
-                            _recover_order_table(page, timeout, list_url)
-                            list_ready = False
                             _emit(progress_callback, f"{code} 处理失败：{exc}")
                             decision = "skip"
                             if order_decision_callback:
                                 decision = order_decision_callback(code, str(exc)).lower()
                             if decision == "retry":
                                 _emit(progress_callback, f"重试 {code}")
+                                candidates.insert(0, entry)
                                 continue
                             if decision == "stop":
                                 _emit(progress_callback, f"{code} 已选择停止，本轮结束")
                                 stop_event.set()
                                 break
                             _emit(progress_callback, f"{code} 未找到，跳过")
+                            order = None
                             break
-
+                        break
                     if stop_event.is_set():
                         break
                     processed += 1
