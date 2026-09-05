@@ -1,17 +1,22 @@
-"""闪时送（sss）平台批量下单自动化。
+"""闪时送（sss）平台批量下单自动化（接口模式）。
 
 本模块与管理后台订单处理（:mod:`app.automation`）方向相反：从独立的
 《闪时送.xlsx》读取订单（午餐/晚餐两表），再在闪时送平台逐单创建预约单。
 
-登录页存在验证码，程序只自动填写账号密码并等待用户手动完成验证码、点击登录，
-随后检测到「创建订单」按钮出现即视为登录成功，再继续自动下单。凭据与路径由
-GUI 通过 :class:`AppConfig` 传入，不写入源码；定位器沿用候选链机制，改版时编辑
-``sss_locators.json`` 即可适配，无需改代码。
+界面只负责登录：程序自动切换“账户密码登录”并填写账号密码，用户只需输入
+图形验证码（输完第 4 位自动点登录，验证码错误会提示重输）。下单本身不再
+操作页面表单——登录成功后通过页面内 ``fetch`` 直调后端接口（``token`` 头
+取自 ``localStorage.tokenObj``），与订单处理侧的
+:func:`app.automation.run_job` 同一套思路，不受页面弹回与渲染缺陷影响。
+
+干跑模式：配置 ``sss_dry_run = true`` 时只组装并打印下单报文，不真实提交。
+凭据与路径由 GUI 通过 :class:`AppConfig` 传入，不写入源码。
 """
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,9 +25,7 @@ try:
         BrowserNotFoundError,
         LocatorError,
         _emit,
-        _find_by_candidates,
         _launch_browser,
-        _locator_failure,
     )
     from .locators import SSS_LOCATORS, load_sss_locators
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
@@ -30,9 +33,7 @@ except ImportError:  # pragma: no cover - allows ``python app/sss.py``
         BrowserNotFoundError,
         LocatorError,
         _emit,
-        _find_by_candidates,
         _launch_browser,
-        _locator_failure,
     )
     from locators import SSS_LOCATORS, load_sss_locators
 
@@ -41,13 +42,25 @@ LUNCH_TIME = "11:00:00"
 DINNER_TIME = "17:00:00"
 DEFAULT_SSS_URL = "https://sssplusnew.zhuopaikeji.com/takeout"
 
-# 「地址选项」的候选需要根据 sss_common_address 动态替换文字。
-_ADDRESS_OPTION_DEFAULT = {
-    "candidates": [
-        {"css": ".ant-select-dropdown .ant-select-item-option", "has_text": "{label}"},
-        {"text": "{label}"},
-    ],
+# 下单相关接口（2026-09-05 实测抓包确认，详见 .zcode/sss_api_recon.md）。
+_CREATE_ORDER_PATH = "/consumer/order/one-touch-send/create-order-from-client"
+_STORE_LIST_PATH = "/consumer/customer/store/queryStoreAddresses?pageNo=1&pageSize=40"
+_FREQUENT_ADDR_PATH = "/consumer/customer/customerAddress/queryFrequentAddressByCustomer"
+
+_SSS_FETCH_JS = """
+async ({method, path, body}) => {
+  let token = null;
+  try {
+    const t = JSON.parse(localStorage.getItem('tokenObj') || 'null');
+    if (t && t.expirationTime > Date.now()) token = t.token;
+  } catch (e) {}
+  const headers = {'Content-Type': 'application/json'};
+  if (token) headers['token'] = token;
+  const r = await fetch(path, {method, headers,
+      body: body === null || body === undefined ? undefined : JSON.stringify(body)});
+  return JSON.stringify({http: r.status, text: await r.text()});
 }
+"""
 
 
 def _clean(value: Any) -> Any:
@@ -129,141 +142,150 @@ def _substitute_tokens(step: dict[str, Any], **tokens: str) -> dict[str, Any]:
     return copied
 
 
-def _address_option_step(locators: dict[str, Any] | None, label: str) -> dict[str, Any]:
-    step = _resolve(locators, "地址选项") or _ADDRESS_OPTION_DEFAULT
-    return _substitute_tokens(step, label=str(label))
+def _pick(record: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """按优先级从记录里取第一个非空字段。"""
+    for key in keys:
+        value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
 
 
-def _click(page: Any, step: dict[str, Any], name: str, timeout: int,
-           callback: Callable[[str], Any] | None) -> Any:
-    element, index = _find_by_candidates(page, step, timeout)
-    if element is None:
-        raise _locator_failure(page, name)
-    element.click(timeout=timeout)
-    _emit(callback, f"{name}：第 {index + 1} 个定位候选命中")
-    return element
+def _result_records(payload: dict[str, Any]) -> list:
+    """从 {result: {records: [...]}} 或 {result: [...]} 里取记录列表。"""
+    result = payload.get("result")
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        records = result.get("records") or result.get("list")
+        if isinstance(records, list):
+            return records
+    return []
 
 
-def _type_into(page: Any, step: dict[str, Any], name: str, value: Any, timeout: int,
-               callback: Callable[[str], Any] | None) -> Any:
-    element, _ = _find_by_candidates(page, step, timeout)
-    if element is None:
-        raise _locator_failure(page, name)
-    text = "" if value is None else str(value)
-    element.click(timeout=timeout)
+def _match_record(records: Any, keyword: str, what: str) -> dict[str, Any]:
+    """在列表里按关键词匹配（任意字段包含即可）；唯一记录时直接采用。"""
+    if not isinstance(records, list) or not records:
+        raise LookupError(f"{what}列表为空或格式异常")
+    for record in records:
+        if keyword and keyword in json.dumps(record, ensure_ascii=False):
+            return record
+    if len(records) == 1:
+        return records[0]
+    raise LookupError(
+        f"{what}列表里没有匹配「{keyword}」的记录，共 {len(records)} 条："
+        + json.dumps(records, ensure_ascii=False)[:600])
+
+
+def _sss_api(page: Any, method: str, path: str, body: Any = None) -> tuple[int, dict[str, Any]]:
+    """在登录页会话内调闪时送接口（token 头自动取自 localStorage.tokenObj）。"""
+    raw = page.evaluate(_SSS_FETCH_JS, {"method": method, "path": path, "body": body})
+    envelope = json.loads(raw)
     try:
-        element.fill(text)
-    except Exception:
-        element.press("Control+a")
-        element.press("Delete")
-        element.press_sequentially(text, timeout=timeout)
-    _emit(callback, f"{name} 已填入：{text}")
-    return element
+        payload = json.loads(envelope.get("text") or "{}")
+    except ValueError:
+        payload = {}
+    return int(envelope.get("http") or 0), payload
 
 
-def _fill_delivery_time(page: Any, step: dict[str, Any], is_dinner: bool, timeout: int,
-                        callback: Callable[[str], Any] | None) -> None:
-    element, _ = _find_by_candidates(page, step, timeout)
-    if element is None:
-        raise _locator_failure(page, "送达时间输入框")
-    value = compute_delivery_time(is_dinner)
-    element.click(timeout=timeout)
-    try:
-        element.fill(value)
-    except Exception:
-        element.press("Control+a")
-        element.press("Delete")
-        element.press_sequentially(value, timeout=timeout)
-    # 触发 React/Ant Design 受控组件更新（原脚本同样派发了 input/change/blur）。
-    element.evaluate(
-        "el => ['input','change','blur'].forEach(t => el.dispatchEvent(new Event(t, {bubbles:true, cancelable:true})))"
-    )
-    _emit(callback, f"送达时间已填入：{value}")
-
-
-def _wait_for_login(page: Any, locators: dict[str, Any] | None, stop_event: Any,
-                    callback: Callable[[str], Any] | None) -> None:
-    """等待用户在浏览器中手动完成验证码并点击登录。"""
-    _emit(callback, "已填写账号密码，请在浏览器中手动完成验证码并点击登录…")
-    step = _resolve(locators, "创建订单")
-    while not stop_event.is_set():
-        element, _ = _find_by_candidates(page, step, 1000)
-        if element is not None:
-            _emit(callback, "检测到登录成功，开始下单")
-            return
-        page.wait_for_timeout(500)
-
-
-def _wait_modal_close(page: Any, locators: dict[str, Any] | None, timeout: int,
+def _ensure_logged_in(page: Any, account: str, password: str, stop_event: Any,
                       callback: Callable[[str], Any] | None) -> None:
-    """等待下单弹窗关闭、页面恢复可继续下单的状态。"""
-    try:
-        page.locator(".ant-modal-mask").first.wait_for(state="hidden", timeout=min(max(timeout, 1), 5000))
-    except Exception:
-        pass
-    step = _resolve(locators, "创建订单")
-    element, _ = _find_by_candidates(page, step, timeout)
-    if element is None:
-        raise _locator_failure(page, "下单后恢复的创建订单按钮")
-    _emit(callback, "订单创建完成，页面已就绪")
+    """确保已登录：已登录直接返回；否则自动填写并等用户输验证码后自动点登录。
 
-
-def _recover_sss_page(page: Any, locators: dict[str, Any] | None, timeout: int,
-                      callback: Callable[[str], Any] | None) -> None:
-    """下单失败后的兜底恢复：先关掉可能残留的弹窗，再回到可下单状态。
-
-    与订单处理侧的 :func:`_recover_order_table` 对应。全程 best-effort：
-    恢复不成功时留给随后的重试流程自行报错，不在此处打断用户决策。
+    验证码输错时页面会刷新出新验证码，循环等待重输；登录成功的标志是
+    「创建订单」按钮出现（登录后进入的是订单页）。
     """
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(300)
-    except Exception:
-        pass
-    if _find_by_candidates(page, _resolve(locators, "创建订单"), timeout)[0] is not None:
+    if page.locator("text=创建订单").count():
         return
+    page.wait_for_selector("text=账户密码登录", state="visible", timeout=30000)
+    page.get_by_text("账户密码登录").click()
+    page.wait_for_selector("input#account", state="visible", timeout=15000)
+    page.fill("input#account", account)
+    page.fill("input#password", password)
+    _emit(callback, ">>> 请在闪时送窗口输入图形验证码（输完自动点登录；"
+                    "窗口已最小化时请先点任务栏还原）<<<")
+
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if stop_event.is_set():
+            raise RuntimeError("已停止")
+        code_val = page.evaluate(
+            "() => (document.querySelector('input#code')||{}).value || ''")
+        if len(code_val.strip()) >= 4:
+            page.locator("button", has_text="登录").first.click()
+            page.wait_for_timeout(2500)
+            if page.locator("text=创建订单").count():
+                _emit(callback, "登录成功")
+                return
+            # 验证码错误：清空输入框等待重输（否则残留旧值会触发误重试）
+            try:
+                page.fill("input#code", "")
+            except Exception:
+                pass
+            _emit(callback, "验证码不正确或登录未成功，请按窗口里的新验证码重新输入")
+        page.wait_for_timeout(400)
+    raise TimeoutError("登录超时：未完成验证码输入")
+
+
+def _minimize_window(browser: Any, callback: Callable[[str], Any] | None) -> None:
+    """Best-effort 最小化浏览器窗口（CDP），失败不阻断流程。"""
     try:
-        page.reload(timeout=timeout, wait_until="domcontentloaded")
-        page.wait_for_timeout(500)
+        session = browser.new_browser_cdp_session()
+        window_id = session.send("Browser.getWindowForTarget")["windowId"]
+        session.send("Browser.setWindowBounds",
+                     {"windowId": window_id, "bounds": {"windowState": "minimized"}})
+        _emit(callback, "浏览器已最小化（任务栏可见，需要输验证码时再还原）")
     except Exception:
         pass
 
 
-def _create_one_order(page: Any, locators: dict[str, Any] | None, order: dict[str, Any],
-                      is_dinner: bool, config: Any, timeout: int,
-                      callback: Callable[[str], Any] | None) -> None:
-    """在闪时送平台按脚本流程为单个订单创建预约单。"""
-    name = order.get("name") or ""
-    door = order.get("door") or ""
-    phone = order.get("phone") or ""
-    product_name = str(getattr(config, "sss_product_name", "轻食") or "轻食")
-    common_address = str(getattr(config, "sss_common_address", "嗯哼") or "嗯哼")
+def build_order_payload(order: dict[str, Any], is_dinner: bool, store_id: int,
+                        address: dict[str, Any], goods_name: str,
+                        now: _dt.datetime | None = None) -> dict[str, Any]:
+    """组装 create-order-from-client 的请求体（字段为 2026-09-05 抓包确认）。"""
+    return {
+        "expectedDeliveryTime": compute_delivery_time(is_dinner, now),
+        "goodsDetail": [{"goodsName": goods_name, "goodsNum": 1}],
+        "orderType": 2,  # 预约单
+        "receiveName": str(order.get("name") or ""),
+        "receivePhone": str(order.get("phone") or ""),
+        "storeId": store_id,
+        "receiveAddress": {
+            "lnt": address["lnt"],
+            "lat": address["lat"],
+            "areaCode": address["areaCode"],
+            "addressDetail": address["addressDetail"],
+            "doorNum": str(order.get("door") or ""),
+        },
+    }
 
-    _click(page, _resolve(locators, "创建订单"), "创建订单", timeout, callback)
 
-    modal, _ = _find_by_candidates(page, _resolve(locators, "订单弹窗"), timeout)
-    if modal is None:
-        raise _locator_failure(page, "创建订单弹窗（即时单）")
+def _address_from_record(record: dict[str, Any]) -> dict[str, Any]:
+    """从常用地址记录提取下单需要的坐标与地址字段。
 
-    _click(page, _resolve(locators, "订单类型下拉"), "订单类型下拉", timeout, callback)
-    _click(page, _resolve(locators, "预约单选项"), "选择预约单", timeout, callback)
-    _click(page, _resolve(locators, "分单下拉"), "分单下拉", timeout, callback)
-    _click(page, _resolve(locators, "一口轻食选项"), "选择一口轻食", timeout, callback)
+    站点前端的映射（chunk 反解）：记录的 ``markLnglat`` 子对象携带
+    ``longitude/latitude/adcode/address``，顶层字段仅作兜底。
+    """
+    mark = record.get("markLnglat") if isinstance(record.get("markLnglat"), dict) else {}
 
-    _click(page, _resolve(locators, "常用地址"), "常用地址", timeout, callback)
-    _click(page, _address_option_step(locators, common_address), "选择常用地址", timeout, callback)
-    _click(page, _resolve(locators, "地址确定"), "地址确定", timeout, callback)
+    def pick(src: dict[str, Any], keys: tuple[str, ...]) -> Any:
+        for key in keys:
+            value = src.get(key)
+            if value not in (None, ""):
+                return value
+        return None
 
-    _fill_delivery_time(page, _resolve(locators, "送达时间输入"), is_dinner, timeout, callback)
-    _click(page, _resolve(locators, "时间确定"), "时间确定", timeout, callback)
-
-    _type_into(page, _resolve(locators, "顾客姓名"), "顾客姓名", name, timeout, callback)
-    _type_into(page, _resolve(locators, "顾客电话"), "顾客电话", phone, timeout, callback)
-    _type_into(page, _resolve(locators, "商品名称"), "商品名称", product_name, timeout, callback)
-    _type_into(page, _resolve(locators, "门牌号"), "门牌号", door, timeout, callback)
-
-    _click(page, _resolve(locators, "最终确定"), "最终确定", timeout, callback)
-    _wait_modal_close(page, locators, timeout, callback)
+    lnt = pick(mark, ("longitude", "lng", "lnt", "lon")) or _pick(record, ("longitude", "lnt", "lng"))
+    lat = pick(mark, ("latitude", "lat")) or _pick(record, ("latitude", "lat"))
+    area = pick(mark, ("adcode", "areaCode")) or _pick(record, ("areaCode", "code"))
+    detail = pick(mark, ("address", "addressDetail")) or _pick(record, ("position", "address", "addressDetail"))
+    if lnt in (None, "") or lat in (None, ""):
+        raise LookupError("常用地址记录缺少经纬度字段："
+                          + json.dumps(record, ensure_ascii=False)[:400])
+    return {
+        "lnt": float(lnt), "lat": float(lat),
+        "areaCode": str(area or ""), "addressDetail": str(detail or ""),
+    }
 
 
 def run_sss_job(config: Any, stop_event: Any,
@@ -271,10 +293,11 @@ def run_sss_job(config: Any, stop_event: Any,
                 password: str | None = None,
                 decision_callback: Callable[[str, str], str] | None = None,
                 locators: dict[str, Any] | None = None) -> dict[str, int]:
-    """读取《闪时送.xlsx》并在闪时送平台逐单创建预约单。
+    """读取《闪时送.xlsx》并通过接口逐单创建预约单。
 
     ``decision_callback(identifier, error)`` 返回 ``retry``/``skip``/``stop``，
     用于单个订单创建失败时的交互决策（与订单处理的 order_decision 一致）。
+    ``config.sss_dry_run`` 为真时只组装并打印报文，不真实提交。
     """
     configured_excel = getattr(config, "sss_excel_path", None)
     if not configured_excel:
@@ -294,6 +317,14 @@ def run_sss_job(config: Any, stop_event: Any,
     except ImportError as exc:
         raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
 
+    account = str(getattr(config, "sss_account", "") or "")
+    if not account:
+        raise ValueError("尚未填写闪时送账号")
+    dry_run = bool(getattr(config, "sss_dry_run", False))
+    store_name = str(getattr(config, "sss_store_name", "") or "一口轻食")
+    common_address = str(getattr(config, "sss_common_address", "") or "")
+    goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
+
     orders_by_sheet = load_sss_orders(excel_path)
     total = sum(len(orders) for orders in orders_by_sheet.values())
     if total == 0:
@@ -302,7 +333,6 @@ def run_sss_job(config: Any, stop_event: Any,
 
     timeout = int(getattr(config, "element_timeout_ms", 8000))
     url = str(getattr(config, "sss_url", "") or "").strip() or DEFAULT_SSS_URL
-    account = str(getattr(config, "sss_account", "") or "")
     processed = 0
     created = 0
 
@@ -314,28 +344,32 @@ def run_sss_job(config: Any, stop_event: Any,
         )
         page = browser.new_page()
         try:
-            _emit(progress_callback, "正在打开闪时送登录页…")
+            _emit(progress_callback, "正在打开闪时送…")
             page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+            _ensure_logged_in(page, account, password, stop_event, progress_callback)
+            _minimize_window(browser, progress_callback)
 
-            # 若登录页默认是扫码/验证码登录，先切换到账户密码登录；已在该页则跳过。
-            try:
-                _click(page, _resolve(locators, "登录切换"), "账户密码登录", timeout, progress_callback)
-            except Exception:
-                pass
+            # 登录会话就绪：读取门店与常用地址，之后每单只调下单接口。
+            _emit(progress_callback, "读取门店与常用地址…")
+            _, store_payload = _sss_api(page, "GET", _STORE_LIST_PATH)
+            store_record = _match_record(_result_records(store_payload),
+                                         store_name, "门店")
+            store_id = _pick(store_record, ("id", "storeId", "storeNo"))
+            if store_id in (None, ""):
+                raise LookupError("门店记录缺少 id："
+                                  + json.dumps(store_record, ensure_ascii=False)[:300])
 
-            account_input, _ = _find_by_candidates(page, _resolve(locators, "账号输入框"), timeout)
-            if account_input is None:
-                raise _locator_failure(page, "账号输入框")
-            account_input.fill(account)
-
-            password_input, _ = _find_by_candidates(page, _resolve(locators, "密码输入框"), timeout)
-            if password_input is None:
-                raise _locator_failure(page, "密码输入框")
-            password_input.fill(password)
-
-            _wait_for_login(page, locators, stop_event, progress_callback)
-            if stop_event.is_set():
-                return {"processed": processed, "created": created}
+            _, addr_payload = _sss_api(page, "GET", _FREQUENT_ADDR_PATH)
+            address_record = _match_record(_result_records(addr_payload),
+                                           common_address, "常用地址")
+            _emit(progress_callback,
+                  f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
+            address = _address_from_record(address_record)
+            _emit(progress_callback,
+                  f"门店「{store_name}」与常用地址「{common_address}」就绪"
+                  f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
+            if dry_run:
+                _emit(progress_callback, "【干跑模式】只组装报文，不真实提交")
 
             for sheet_name in DEFAULT_SHEETS:
                 orders = orders_by_sheet.get(sheet_name, [])
@@ -348,19 +382,41 @@ def run_sss_job(config: Any, stop_event: Any,
                         break
                     processed += 1
                     identifier = f"第 {order['row']} 行 {order.get('name') or '未填写'}"
+                    payload = build_order_payload(order, is_dinner, int(store_id),
+                                                  address, goods_name)
+                    if dry_run:
+                        _emit(progress_callback,
+                              f"【干跑】{identifier} 报文：{json.dumps(payload, ensure_ascii=False)}")
+                        created += 1
+                        continue
                     _emit(progress_callback, f"正在创建【{sheet_name}】{identifier}")
                     try:
-                        _create_one_order(page, locators, order, is_dinner, config, timeout, progress_callback)
+                        http, resp = _submit_order(page, payload)
+                        if http == 401 or resp.get("code") == 401:
+                            # token 服务端过期（约 30-60 分钟）：重新登录后重试一次
+                            _emit(progress_callback, "登录态过期，重新登录…")
+                            page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+                            _ensure_logged_in(page, account, password, stop_event,
+                                              progress_callback)
+                            _minimize_window(browser, progress_callback)
+                            http, resp = _submit_order(page, payload)
+                        if not resp.get("success"):
+                            raise LookupError(
+                                resp.get("message") or json.dumps(resp, ensure_ascii=False)[:200])
                         created += 1
-                        _emit(progress_callback, f"订单创建成功：{identifier}")
+                        _emit(progress_callback,
+                              f"订单创建成功：{identifier}（预约 {payload['expectedDeliveryTime']}）")
                     except Exception as exc:
                         _emit(progress_callback, f"订单创建失败：{identifier}：{exc}")
                         if decision_callback is not None:
                             decision = decision_callback(identifier, str(exc)).lower()
                             if decision == "retry":
-                                _recover_sss_page(page, locators, timeout, progress_callback)
+                                _emit(progress_callback, f"重试 {identifier}")
                                 try:
-                                    _create_one_order(page, locators, order, is_dinner, config, timeout, progress_callback)
+                                    http, resp = _submit_order(page, payload)
+                                    if not resp.get("success"):
+                                        raise LookupError(
+                                            resp.get("message") or "创建失败")
                                     created += 1
                                     _emit(progress_callback, f"重试成功：{identifier}")
                                 except Exception as exc2:
@@ -373,9 +429,16 @@ def run_sss_job(config: Any, stop_event: Any,
         finally:
             browser.close()
 
-    _emit(progress_callback, f"闪时送下单完成：成功 {created}/{processed}")
+    mode = "（干跑）" if dry_run else ""
+    _emit(progress_callback, f"闪时送下单完成{mode}：成功 {created}/{processed}")
     return {"processed": processed, "created": created}
 
 
-__all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time", "SSS_LOCATORS",
+def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    http, resp = _sss_api(page, "POST", _CREATE_ORDER_PATH, payload)
+    return http, resp
+
+
+__all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time",
+           "build_order_payload", "SSS_LOCATORS",
            "BrowserNotFoundError", "LocatorError"]

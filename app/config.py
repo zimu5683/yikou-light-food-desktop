@@ -59,6 +59,9 @@ class AppConfig:
     sss_excel_path: Path | None = None
     sss_product_name: str = "轻食"
     sss_common_address: str = "嗯哼"
+    sss_store_name: str = "一口轻食"
+    # 干跑模式：只组装并打印下单报文，不真实提交（用于验证流程）。
+    sss_dry_run: bool = False
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -73,6 +76,8 @@ class AppConfig:
                  sss_excel_path: str | os.PathLike[str] = "",
                  sss_product_name: str = "轻食",
                  sss_common_address: str = "嗯哼",
+                 sss_store_name: str = "一口轻食",
+                 sss_dry_run: bool = False,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -98,6 +103,8 @@ class AppConfig:
         self.sss_excel_path = Path(sss_excel_path) if sss_excel_path else None
         self.sss_product_name = sss_product_name or "轻食"
         self.sss_common_address = sss_common_address or "嗯哼"
+        self.sss_store_name = sss_store_name or "一口轻食"
+        self.sss_dry_run = bool(sss_dry_run)
         self.config_path = config_path
 
     @property

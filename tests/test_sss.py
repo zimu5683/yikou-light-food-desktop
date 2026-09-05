@@ -86,3 +86,53 @@ def test_sss_locators_include_required_steps():
                  "顾客姓名", "顾客电话", "门牌号", "最终确定"):
         assert step in SSS_LOCATORS
         assert SSS_LOCATORS[step]["candidates"]
+
+
+def test_build_order_payload_matches_captured_schema():
+    import datetime as dt
+
+    order = {"row": 3, "name": "张三", "door": "A101", "phone": "13800000001"}
+    address = {"lnt": 119.727873, "lat": 30.257483,
+               "areaCode": "330112", "addressDetail": "浙江农林大学东湖校区"}
+    payload = sss.build_order_payload(order, False, 211053, address, "轻食",
+                                      now=dt.datetime(2026, 9, 5, 18, 0))
+    assert payload == {
+        "expectedDeliveryTime": "2026-09-06 11:00:00",  # 18 点后顺延次日
+        "goodsDetail": [{"goodsName": "轻食", "goodsNum": 1}],
+        "orderType": 2,
+        "receiveName": "张三",
+        "receivePhone": "13800000001",
+        "storeId": 211053,
+        "receiveAddress": {
+            "lnt": 119.727873, "lat": 30.257483,
+            "areaCode": "330112",
+            "addressDetail": "浙江农林大学东湖校区",
+            "doorNum": "A101",
+        },
+    }
+
+
+def test_match_record_prefers_keyword_and_single_record_fallback():
+    records = [{"id": 1, "name": "其他"}, {"id": 2, "name": "一口轻食"}]
+    assert sss._match_record(records, "一口轻食", "门店")["id"] == 2
+    assert sss._match_record([{"id": 9}], "", "门店")["id"] == 9
+
+
+def test_address_from_record_reads_marklnglat_like_frontend():
+    record = {"name": "嗯哼", "markLnglat": {
+        "longitude": 119.727873, "latitude": 30.257483,
+        "adcode": "330112", "address": "浙江省杭州市临安区浙江农林大学东湖校区"}}
+    addr = sss._address_from_record(record)
+    assert addr == {"lnt": 119.727873, "lat": 30.257483,
+                    "areaCode": "330112",
+                    "addressDetail": "浙江省杭州市临安区浙江农林大学东湖校区"}
+
+
+def test_address_from_record_reads_real_frequent_address_fields():
+    """2026-09-05 实测的「嗯哼」记录结构：code=区划码、position=地址文本。"""
+    record = {"id": 75812, "longitude": "119.728224", "latitude": "30.256632",
+              "code": "330110", "position": "浙江农林大学东湖校区",
+              "houseNum": "图书馆", "contactName": "嗯哼"}
+    addr = sss._address_from_record(record)
+    assert addr == {"lnt": 119.728224, "lat": 30.256632,
+                    "areaCode": "330110", "addressDetail": "浙江农林大学东湖校区"}
