@@ -1,4 +1,4 @@
-# 前端重写进度快照（2026-09-06 · M7/M8 完成，v3.0.1 发布）
+# 前端重写进度快照（2026-09-06 · M7/M8 完成，v3.0.1 已发布）
 
 ## 当前状态：M0–M5 全部完成，运行层稳定，M6 大部分完成
 
@@ -50,6 +50,10 @@
 - 坑：bash 无引号 heredoc 会展开 `${...}`（曾把 JS 模板字符串打穿），含模板字符串的补丁必须用 Edit 工具或引号 heredoc。
 
 ## M7/M8 完成记录
+
+- **v3.0.1 已通过 CI 发布**：Windows/Linux/macOS 三平台产物 + v2.2.0→3.0.1 增量补丁 + latest.json 清单全部就位，老用户自动更新已可收到。
+- CI 修了两处（commit 94fc576 / 9b60de7）：Linux 构建改用系统 Python + apt GTK 绑定（setup-python 无法 import gi）；file URI 断言用 url2pathname 兼容 Windows 盘符。上传补丁时遇到过一次瞬时网络错误，重跑 failed jobs 后成功。
+- 备注：仓库还有旧解压目录 `/home/zimu/下载/yikou-light-food-linux-x64/`（9 月 1 日的旧二进制），用户实际运行的程序以其启动路径为准。
 
 - M7：功能对照验收清单见 `design/M7-ACCEPTANCE.md`（26 项；真实订单流程/日志完整性由用户两轮实测确认）。
 - M8：已删除 `app/gui.py`、`app/design_system.py`、`tests/test_design_system.py`；`main.py` 移除 --legacy；`DESIGN.md` 归档至 `design/legacy/`；release.yml 冒烟清单换成 bridge/webview_app/excel_templates；spec 与 requirements 移除 Pillow/Tkinter 残留；版本号 **3.0.1**。
