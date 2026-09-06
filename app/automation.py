@@ -701,7 +701,6 @@ def _api_list_waimai_orders(page: Any, selected_date: _dt.date,
         if (oldest is not None and oldest < selected_date) \
                 or (isinstance(total, int) and page_no * page_size >= total):
             break
-    _emit(callback, f"接口读取外送订单 {len(rows)} 笔（新单在前）")
     return rows
 
 

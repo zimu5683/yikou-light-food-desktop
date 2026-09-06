@@ -25,6 +25,20 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile && pnpm build
+
       - name: Verify release tag matches application version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
@@ -111,6 +125,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile && pnpm build
       - name: Verify release tag matches application version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -120,7 +145,7 @@ jobs:
         run: bash scripts/build_macos.sh
       - name: Smoke-test application imports on macOS
         run: |
-          python3 -c "import app.main, app.gui, app.automation, app.sss, app.updater, app.design_system; print('imports OK on macOS')"
+          python3 -c "import app.main, app.bridge, app.webview_app, app.excel_templates, app.automation, app.sss, app.updater; print('imports OK on macOS')"
       - name: Verify app bundle structure
         run: |
           APP="dist/yikou-light-food.app"
@@ -167,6 +192,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+      - name: Build frontend
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile && pnpm build
       - name: Verify release tag matches application version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -176,7 +212,7 @@ jobs:
         run: bash scripts/build_linux.sh
       - name: Smoke-test application imports on Linux
         run: |
-          python3 -c "import app.main, app.gui, app.automation, app.sss, app.updater, app.design_system; print('imports OK on Linux')"
+          python3 -c "import app.main, app.bridge, app.webview_app, app.excel_templates, app.automation, app.sss, app.updater; print('imports OK on Linux')"
       - name: Verify binary and archive
         run: |
           test -x dist/yikou-light-food

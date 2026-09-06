@@ -6,6 +6,7 @@ cd "$ROOT"
 
 python3 -m pip install --upgrade pip
 python3 -m pip install -r requirements.txt
+python3 scripts/build_frontend.py
 
 # Keep browser installation outside the app bundle.  The application can
 # download Chromium on first run when Edge/Chromium is unavailable.
@@ -18,4 +19,3 @@ if [[ ! -d "$APP" ]]; then
   exit 1
 fi
 echo "Build complete: $APP"
-

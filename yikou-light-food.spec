@@ -6,14 +6,25 @@ import sys
 from PyInstaller.utils.hooks import collect_all
 
 project = Path(SPECPATH)
+frontend_dist = project / "frontend" / "dist"
+if not (frontend_dist / "index.html").is_file():
+    raise SystemExit(
+        "Missing frontend/dist/index.html. Build the frontend first with "
+        "'cd frontend && pnpm install && pnpm build'."
+    )
+
 datas, binaries, hiddenimports = collect_all("playwright")
+# Include the complete Vite output. The HTML references sibling assets such as
+# the favicon and icon sprite even though its JS/CSS are inlined. Build the
+# regular two-item ``(source, destination)`` data tuples expected by Analysis.
+datas += [
+    (str(path), str(Path("frontend") / path.relative_to(frontend_dist).parent))
+    for path in frontend_dist.rglob("*")
+    if path.is_file()
+]
 # The browser payload is machine-specific and is intentionally not bundled.
 datas = [item for item in datas if ".local-browsers" not in str(item[0])]
 binaries = [item for item in binaries if ".local-browsers" not in str(item[0])]
-# Pillow's C extension ``PIL._imagingtk`` imports ``PIL._tkinter_finder`` only
-# at runtime, and hook-PIL excludes tkinter-derived edges, so static analysis
-# never sees it; without this the GUI crashes on first ImageTk.PhotoImage use.
-hiddenimports = hiddenimports + ["PIL.ImageTk", "PIL._tkinter_finder"]
 
 analysis = Analysis(
     [str(project / "run.py")],
@@ -67,4 +78,3 @@ if sys.platform == "darwin":
         name="yikou-light-food.app",
         bundle_identifier="com.zimu5683.yikou-light-food",
     )
-

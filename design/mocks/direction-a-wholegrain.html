@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>方向 A · 全麦 Wholegrain — 一口轻食</title>
+<style>
+  /* ============ tokens: 全麦 Wholegrain · light ============ */
+  :root {
+    --wheat: #7A5A3A;        /* 全麦棕 primary */
+    --wheat-strong: #6B4E31;
+    --wheat-soft: #F0E6D8;   /* 选中态底 */
+    --flour: #FAF7F1;        /* canvas 面粉白 */
+    --plate: #FFFFFF;        /* 卡片瓷盘白 */
+    --bran: #EFE8DD;         /* 输入底 */
+    --ink: #2A241C;          /* 正文 */
+    --ink-soft: #7A6F5E;     /* 次级文字 */
+    --ink-faint: #A99C88;    /* 占位 */
+    --line: #E5DCCC;         /* 边框 */
+    --lettuce: #3E7C4F;      /* 成功 */
+    --tomato: #C0442E;       /* 危险 */
+    --mustard: #C88A16;      /* 警示 */
+    --radius-card: 10px;
+    --radius-input: 6px;
+    --radius-btn: 8px;
+    --font: "MiSans", "HarmonyOS Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "JetBrains Mono", "Noto Sans Mono CJK SC", ui-monospace, monospace;
+  }
+  /* ============ tokens: dark ============ */
+  :root.dark {
+    --wheat: #A67B4F;
+    --wheat-strong: #B98A5C;
+    --wheat-soft: #3A2F22;
+    --flour: #1D1710;
+    --plate: #262019;
+    --bran: #2E271D;
+    --ink: #F3EDE3;
+    --ink-soft: #B3A78F;
+    --ink-faint: #7D715C;
+    --line: #3B3325;
+    --lettuce: #6FB583;
+    --tomato: #E0705A;
+    --mustard: #DFAE4C;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--font); background: var(--flour); color: var(--ink);
+    font-size: 13px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button { font-family: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--wheat); outline-offset: 1px; border-radius: 4px; }
+
+  /* ============ 自绘标题栏 ============ */
+  .titlebar {
+    height: 44px; flex: 0 0 44px; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px 0 16px; border-bottom: 1px solid var(--line);
+    background: var(--flour); user-select: none;
+  }
+  .brandmark {
+    width: 22px; height: 22px; border-radius: 6px; background: var(--wheat);
+    display: grid; place-items: center; color: #FFF; font-size: 12px; font-weight: 700;
+  }
+  .titlebar .name { font-weight: 600; font-size: 14px; letter-spacing: -0.2px; }
+  .titlebar .tagline { color: var(--ink-soft); font-size: 12px; margin-left: 2px; }
+  .ver {
+    margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px; background: var(--plate);
+  }
+  .winbtns { display: flex; gap: 2px; margin-left: 8px; }
+  .winbtns button {
+    width: 30px; height: 26px; border: 0; background: transparent; border-radius: 6px;
+    color: var(--ink-soft); font-size: 12px; line-height: 1;
+  }
+  .winbtns button:hover { background: var(--bran); color: var(--ink); }
+  .theme-toggle {
+    border: 1px solid var(--line); background: var(--plate); color: var(--ink-soft);
+    border-radius: 6px; height: 26px; padding: 0 10px; font-size: 12px; margin-left: 8px;
+  }
+  .theme-toggle:hover { color: var(--ink); border-color: var(--wheat); }
+
+  /* ============ 主体分栏 ============ */
+  .main { flex: 1; display: flex; min-height: 0; }
+  .pane-left {
+    width: 396px; flex: 0 0 396px; min-width: 340px; display: flex; flex-direction: column;
+    border-right: 1px solid var(--line); background: var(--flour); min-height: 0;
+  }
+  .pane-right { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--flour); }
+
+  /* ============ 左：任务面板 ============ */
+  .task { flex: 1; overflow-y: auto; padding: 18px 20px 14px; }
+  .task::before { content: ""; display: block; height: 4px; margin: -18px -20px 14px; background: var(--wheat); } /* 案板包边 = 全页暖色集中点 */
+  .task h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  .task .sub { color: var(--ink-soft); font-size: 12px; margin: 3px 0 14px; }
+
+  .seg { display: flex; background: var(--bran); border-radius: var(--radius-btn); padding: 3px; gap: 3px; margin-bottom: 16px; }
+  .seg button {
+    flex: 1; height: 30px; border: 0; border-radius: 6px; background: transparent;
+    color: var(--ink-soft); font-size: 13px; font-weight: 500;
+  }
+  .seg button[aria-selected="true"] { background: var(--plate); color: var(--ink); box-shadow: 0 1px 2px rgba(42,36,28,.12); }
+
+  .field { margin-bottom: 13px; }
+  .field label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 5px; color: var(--ink); }
+  .control { display: flex; gap: 6px; }
+  .input {
+    flex: 1; min-width: 0; height: 34px; padding: 0 10px; font-size: 13px; font-family: inherit;
+    background: var(--bran); color: var(--ink); border: 1px solid transparent; border-radius: var(--radius-input);
+  }
+  .input::placeholder { color: var(--ink-faint); }
+  .input:focus { outline: none; border-color: var(--wheat); background: var(--plate); }
+  .input.is-ok { border-color: var(--lettuce); background: color-mix(in srgb, var(--lettuce) 7%, var(--plate)); }
+  .helper { display: none; font-size: 11px; color: var(--ink-soft); margin-top: 4px; }
+  .field:focus-within .helper, .field.show-helper .helper { display: block; }
+  .helper.err { color: var(--tomato); }
+
+  .ghostbtn {
+    height: 34px; padding: 0 11px; font-size: 12px; color: var(--ink); background: var(--plate);
+    border: 1px solid var(--line); border-radius: var(--radius-input); white-space: nowrap;
+  }
+  .ghostbtn:hover { border-color: var(--wheat); color: var(--wheat-strong); }
+
+  .stepper { display: inline-flex; align-items: center; border: 1px solid var(--line); background: var(--plate); border-radius: var(--radius-input); overflow: hidden; }
+  .stepper button { width: 30px; height: 34px; border: 0; background: transparent; color: var(--ink-soft); font-size: 15px; }
+  .stepper button:hover { background: var(--bran); color: var(--ink); }
+  .stepper .num { width: 44px; text-align: center; font-family: var(--mono); font-size: 13px; border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+
+  .switchrow { display: flex; align-items: center; gap: 8px; margin: 2px 0 16px; font-size: 12.5px; color: var(--ink-soft); }
+  .switch { position: relative; width: 30px; height: 17px; border-radius: 999px; background: var(--line); border: 0; }
+  .switch[aria-checked="true"] { background: var(--wheat); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: #FFF; transition: left .15s ease; }
+  .switch[aria-checked="true"]::after { left: 15px; }
+
+  .actionbar { display: flex; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
+  .primary {
+    flex: 1; height: 38px; border: 0; border-radius: var(--radius-btn); background: var(--wheat);
+    color: #FFF; font-size: 13.5px; font-weight: 600; letter-spacing: .2px;
+  }
+  .primary:hover { background: var(--wheat-strong); }
+  .danger {
+    flex: 0 0 96px; height: 38px; border-radius: var(--radius-btn); font-size: 13.5px;
+    background: var(--plate); color: var(--tomato); border: 1px solid color-mix(in srgb, var(--tomato) 40%, var(--line));
+  }
+  .danger:disabled { color: var(--ink-faint); border-color: var(--line); background: var(--bran); cursor: default; }
+
+  .more { margin-top: 12px; font-size: 12px; color: var(--ink-soft); display: flex; align-items: center; gap: 6px; }
+  .more a { color: var(--ink-soft); text-decoration: none; padding: 3px 8px; border-radius: 5px; }
+  .more a:hover { background: var(--bran); color: var(--ink); }
+  .more .dot { color: var(--ink-faint); }
+
+  /* ============ 右：日志控制台 ============ */
+  .logcard { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 18px 20px 16px; }
+  .loghead { display: flex; align-items: center; gap: 10px; }
+  .loghead h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 10px;
+    border-radius: 999px; font-size: 12px; font-weight: 500;
+    background: color-mix(in srgb, var(--wheat) 12%, var(--plate)); color: var(--wheat-strong);
+    border: 1px solid color-mix(in srgb, var(--wheat) 30%, var(--line));
+  }
+  .badge .led { width: 7px; height: 7px; border-radius: 2px; background: var(--wheat); }
+  @media (prefers-reduced-motion: no-preference) {
+    .badge .led { animation: breathe 1.6s ease-in-out infinite; }
+    @keyframes breathe { 50% { opacity: .35; } }
+  }
+  .logtools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .logfilter {
+    height: 28px; width: 180px; padding: 0 9px; font-size: 12px; font-family: inherit;
+    background: var(--bran); border: 1px solid transparent; border-radius: 6px; color: var(--ink);
+  }
+  .logfilter:focus { outline: none; border-color: var(--wheat); background: var(--plate); }
+  .toolbtn {
+    height: 28px; padding: 0 9px; font-size: 12px; border-radius: 6px; border: 1px solid var(--line);
+    background: var(--plate); color: var(--ink-soft);
+  }
+  .toolbtn:hover { color: var(--ink); border-color: var(--wheat); }
+  .toolbtn.on { color: var(--wheat-strong); border-color: var(--wheat); background: var(--wheat-soft); }
+
+  .console {
+    flex: 1; min-height: 0; margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius-card);
+    background: var(--plate); overflow-y: auto; padding: 10px 0;
+  }
+  .row { display: flex; gap: 10px; padding: 3px 14px; font-family: var(--mono); font-size: 12px; line-height: 1.7; }
+  .row .t { color: var(--ink-faint); flex: 0 0 auto; }
+  .row .lv { flex: 0 0 38px; font-weight: 600; letter-spacing: .3px; }
+  .lv.ok { color: var(--lettuce); } .lv.info { color: var(--ink-soft); } .lv.err { color: var(--tomato); } .lv.warn { color: var(--mustard); }
+  .row .msg { color: var(--ink); word-break: break-all; }
+  .row.hit .msg { background: color-mix(in srgb, var(--mustard) 22%, transparent); border-radius: 3px; }
+  .sep { border: 0; border-top: 1px dashed var(--line); margin: 5px 14px; }
+</style>
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brandmark">轻</div>
+    <span class="name">一口轻食</span>
+    <span class="tagline">订单自动处理台</span>
+    <span class="ver">v3.0.0</span>
+    <button class="theme-toggle" onclick="const d=document.documentElement.classList.toggle('dark');this.textContent=d?'☀ 浅色':'☾ 深色'">☾ 深色</button>
+    <div class="winbtns">
+      <button aria-label="最小化">—</button><button aria-label="最大化">□</button><button aria-label="关闭">✕</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <section class="pane-left">
+      <div class="task">
+        <h1>任务配置</h1>
+        <p class="sub">选择任务类型，准备好资料后启动。</p>
+
+        <div class="seg" role="tablist">
+          <button role="tab" aria-selected="true">订单处理</button>
+          <button role="tab" aria-selected="false">闪时送下单</button>
+        </div>
+
+        <div class="field">
+          <label for="f-url">管理网址</label>
+          <div class="control"><input id="f-url" class="input" value="https://m.icall.me/admin/#/login"></div>
+          <p class="helper">用于登录管理后台</p>
+        </div>
+
+        <div class="field">
+          <label for="f-phone">手机号 / 账号</label>
+          <div class="control"><input id="f-phone" class="input" value="13968033834"></div>
+          <p class="helper">用于登录管理后台</p>
+        </div>
+
+        <div class="field">
+          <label for="f-pwd">登录密码</label>
+          <div class="control"><input id="f-pwd" class="input" type="password" value="yikou2026"></div>
+          <p class="helper">密码仅保存在系统凭据管理器中</p>
+        </div>
+
+        <div class="field">
+          <label for="f-excel">Excel 文件</label>
+          <div class="control">
+            <input id="f-excel" class="input is-ok" value="/home/zimu/文档/排单.xlsx">
+            <button class="ghostbtn">选择文件</button>
+            <button class="ghostbtn">新建模板</button>
+          </div>
+          <p class="helper">支持 .xlsx / .xlsm，文件已准备</p>
+        </div>
+
+        <div class="field">
+          <label for="f-date">目标日期</label>
+          <div class="control"><input id="f-date" class="input" value="2026-09-05"></div>
+          <p class="helper">将筛选 2026-09-05 的订单；留空默认今天</p>
+        </div>
+
+        <div class="field">
+          <label id="lb-count">待处理订单数</label>
+          <div class="stepper" role="group" aria-labelledby="lb-count">
+            <button aria-label="减少">−</button><span class="num">1</span><button aria-label="增加">＋</button>
+          </div>
+        </div>
+
+        <div class="switchrow">
+          <button class="switch" role="switch" aria-checked="true" aria-label="保存到系统凭据管理器"></button>
+          <span>保存到系统凭据管理器</span>
+        </div>
+
+        <div class="actionbar">
+          <button class="primary">开始处理</button>
+          <button class="danger" disabled>停止</button>
+        </div>
+
+        <nav class="more">
+          <a href="#">检查浏览器</a><span class="dot">·</span>
+          <a href="#">清除密码</a><span class="dot">·</span>
+          <a href="#">检查更新</a>
+        </nav>
+      </div>
+    </section>
+
+    <section class="pane-right">
+      <div class="logcard">
+        <div class="loghead">
+          <h2>运行日志</h2>
+          <span class="badge"><span class="led"></span>处理中</span>
+          <div class="logtools">
+            <input class="logfilter" placeholder="过滤日志…">
+            <button class="toolbtn">复制</button>
+            <button class="toolbtn">清空</button>
+            <button class="toolbtn on">自动滚动</button>
+          </div>
+        </div>
+
+        <div class="console">
+          <div class="row"><span class="t">19:23:41</span><span class="lv ok">OK</span><span class="msg">正在检查更新…</span></div>
+          <div class="row"><span class="t">19:23:42</span><span class="lv info">INFO</span><span class="msg">已是最新版本</span></div>
+          <div class="row"><span class="t">19:24:03</span><span class="lv info">INFO</span><span class="msg">登录成功，开始处理订单</span></div>
+          <div class="row"><span class="t">19:24:05</span><span class="lv info">INFO</span><span class="msg">接口读取外卖订单 50 笔（新单在前）</span></div>
+          <hr class="sep">
+          <div class="row"><span class="t">19:24:07</span><span class="lv ok">OK</span><span class="msg">W1|汤|13566047050|校门口|午餐经济1餐 x1</span></div>
+          <div class="row hit"><span class="t">19:24:09</span><span class="lv info">INFO</span><span class="msg">订单 13566047050 提交成功，等待接单</span></div>
+          <div class="row"><span class="t">19:24:12</span><span class="lv ok">OK</span><span class="msg">处理完成：已处理 1 项，找到 1 项</span></div>
+          <div class="row"><span class="t">19:24:12</span><span class="lv info">INFO</span><span class="msg">Excel 已备份至 backups/排单-20260905.xlsx</span></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

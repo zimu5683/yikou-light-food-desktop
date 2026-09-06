@@ -1,6 +1,6 @@
 # 一口轻食桌面程序
 
-这是一个使用 Tkinter + Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager、macOS Keychain 或 Linux SecretService（GNOME Keyring/KWallet，`keyring`）保存；系统没有可用密钥环时退化为每次运行手动输入。
+这是一个使用 pywebview（React + TypeScript + Tailwind 前端）+ Playwright + openpyxl 的订单处理桌面程序。账号密码不会写入源码；密码通过 Windows Credential Manager、macOS Keychain 或 Linux SecretService（GNOME Keyring/KWallet，`keyring`）保存；系统没有可用密钥环时退化为每次运行手动输入。
 
 此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
 
@@ -43,7 +43,13 @@ python run.py
 
 ## Linux 构建
 
-普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建，Ubuntu 22.04/Debian 12/Fedora 36 及更新版本可直接运行）。解压后执行：
+普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建）。Linux 版本使用系统 GTK 3 + WebKitGTK 4.0/4.1 作为 pywebview 渲染内核；Ubuntu/Debian 通常需要先安装对应运行库：
+
+```bash
+sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+```
+
+部分较旧发行版将最后一个包命名为 `gir1.2-webkit2-4.0`。程序启动时会检查前端文件和图形后端，缺少依赖会显示明确错误，而不是打开空白窗口。满足这些依赖后，Ubuntu 22.04、Debian 12 及更新版本可按下列方式运行：
 
 ```bash
 tar -xzf yikou-light-food-linux-x64.tar.gz

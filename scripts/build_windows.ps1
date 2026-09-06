@@ -8,6 +8,7 @@ Set-Location $root
 
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python scripts/build_frontend.py
 
 # Browser binaries are installed into the user cache at first run.  Setting
 # this variable keeps PyInstaller from trying to bundle a machine-specific
@@ -21,4 +22,3 @@ $sizeMb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
 Write-Host "Executable size: $sizeMb MB (Playwright browsers are external)"
 
 Write-Host "Build complete: $root\dist\yikou-light-food.exe"
-

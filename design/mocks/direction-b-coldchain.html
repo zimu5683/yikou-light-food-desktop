@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>方向 B · 冷链 Cold Chain — 一口轻食</title>
+<style>
+  /* ============ tokens: 冷链 Cold Chain · light ============ */
+  :root {
+    --steel: #2F7E8F;        /* 钢青 primary */
+    --steel-strong: #27697A;
+    --steel-soft: #E3F0F3;   /* 选中态底 */
+    --dawn: #F4F7F8;         /* canvas 凌晨灰 */
+    --porcelain: #FFFFFF;    /* surface 瓷白 */
+    --hairline: #E3E9EB;     /* 发丝线 */
+    --hairline-strong: #C6D2D6;
+    --ink: #111C1F;          /* 墨青黑 */
+    --ink-soft: #5E6F74;
+    --ink-faint: #93A5AA;
+    --ok: #2E9E63;
+    --err: #D5443C;
+    --warn: #E8A13C;
+    --radius-card: 10px;
+    --radius-input: 6px;
+    --font: "MiSans", "HarmonyOS Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "JetBrains Mono", "Noto Sans Mono CJK SC", ui-monospace, monospace;
+  }
+  /* ============ tokens: dark — Linear 式 surface 阶梯 ============ */
+  :root.dark {
+    --steel: #4FC3D8;
+    --steel-strong: #7BD4E4;
+    --steel-soft: #12333B;
+    --dawn: #0B1416;         /* 深水底 */
+    --porcelain: #121F23;    /* surface-1 */
+    --hairline: #1E2E33;
+    --hairline-strong: #2C4148;
+    --ink: #E8F0F2;
+    --ink-soft: #9AB3B9;
+    --ink-faint: #5E767C;
+    --ok: #4FC98A;
+    --err: #F0776F;
+    --warn: #F2BC63;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--font); background: var(--dawn); color: var(--ink);
+    font-size: 13px; line-height: 1.5; -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  button { font-family: inherit; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--steel); outline-offset: 1px; border-radius: 4px; }
+
+  /* ============ 自绘标题栏 ============ */
+  .titlebar {
+    height: 44px; flex: 0 0 44px; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px 0 16px; border-bottom: 1px solid var(--hairline); user-select: none;
+  }
+  .brandmark {
+    width: 22px; height: 22px; border-radius: 5px; background: var(--steel);
+    display: grid; place-items: center; color: #FFF; font-size: 12px; font-weight: 700;
+  }
+  :root.dark .brandmark { color: #0B1416; }
+  .titlebar .name { font-weight: 600; font-size: 14px; letter-spacing: -0.2px; }
+  .titlebar .tagline { color: var(--ink-soft); font-size: 12px; }
+  .ver {
+    margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
+    border: 1px solid var(--hairline); border-radius: 4px; padding: 2px 8px;
+  }
+  .winbtns { display: flex; gap: 2px; margin-left: 8px; }
+  .winbtns button {
+    width: 30px; height: 26px; border: 0; background: transparent; border-radius: 5px;
+    color: var(--ink-soft); font-size: 12px;
+  }
+  .winbtns button:hover { background: var(--hairline); color: var(--ink); }
+  .theme-toggle {
+    border: 1px solid var(--hairline); background: var(--porcelain); color: var(--ink-soft);
+    border-radius: 5px; height: 26px; padding: 0 10px; font-size: 12px; margin-left: 8px;
+  }
+  .theme-toggle:hover { color: var(--ink); border-color: var(--steel); }
+
+  /* ============ 主体 ============ */
+  .main { flex: 1; display: flex; min-height: 0; }
+  .pane-left {
+    width: 396px; flex: 0 0 396px; min-width: 340px; display: flex; flex-direction: column;
+    border-right: 1px solid var(--hairline); min-height: 0;
+  }
+  .pane-right { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+
+  /* ============ 左：任务面板 ============ */
+  .task { flex: 1; overflow-y: auto; padding: 18px 20px 14px; }
+  .task h1 { font-size: 17px; font-weight: 600; letter-spacing: -0.3px; }
+  .task .sub { color: var(--ink-soft); font-size: 12px; margin: 3px 0 14px; }
+
+  .seg { display: flex; border: 1px solid var(--hairline); border-radius: var(--radius-input); padding: 2px; gap: 2px; margin-bottom: 16px; background: var(--porcelain); }
+  .seg button {
+    flex: 1; height: 29px; border: 0; border-radius: 4px; background: transparent;
+    color: var(--ink-soft); font-size: 13px; font-weight: 500;
+  }
+  .seg button[aria-selected="true"] { background: var(--steel-soft); color: var(--steel-strong); }
+  :root.dark .seg button[aria-selected="true"] { color: var(--steel); }
+
+  .field { margin-bottom: 13px; }
+  .field label { display: block; font-size: 12px; font-weight: 500; margin-bottom: 5px; }
+  .control { display: flex; gap: 6px; }
+  .input {
+    flex: 1; min-width: 0; height: 34px; padding: 0 10px; font-size: 13px; font-family: inherit;
+    background: var(--porcelain); color: var(--ink); border: 1px solid var(--hairline); border-radius: var(--radius-input);
+    font-variant-numeric: tabular-nums;
+  }
+  .input::placeholder { color: var(--ink-faint); }
+  .input:focus { outline: none; border-color: var(--steel); box-shadow: 0 0 0 3px color-mix(in srgb, var(--steel) 18%, transparent); }
+  .input.is-ok { border-color: color-mix(in srgb, var(--ok) 45%, var(--hairline)); }
+  .helper { display: none; font-size: 11px; color: var(--ink-soft); margin-top: 4px; }
+  .field:focus-within .helper, .field.show-helper .helper { display: block; }
+
+  .ghostbtn {
+    height: 34px; padding: 0 11px; font-size: 12px; color: var(--ink); background: var(--porcelain);
+    border: 1px solid var(--hairline); border-radius: var(--radius-input); white-space: nowrap;
+  }
+  .ghostbtn:hover { border-color: var(--steel); color: var(--steel-strong); }
+  :root.dark .ghostbtn:hover { color: var(--steel); }
+
+  .stepper { display: inline-flex; align-items: center; border: 1px solid var(--hairline); background: var(--porcelain); border-radius: var(--radius-input); overflow: hidden; }
+  .stepper button { width: 30px; height: 34px; border: 0; background: transparent; color: var(--ink-soft); font-size: 15px; }
+  .stepper button:hover { background: var(--steel-soft); color: var(--steel-strong); }
+  .stepper .num { width: 44px; text-align: center; font-family: var(--mono); font-size: 13px; border-left: 1px solid var(--hairline); border-right: 1px solid var(--hairline); }
+
+  .switchrow { display: flex; align-items: center; gap: 8px; margin: 2px 0 16px; font-size: 12.5px; color: var(--ink-soft); }
+  .switch { position: relative; width: 30px; height: 17px; border-radius: 999px; background: var(--hairline-strong); border: 0; }
+  .switch[aria-checked="true"] { background: var(--steel); }
+  .switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: #FFF; transition: left .15s ease; }
+  .switch[aria-checked="true"]::after { left: 15px; }
+
+  .actionbar { display: flex; gap: 8px; padding-top: 14px; border-top: 1px solid var(--hairline); }
+  .primary {
+    flex: 1; height: 38px; border: 0; border-radius: var(--radius-input); background: var(--steel);
+    color: #FFF; font-size: 13.5px; font-weight: 600;
+  }
+  :root.dark .primary { color: #0B1416; }
+  .primary:hover { background: var(--steel-strong); }
+  .danger {
+    flex: 0 0 96px; height: 38px; border-radius: var(--radius-input); font-size: 13.5px;
+    background: var(--porcelain); color: var(--err); border: 1px solid color-mix(in srgb, var(--err) 40%, var(--hairline));
+  }
+  .danger:disabled { color: var(--ink-faint); border-color: var(--hairline); cursor: default; }
+
+  .more { margin-top: 12px; font-size: 12px; color: var(--ink-soft); display: flex; align-items: center; gap: 6px; }
+  .more a { color: var(--ink-soft); text-decoration: none; padding: 3px 8px; border-radius: 4px; }
+  .more a:hover { background: var(--steel-soft); color: var(--ink); }
+  .more .dot { color: var(--ink-faint); }
+
+  /* ============ 右：日志「设备屏」 ============ */
+  .logcard { flex: 1; display: flex; flex-direction: column; min-height: 0; padding: 18px 20px 16px; }
+  .loghead { display: flex; align-items: center; gap: 10px; }
+  .loghead h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.2px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px;
+    border-radius: 4px; font-family: var(--mono); font-size: 11.5px; font-weight: 600; letter-spacing: .5px;
+    background: var(--steel-soft); color: var(--steel-strong); border: 1px solid color-mix(in srgb, var(--steel) 35%, var(--hairline));
+  }
+  :root.dark .badge { color: var(--steel); }
+  .badge .led { width: 7px; height: 7px; border-radius: 1.5px; background: var(--steel); box-shadow: 0 0 0 1px color-mix(in srgb, var(--steel) 30%, transparent); }
+  @media (prefers-reduced-motion: no-preference) {
+    .badge .led { animation: blink 1.4s steps(2, jump-none) infinite; }
+    @keyframes blink { 50% { opacity: .25; } }
+  }
+  .logtools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+  .logfilter {
+    height: 28px; width: 180px; padding: 0 9px; font-size: 12px; font-family: inherit;
+    background: var(--porcelain); border: 1px solid var(--hairline); border-radius: 5px; color: var(--ink);
+  }
+  .logfilter:focus { outline: none; border-color: var(--steel); }
+  .toolbtn {
+    height: 28px; padding: 0 9px; font-size: 12px; border-radius: 5px; border: 1px solid var(--hairline);
+    background: var(--porcelain); color: var(--ink-soft);
+  }
+  .toolbtn:hover { color: var(--ink); border-color: var(--steel); }
+  .toolbtn.on { color: var(--steel-strong); border-color: var(--steel); background: var(--steel-soft); }
+  :root.dark .toolbtn.on { color: var(--steel); }
+
+  /* 设备屏：屏幕内嵌 + 顶部运行微光 = 全页记忆点 */
+  .console {
+    flex: 1; min-height: 0; margin-top: 12px; position: relative;
+    border: 1px solid var(--hairline); border-radius: var(--radius-card); background: var(--porcelain);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .console .glow {
+    height: 2px; flex: 0 0 2px; background: linear-gradient(90deg, transparent, var(--steel), transparent);
+    background-size: 45% 100%; background-repeat: no-repeat;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .console .glow { animation: sweep 2.2s linear infinite; }
+    @keyframes sweep { 0% { background-position: -45% 0; } 100% { background-position: 145% 0; } }
+  }
+  .screen { flex: 1; overflow-y: auto; padding: 10px 0; font-family: var(--mono); font-size: 12px; }
+  .row { display: flex; gap: 10px; padding: 2px 14px; line-height: 1.75; }
+  .row .n { color: var(--ink-faint); flex: 0 0 20px; text-align: right; user-select: none; font-size: 11px; padding-top: 2px; }
+  .row .t { color: var(--ink-faint); flex: 0 0 auto; }
+  .row .lv { flex: 0 0 38px; font-weight: 600; }
+  .lv.ok { color: var(--ok); } .lv.info { color: var(--ink-soft); } .lv.err { color: var(--err); } .lv.warn { color: var(--warn); }
+  .row .msg { color: var(--ink); word-break: break-all; }
+  .row.hit .msg { background: color-mix(in srgb, var(--warn) 25%, transparent); border-radius: 3px; }
+  .row.sep { color: var(--ink-faint); gap: 0; padding-left: 14px; }
+</style>
+</head>
+<body>
+  <header class="titlebar">
+    <div class="brandmark">轻</div>
+    <span class="name">一口轻食</span>
+    <span class="tagline">订单自动处理台</span>
+    <span class="ver">v3.0.0</span>
+    <button class="theme-toggle" onclick="const d=document.documentElement.classList.toggle('dark');this.textContent=d?'☀ 浅色':'☾ 深色'">☾ 深色</button>
+    <div class="winbtns">
+      <button aria-label="最小化">—</button><button aria-label="最大化">□</button><button aria-label="关闭">✕</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <section class="pane-left">
+      <div class="task">
+        <h1>任务配置</h1>
+        <p class="sub">选择任务类型，准备好资料后启动。</p>
+
+        <div class="seg" role="tablist">
+          <button role="tab" aria-selected="true">订单处理</button>
+          <button role="tab" aria-selected="false">闪时送下单</button>
+        </div>
+
+        <div class="field">
+          <label for="f-url">管理网址</label>
+          <div class="control"><input id="f-url" class="input" value="https://m.icall.me/admin/#/login"></div>
+          <p class="helper">用于登录管理后台</p>
+        </div>
+
+        <div class="field">
+          <label for="f-phone">手机号 / 账号</label>
+          <div class="control"><input id="f-phone" class="input" value="13968033834"></div>
+          <p class="helper">用于登录管理后台</p>
+        </div>
+
+        <div class="field">
+          <label for="f-pwd">登录密码</label>
+          <div class="control"><input id="f-pwd" class="input" type="password" value="yikou2026"></div>
+          <p class="helper">密码仅保存在系统凭据管理器中</p>
+        </div>
+
+        <div class="field">
+          <label for="f-excel">Excel 文件</label>
+          <div class="control">
+            <input id="f-excel" class="input is-ok" value="/home/zimu/文档/排单.xlsx">
+            <button class="ghostbtn">选择文件</button>
+            <button class="ghostbtn">新建模板</button>
+          </div>
+          <p class="helper">支持 .xlsx / .xlsm，文件已准备</p>
+        </div>
+
+        <div class="field">
+          <label for="f-date">目标日期</label>
+          <div class="control"><input id="f-date" class="input" value="2026-09-05"></div>
+          <p class="helper">将筛选 2026-09-05 的订单；留空默认今天</p>
+        </div>
+
+        <div class="field">
+          <label id="lb-count">待处理订单数</label>
+          <div class="stepper" role="group" aria-labelledby="lb-count">
+            <button aria-label="减少">−</button><span class="num">1</span><button aria-label="增加">＋</button>
+          </div>
+        </div>
+
+        <div class="switchrow">
+          <button class="switch" role="switch" aria-checked="true" aria-label="保存到系统凭据管理器"></button>
+          <span>保存到系统凭据管理器</span>
+        </div>
+
+        <div class="actionbar">
+          <button class="primary">开始处理</button>
+          <button class="danger" disabled>停止</button>
+        </div>
+
+        <nav class="more">
+          <a href="#">检查浏览器</a><span class="dot">·</span>
+          <a href="#">清除密码</a><span class="dot">·</span>
+          <a href="#">检查更新</a>
+        </nav>
+      </div>
+    </section>
+
+    <section class="pane-right">
+      <div class="logcard">
+        <div class="loghead">
+          <h2>运行日志</h2>
+          <span class="badge"><span class="led"></span>处理中</span>
+          <div class="logtools">
+            <input class="logfilter" placeholder="过滤日志…">
+            <button class="toolbtn">复制</button>
+            <button class="toolbtn">清空</button>
+            <button class="toolbtn on">自动滚动</button>
+          </div>
+        </div>
+
+        <div class="console">
+          <div class="glow"></div>
+          <div class="screen">
+            <div class="row"><span class="n">01</span><span class="t">19:23:41</span><span class="lv ok">OK</span><span class="msg">正在检查更新…</span></div>
+            <div class="row"><span class="n">02</span><span class="t">19:23:42</span><span class="lv info">INFO</span><span class="msg">已是最新版本</span></div>
+            <div class="row"><span class="n">03</span><span class="t">19:24:03</span><span class="lv info">INFO</span><span class="msg">登录成功，开始处理订单</span></div>
+            <div class="row"><span class="n">04</span><span class="t">19:24:05</span><span class="lv info">INFO</span><span class="msg">接口读取外卖订单 50 笔（新单在前）</span></div>
+            <div class="row sep">──────────────────────────────</div>
+            <div class="row"><span class="n">05</span><span class="t">19:24:07</span><span class="lv ok">OK</span><span class="msg">W1|汤|13566047050|校门口|午餐经济1餐 x1</span></div>
+            <div class="row hit"><span class="n">06</span><span class="t">19:24:09</span><span class="lv info">INFO</span><span class="msg">订单 13566047050 提交成功，等待接单</span></div>
+            <div class="row"><span class="n">07</span><span class="t">19:24:12</span><span class="lv ok">OK</span><span class="msg">处理完成：已处理 1 项，找到 1 项</span></div>
+            <div class="row"><span class="n">08</span><span class="t">19:24:12</span><span class="lv info">INFO</span><span class="msg">Excel 已备份至 backups/排单-20260905.xlsx</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+</body>
+</html>

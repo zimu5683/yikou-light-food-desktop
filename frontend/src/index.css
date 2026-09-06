@@ -1,0 +1,187 @@
+@import "tailwindcss";
+
+/* ============================================================
+   全麦早市 Wheat Press — 冻结 token（design/DESIGN-WEB.md §5）
+   C 早市版式骨架 × A 全麦配色；浅色默认，.dark 由桥接层持久化。
+   ============================================================ */
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #faf7f1; /* 面粉白画布 */
+  --foreground: #2a241c; /* 油墨深褐，非纯黑 */
+  --card: #ffffff; /* 卡片 = 小票纸 */
+  --card-foreground: #2a241c;
+  --popover: #ffffff;
+  --popover-foreground: #2a241c;
+  --primary: #7a5a3a; /* 全麦棕 */
+  --primary-foreground: #ffffff;
+  --secondary: #efe8dd; /* 麸皮 */
+  --secondary-foreground: #2a241c;
+  --muted: #efe8dd;
+  --muted-foreground: #7a6f5e;
+  --accent: #f0e6d8; /* 全麦浅：选中态底 */
+  --accent-foreground: #2a241c;
+  --destructive: #c0442e; /* 番茄红：仅危险语义 */
+  --destructive-foreground: #ffffff;
+  --border: #e5dccc;
+  --input: #e5dccc;
+  --ring: #7a5a3a;
+
+  /* Wheat Press 扩展 token（非 shadcn 标准） */
+  --success: #3e7c4f; /* 生菜绿：仅成功语义 */
+  --warning: #c88a16; /* 芥末：仅警示语义 */
+  --ink-faint: #a99c88; /* 占位/时间戳 */
+  --hit: rgba(200, 138, 22, 0.22); /* 日志命中高亮 */
+  --receipt-edge: rgba(42, 36, 28, 0.25); /* 小票投影 */
+  --dashed-line: rgba(42, 36, 28, 0.3); /* 虚线裁切线 */
+
+  --radius: 0.5rem;
+}
+
+.dark {
+  --background: #1d1710; /* 烤面包底 */
+  --foreground: #f3ede3;
+  --card: #262019;
+  --card-foreground: #f3ede3;
+  --popover: #262019;
+  --popover-foreground: #f3ede3;
+  --primary: #a67b4f; /* 棕金 */
+  --primary-foreground: #ffffff;
+  --secondary: #2e271d;
+  --secondary-foreground: #f3ede3;
+  --muted: #2e271d;
+  --muted-foreground: #b3a78f;
+  --accent: #3a2f22;
+  --accent-foreground: #f3ede3;
+  --destructive: #e0705a;
+  --destructive-foreground: #ffffff;
+  --border: #3b3325;
+  --input: #3b3325;
+  --ring: #a67b4f;
+
+  --success: #6fb583;
+  --warning: #dfae4c;
+  --ink-faint: #7d715c;
+  --hit: rgba(223, 174, 76, 0.3);
+  --receipt-edge: rgba(0, 0, 0, 0.45);
+  --dashed-line: rgba(243, 237, 227, 0.32);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-strong: var(--primary-strong);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  /* 扩展 */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-ink-faint: var(--ink-faint);
+  --color-hit: var(--hit);
+
+  --radius-xs: calc(var(--radius) - 6px); /* 2px 徽章/LED */
+  --radius-sm: calc(var(--radius) - 4px); /* 4px 输入 */
+  --radius-md: calc(var(--radius) - 2px); /* 6px 按钮 */
+  --radius-lg: var(--radius); /* 8px 卡片 */
+
+  --font-sans: "MiSans", "HarmonyOS Sans SC", "Noto Sans SC", "PingFang SC",
+    "Microsoft YaHei", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Noto Serif SC", "Source Han Serif SC", "Songti SC", serif;
+  --font-mono: "JetBrains Mono", "Noto Sans Mono CJK SC", ui-monospace,
+    SFMono-Regular, monospace;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+  body {
+    @apply bg-background text-foreground font-sans antialiased select-none;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  input,
+  textarea {
+    @apply select-text;
+  }
+  /* 数字统一 tabular（DESIGN-WEB：全部数字 tabular-mono） */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   Wheat Press 专用组件类（自 final-wheat-press.html mock 移植）
+   ============================================================ */
+
+/* 小票锯齿顶边（SVG 三角齿平铺，颜色跟随 --card） */
+.receipt-tear {
+  height: 8px;
+  flex: 0 0 8px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M0 8 L6 0 L12 8 Z' fill='white'/%3E%3C/svg%3E");
+  background-repeat: repeat-x;
+  background-position: bottom;
+}
+.dark .receipt-tear {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M0 8 L6 0 L12 8 Z' fill='%23262019'/%3E%3C/svg%3E");
+}
+
+/* 宋体主按钮（印刷铅字感，字距 4px） */
+.btn-serif-primary {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  letter-spacing: 4px;
+}
+
+/* 运行徽章呼吸 LED */
+@keyframes led-breathe {
+  50% { opacity: 0.3; }
+}
+.led-breathe {
+  animation: led-breathe 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .led-breathe { animation: none; }
+}
+
+/* 日志虚线裁切分隔（票据语言） */
+.receipt-row + .receipt-row {
+  border-top: 1px dashed var(--dashed-line);
+}
+
+/* 小票纸投影 */
+.receipt-paper {
+  box-shadow: 0 6px 14px -10px var(--receipt-edge);
+}
