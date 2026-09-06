@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 
 import pytest
 
@@ -45,4 +46,4 @@ def test_frozen_frontend_target_is_file_uri(monkeypatch, tmp_path: Path) -> None
 
     assert debug is False
     assert urlparse(target).scheme == "file"
-    assert Path(unquote(urlparse(target).path)) == frozen_index
+    assert Path(url2pathname(unquote(urlparse(target).path))) == frozen_index
