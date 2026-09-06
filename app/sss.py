@@ -288,6 +288,21 @@ def _address_from_record(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _fixed_address_from_config(config: Any) -> dict[str, Any]:
+    """从配置读取固定地址，供“跳过常用地址匹配”的固定地址模式使用。"""
+    lnt = getattr(config, "sss_fixed_lnt", None)
+    lat = getattr(config, "sss_fixed_lat", None)
+    area_code = str(getattr(config, "sss_fixed_area_code", "") or "")
+    detail = str(getattr(config, "sss_fixed_address_detail", "") or "")
+    if lnt in (None, "") or lat in (None, ""):
+        raise LookupError("固定地址配置缺少经纬度字段："
+                          + json.dumps({"lnt": lnt, "lat": lat}, ensure_ascii=False))
+    return {
+        "lnt": float(lnt), "lat": float(lat),
+        "areaCode": area_code, "addressDetail": detail,
+    }
+
+
 def run_sss_job(config: Any, stop_event: Any,
                 progress_callback: Callable[[str], Any] | None = None,
                 password: str | None = None,
@@ -320,6 +335,7 @@ def run_sss_job(config: Any, stop_event: Any,
     dry_run = bool(getattr(config, "sss_dry_run", False))
     store_name = str(getattr(config, "sss_store_name", "") or "一口轻食")
     common_address = str(getattr(config, "sss_common_address", "") or "")
+    use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
     api_mode = bool(getattr(config, "api_mode", True))
 
@@ -352,15 +368,20 @@ def run_sss_job(config: Any, stop_event: Any,
             raise LookupError("门店记录缺少 id："
                               + json.dumps(store_record, ensure_ascii=False)[:300])
 
-        addr_payload = client.get_json(_FREQUENT_ADDR_PATH)
-        address_record = _match_record(_result_records(addr_payload),
-                                       common_address, "常用地址")
-        _emit(progress_callback,
-              f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
-        address = _address_from_record(address_record)
-        _emit(progress_callback,
-              f"门店「{store_name}」与常用地址「{common_address}」就绪"
-              f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
+        if use_fixed_address:
+            address = _fixed_address_from_config(config)
+            _emit(progress_callback,
+                  f"使用固定地址：{address['addressDetail']} @ {address['lnt']},{address['lat']}")
+        else:
+            addr_payload = client.get_json(_FREQUENT_ADDR_PATH)
+            address_record = _match_record(_result_records(addr_payload),
+                                           common_address, "常用地址")
+            _emit(progress_callback,
+                  f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
+            address = _address_from_record(address_record)
+            _emit(progress_callback,
+                  f"门店「{store_name}」与常用地址「{common_address}」就绪"
+                  f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
         if dry_run:
             _emit(progress_callback, "【干跑模式】只组装报文，不真实提交")
 
@@ -449,7 +470,7 @@ def run_sss_job(config: Any, stop_event: Any,
             _ensure_logged_in(page, account, password, stop_event, progress_callback)
             _minimize_window(browser, progress_callback)
 
-            # 登录会话就绪：读取门店与常用地址，之后每单只调下单接口。
+            # 登录会话就绪：读取门店；地址可来自固定配置或常用地址列表。
             _emit(progress_callback, "读取门店与常用地址…")
             _, store_payload = _sss_api(page, "GET", _STORE_LIST_PATH)
             store_record = _match_record(_result_records(store_payload),
@@ -459,15 +480,20 @@ def run_sss_job(config: Any, stop_event: Any,
                 raise LookupError("门店记录缺少 id："
                                   + json.dumps(store_record, ensure_ascii=False)[:300])
 
-            _, addr_payload = _sss_api(page, "GET", _FREQUENT_ADDR_PATH)
-            address_record = _match_record(_result_records(addr_payload),
-                                           common_address, "常用地址")
-            _emit(progress_callback,
-                  f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
-            address = _address_from_record(address_record)
-            _emit(progress_callback,
-                  f"门店「{store_name}」与常用地址「{common_address}」就绪"
-                  f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
+            if use_fixed_address:
+                address = _fixed_address_from_config(config)
+                _emit(progress_callback,
+                      f"使用固定地址：{address['addressDetail']} @ {address['lnt']},{address['lat']}")
+            else:
+                _, addr_payload = _sss_api(page, "GET", _FREQUENT_ADDR_PATH)
+                address_record = _match_record(_result_records(addr_payload),
+                                               common_address, "常用地址")
+                _emit(progress_callback,
+                      f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
+                address = _address_from_record(address_record)
+                _emit(progress_callback,
+                      f"门店「{store_name}」与常用地址「{common_address}」就绪"
+                      f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
             if dry_run:
                 _emit(progress_callback, "【干跑模式】只组装报文，不真实提交")
 

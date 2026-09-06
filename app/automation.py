@@ -717,6 +717,28 @@ def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str
     return grouped
 
 
+def _filter_rows_by_date(rows: list[dict[str, Any]], selected_date: _dt.date) -> list[dict[str, Any]]:
+    """先按目标日期筛选订单，避免在遍历 W 编号时再逐单判断日期。"""
+    return [row for row in rows if row.get("date") == selected_date]
+
+
+def _order_numbers_for_date(rows_by_pick: dict[str, list[dict[str, Any]]],
+                            order_count: int | None = None) -> list[int]:
+    """返回需要处理的 W 编号列表（从大到小）。
+
+    ``order_count`` 为空时返回目标日期全部存在的 W 编号；
+    有值时只返回不超过 ``order_count`` 且当天实际存在的编号。
+    """
+    numbers = sorted(
+        (int(code[1:]) for code in rows_by_pick
+         if code.startswith("W") and code[1:].isdigit()),
+        reverse=True,
+    )
+    if order_count:
+        numbers = [n for n in numbers if n <= order_count]
+    return numbers
+
+
 def _order_detail_by_id(api_get: Callable[[str], dict[str, Any]],
                          code: str, order_id: str, store_id: str) -> OrderInfo | None:
     """直接从详情接口读取订单，偶发失败自动重试一次。"""
@@ -804,12 +826,15 @@ def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | N
     return None
 
 
-def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
+def run_job(config: Any, order_count: int | None, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
             order_decision_callback: Callable[[str, str], str] | None = None,
             save_decision_callback: Callable[[str], str] | None = None,
             locators: dict[str, Any] | None = None,
             target_date: object = None) -> dict[str, int]:
-    """Process the newest W orders and append their meals to the workbook."""
+    """Process the newest W orders and append their meals to the workbook.
+
+    ``order_count`` 为空或 0 时表示自动处理目标日期当天的全部订单。
+    """
     configured_excel = getattr(config, "excel_path", None)
     if not configured_excel:
         raise FileNotFoundError("尚未选择 Excel 文件")
@@ -818,8 +843,6 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
         raise FileNotFoundError(f"Excel 文件不存在: {excel_path}")
     if excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise ValueError("仅支持 .xlsx 和 .xlsm Excel 文件")
-    if order_count < 1:
-        raise ValueError("order_count 必须大于等于 1")
     selected_date = parse_target_date(
         target_date if target_date is not None else getattr(config, "order_date", "")
     )
@@ -841,24 +864,26 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
         nonlocal processed, found
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback)
-        rows_by_pick = _group_orders_by_pick(rows)
-        for number in range(order_count, 0, -1):
+        # 先按目标日期筛选，再遍历当天实际存在的订单，避免先遍历全部 W 编号。
+        rows_by_pick = _group_orders_by_pick(_filter_rows_by_date(rows, selected_date))
+        numbers = _order_numbers_for_date(rows_by_pick, order_count)
+        if not numbers:
+            _emit(progress_callback,
+                  f"目标日期 {selected_date.isoformat()} 没有找到订单，未写入 Excel")
+        elif order_count:
+            _emit(progress_callback,
+                  f"已按目标日期筛选，共 {len(numbers)} 个订单待处理："
+                  + "、".join(f"W{n}" for n in numbers))
+        else:
+            _emit(progress_callback,
+                  f"留空模式：自动识别目标日期订单，共 {len(numbers)} 个："
+                  + "、".join(f"W{n}" for n in numbers))
+        for number in numbers:
             if stop_event.is_set():
                 break
             code = f"W{number}"
             order: OrderInfo | None = None
-            entries = rows_by_pick.get(code, [])
-            candidates = [e for e in entries if e["date"] == selected_date]
-            if not candidates:
-                if entries:
-                    dates = "、".join(sorted({e["date"].isoformat() for e in entries if e["date"]}))
-                    _emit(progress_callback,
-                          f"{code} 只有 {dates} 的订单，没有 {selected_date.isoformat()} 的订单，未写入 Excel")
-                else:
-                    _emit(progress_callback, f"{code} 不在订单列表中，未写入 Excel")
-                processed += 1
-                _emit(progress_callback, "-------")
-                continue
+            candidates = list(rows_by_pick.get(code, []))
             while candidates and not stop_event.is_set():
                 entry = candidates.pop(0)
                 try:

@@ -139,3 +139,34 @@ def test_group_orders_by_pick_groups_repeated_pick_numbers_across_days():
     grouped = _group_orders_by_pick(rows)
     assert [r["order_id"] for r in grouped["W2"]] == ["30", "7"]
     assert [r["order_id"] for r in grouped["W1"]] == ["6"]
+
+
+def test_filter_rows_by_date_keeps_only_target_date():
+    from app.automation import _filter_rows_by_date
+
+    target = dt.date(2026, 9, 7)
+    rows = [
+        {"order_id": "1", "pick_no": "W8", "date": target},
+        {"order_id": "2", "pick_no": "W7", "date": dt.date(2026, 9, 6)},
+        {"order_id": "3", "pick_no": "W3", "date": target},
+        {"order_id": "4", "pick_no": "W1", "date": None},
+    ]
+    filtered = _filter_rows_by_date(rows, target)
+    assert [r["order_id"] for r in filtered] == ["1", "3"]
+
+
+def test_order_numbers_for_date_returns_descending_existing_numbers():
+    from app.automation import _order_numbers_for_date
+
+    rows_by_pick = {
+        "W8": [{"order_id": "1", "date": dt.date(2026, 9, 7)}],
+        "W3": [{"order_id": "2", "date": dt.date(2026, 9, 7)}],
+        "W1": [{"order_id": "3", "date": dt.date(2026, 9, 7)}],
+    }
+    # 留空/0 表示全部
+    assert _order_numbers_for_date(rows_by_pick, None) == [8, 3, 1]
+    assert _order_numbers_for_date(rows_by_pick, 0) == [8, 3, 1]
+    # 指定数量时只保留当天存在且不超过该编号的
+    assert _order_numbers_for_date(rows_by_pick, 3) == [3, 1]
+    # 没有订单时为空
+    assert _order_numbers_for_date({}, None) == []

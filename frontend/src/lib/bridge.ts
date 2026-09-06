@@ -35,6 +35,11 @@ export interface AppConfigState {
   sss_excel_path: string
   sss_product_name: string
   sss_common_address: string
+  sss_use_fixed_address: boolean
+  sss_fixed_lnt: number
+  sss_fixed_lat: number
+  sss_fixed_area_code: string
+  sss_fixed_address_detail: string
   api_mode: boolean
 }
 
@@ -113,6 +118,11 @@ export interface SssFormPayload {
   excel: string
   product_name: string
   common_address: string
+  use_fixed_address: boolean
+  fixed_lnt: string
+  fixed_lat: string
+  fixed_area_code: string
+  fixed_address_detail: string
   remember: boolean
   api_mode: boolean
 }
@@ -256,6 +266,11 @@ function mockState(): AppState {
       sss_excel_path: '/home/zimu/文档/闪时送.xlsx',
       sss_product_name: '轻食',
       sss_common_address: '嗯哼',
+      sss_use_fixed_address: true,
+      sss_fixed_lnt: 119.728224,
+      sss_fixed_lat: 30.256632,
+      sss_fixed_area_code: '330110',
+      sss_fixed_address_detail: '浙江农林大学东湖校区',
       api_mode: true,
     },
     passwords: { order: '', sss: '' },

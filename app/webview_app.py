@@ -14,6 +14,7 @@ import logging
 from pathlib import Path
 
 from .bridge import Bridge
+from .config import user_data_dir
 
 WINDOW_TITLE = "一口轻食 - 订单处理"
 logger = logging.getLogger(__name__)
@@ -92,7 +93,13 @@ def run() -> None:
     bridge.attach(window)
     window.events.closing += bridge.on_native_closing
     try:
-        webview.start(debug=debug)
+        webview.start(
+            debug=debug,
+            # 关闭私有模式：让 localStorage / cookie 持久化，否则每次重启
+            # 主题等本地设置都会回到默认浅色。
+            private_mode=False,
+            storage_path=str(user_data_dir() / "webview"),
+        )
     except Exception as exc:
         if sys.platform.startswith("linux"):
             raise RuntimeError("Linux WebView 启动失败：GTK/WebKitGTK 初始化或渲染进程异常。") from exc

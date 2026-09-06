@@ -2,7 +2,7 @@
  * 自绘标题栏：印章 Logo + 宋体产品名 + 版本徽章 + 主题切换 + 窗口控制。
  * `.pywebview-drag-region` 供 pywebview frameless 拖拽。
  */
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Minus, Moon, Square, Sun, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -17,6 +17,12 @@ function windowAction(action: 'minimize' | 'toggle_maximize') {
 export function TitleBar() {
   const { version, mocked, requestClose } = useApp()
   const [theme, setTheme] = useState<Theme>(initialTheme)
+
+  // 启动时把持久化的主题真正应用上去（仅保存状态不会切换 .dark 类）。
+  useEffect(() => {
+    applyTheme(theme)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   function toggleTheme() {
     const next: Theme = theme === 'light' ? 'dark' : 'light'

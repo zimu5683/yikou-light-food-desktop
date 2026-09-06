@@ -86,31 +86,52 @@ export function GhostButton({
   )
 }
 
-/** 数字步进器：1~9999，样式对齐 mock（左右 − ＋，中间等宽数字） */
+/** 数字步进器：可留空（留空表示“全部”），左右 − ＋，中间等宽数字 */
 export function Stepper({
   value,
   onChange,
   min = 1,
   max = 9999,
   invalid,
+  allowEmpty = true,
 }: {
-  value: number
-  onChange: (v: number) => void
+  value: number | null
+  onChange: (v: number | null) => void
   min?: number
   max?: number
   invalid?: boolean
+  allowEmpty?: boolean
 }) {
   // 草稿态：输入时允许任意内容（含清空），失焦或按按钮时才提交并钳位。
   const [draft, setDraft] = useState<string | null>(null)
   const clamp = (v: number) => Math.min(max, Math.max(min, Math.trunc(v) || min))
   const commit = (raw: string) => {
     const parsed = Number.parseInt(raw, 10)
-    onChange(clamp(Number.isNaN(parsed) ? min : parsed))
+    if ((raw.trim() === '' || Number.isNaN(parsed)) && allowEmpty) {
+      onChange(null)
+    } else {
+      onChange(clamp(Number.isNaN(parsed) ? min : parsed))
+    }
     setDraft(null)
   }
   const step = (delta: number) => {
-    const base = draft !== null ? Number.parseInt(draft, 10) || min : value
-    onChange(clamp(base + delta))
+    const base = draft !== null ? Number.parseInt(draft, 10) : value
+    if (delta < 0 && (base === null || base === undefined || Number.isNaN(base))) {
+      onChange(null)
+      setDraft(null)
+      return
+    }
+    const numeric = base && !Number.isNaN(base) ? base : min
+    let next: number | null
+    if (base === null || base === undefined || Number.isNaN(base)) {
+      // 留空时按 +：回到最小值（1），而不是跳到 2。
+      next = delta > 0 ? min : null
+    } else if (delta < 0 && allowEmpty && numeric <= min) {
+      next = null
+    } else {
+      next = clamp(numeric + delta)
+    }
+    onChange(next)
     setDraft(null)
   }
   return (
@@ -132,11 +153,12 @@ export function Stepper({
         aria-label="待处理订单数"
         inputMode="numeric"
         className="tabular h-[34px] w-11 border-x bg-transparent text-center font-mono text-[13px] outline-none"
-        value={draft ?? String(value)}
+        value={draft ?? (value === null ? '' : String(value))}
         onChange={(e) => {
           const raw = e.target.value.replace(/[^0-9]/g, '').slice(0, 4)
           setDraft(raw)
           if (raw !== '') onChange(clamp(Number.parseInt(raw, 10)))
+          else if (allowEmpty) onChange(null)
         }}
         onBlur={() => {
           if (draft !== null) commit(draft)

@@ -62,6 +62,12 @@ class AppConfig:
     sss_product_name: str = "轻食"
     sss_common_address: str = "嗯哼"
     sss_store_name: str = "一口轻食"
+    # 固定地址模式：跳过常用地址匹配，直接用以下坐标/地区/详细地址下单。
+    sss_use_fixed_address: bool = True
+    sss_fixed_lnt: float = 119.728224
+    sss_fixed_lat: float = 30.256632
+    sss_fixed_area_code: str = "330110"
+    sss_fixed_address_detail: str = "浙江农林大学东湖校区"
     # 干跑模式：只组装并打印下单报文，不真实提交（用于验证流程）。
     sss_dry_run: bool = False
     config_path: Optional[str] = None
@@ -79,6 +85,11 @@ class AppConfig:
                  sss_product_name: str = "轻食",
                  sss_common_address: str = "嗯哼",
                  sss_store_name: str = "一口轻食",
+                 sss_use_fixed_address: bool = True,
+                 sss_fixed_lnt: float = 119.728224,
+                 sss_fixed_lat: float = 30.256632,
+                 sss_fixed_area_code: str = "330110",
+                 sss_fixed_address_detail: str = "浙江农林大学东湖校区",
                  sss_dry_run: bool = False,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
@@ -107,6 +118,11 @@ class AppConfig:
         self.sss_product_name = sss_product_name or "轻食"
         self.sss_common_address = sss_common_address or "嗯哼"
         self.sss_store_name = sss_store_name or "一口轻食"
+        self.sss_use_fixed_address = bool(sss_use_fixed_address)
+        self.sss_fixed_lnt = float(sss_fixed_lnt)
+        self.sss_fixed_lat = float(sss_fixed_lat)
+        self.sss_fixed_area_code = sss_fixed_area_code or "330110"
+        self.sss_fixed_address_detail = sss_fixed_address_detail or "浙江农林大学东湖校区"
         self.sss_dry_run = bool(sss_dry_run)
         self.config_path = config_path
 

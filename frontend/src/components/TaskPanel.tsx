@@ -96,7 +96,7 @@ function OrderForm() {
   const [password, setPassword] = useState('')
   const [excel, setExcel] = useState('')
   const [date, setDate] = useState('')
-  const [count, setCount] = useState(1)
+  const [count, setCount] = useState<number | null>(null)
   const [remember, setRemember] = useState(true)
   const [apiMode, setApiMode] = useState(true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
@@ -123,7 +123,7 @@ function OrderForm() {
     setBusy(true)
     setFields(null)
     try {
-      const payload: OrderFormPayload = { url, phone, password, excel, date, count: String(count), remember, api_mode: apiMode }
+      const payload: OrderFormPayload = { url, phone, password, excel, date, count: count === null ? '' : String(count), remember, api_mode: apiMode }
       const errors = await startOrder(payload)
       if (errors) setFields(errors)
     } finally {
@@ -194,6 +194,7 @@ function OrderForm() {
 
       <Field label="待处理订单数" error={modeError(fields, 'count')}>
         <Stepper value={count} onChange={setCount} invalid={Boolean(modeError(fields, 'count'))} />
+        <p className="mt-1 text-[11px] text-muted-foreground">留空=全部订单</p>
       </Field>
 
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
@@ -231,6 +232,11 @@ function SssForm() {
   const [excel, setExcel] = useState('')
   const [productName, setProductName] = useState('轻食')
   const [commonAddress, setCommonAddress] = useState('')
+  const [useFixedAddress, setUseFixedAddress] = useState(true)
+  const [fixedLnt, setFixedLnt] = useState('119.728224')
+  const [fixedLat, setFixedLat] = useState('30.256632')
+  const [fixedAreaCode, setFixedAreaCode] = useState('330110')
+  const [fixedAddressDetail, setFixedAddressDetail] = useState('浙江农林大学东湖校区')
   const [remember, setRemember] = useState(true)
   const [apiMode, setApiMode] = useState(true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
@@ -244,6 +250,11 @@ function SssForm() {
       setExcel(config.sss_excel_path)
       setProductName(config.sss_product_name)
       setCommonAddress(config.sss_common_address)
+      setUseFixedAddress(config.sss_use_fixed_address)
+      setFixedLnt(String(config.sss_fixed_lnt))
+      setFixedLat(String(config.sss_fixed_lat))
+      setFixedAreaCode(config.sss_fixed_area_code)
+      setFixedAddressDetail(config.sss_fixed_address_detail)
       setPassword(passwords.sss)
       setApiMode(config.api_mode)
       setLoaded(true)
@@ -258,7 +269,21 @@ function SssForm() {
     setBusy(true)
     setFields(null)
     try {
-      const payload: SssFormPayload = { url, account, password, excel, product_name: productName, common_address: commonAddress, remember, api_mode: apiMode }
+      const payload: SssFormPayload = {
+        url,
+        account,
+        password,
+        excel,
+        product_name: productName,
+        common_address: commonAddress,
+        use_fixed_address: useFixedAddress,
+        fixed_lnt: fixedLnt,
+        fixed_lat: fixedLat,
+        fixed_area_code: fixedAreaCode,
+        fixed_address_detail: fixedAddressDetail,
+        remember,
+        api_mode: apiMode,
+      }
       const errors = await startSss(payload)
       if (errors) setFields(errors)
     } finally {
@@ -325,14 +350,6 @@ function SssForm() {
           id="sss-product"
           value={productName}
           onChange={(e) => setProductName(e.target.value)}
-        />
-      </Field>
-
-      <Field label="常用地址" htmlFor="sss-address" helper="下单时选择的常用地址">
-        <TextInput
-          id="sss-address"
-          value={commonAddress}
-          onChange={(e) => setCommonAddress(e.target.value)}
         />
       </Field>
 

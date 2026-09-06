@@ -136,3 +136,37 @@ def test_address_from_record_reads_real_frequent_address_fields():
     addr = sss._address_from_record(record)
     assert addr == {"lnt": 119.728224, "lat": 30.256632,
                     "areaCode": "330110", "addressDetail": "浙江农林大学东湖校区"}
+
+
+def test_fixed_address_from_config_reads_config():
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        sss_fixed_lnt="119.728224",
+        sss_fixed_lat="30.256632",
+        sss_fixed_area_code="330110",
+        sss_fixed_address_detail="浙江农林大学东湖校区",
+    )
+    assert sss._fixed_address_from_config(cfg) == {
+        "lnt": 119.728224,
+        "lat": 30.256632,
+        "areaCode": "330110",
+        "addressDetail": "浙江农林大学东湖校区",
+    }
+
+
+def test_fixed_address_from_config_missing_coords_raises():
+    from types import SimpleNamespace
+
+    cfg = SimpleNamespace(
+        sss_fixed_lnt=None,
+        sss_fixed_lat=None,
+        sss_fixed_area_code="330110",
+        sss_fixed_address_detail="浙江农林大学东湖校区",
+    )
+    try:
+        sss._fixed_address_from_config(cfg)
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("缺少经纬度时应抛出 LookupError")

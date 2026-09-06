@@ -132,6 +132,11 @@ class Bridge:
                 "sss_excel_path": str(config.sss_excel_path) if config.sss_excel_path else "",
                 "sss_product_name": config.sss_product_name,
                 "sss_common_address": config.sss_common_address,
+                "sss_use_fixed_address": config.sss_use_fixed_address,
+                "sss_fixed_lnt": config.sss_fixed_lnt,
+                "sss_fixed_lat": config.sss_fixed_lat,
+                "sss_fixed_area_code": config.sss_fixed_area_code,
+                "sss_fixed_address_detail": config.sss_fixed_address_detail,
                 "api_mode": config.api_mode,
             },
             # 与旧 GUI 启动行为一致：按账号从系统凭据管理器读回密码。
@@ -152,12 +157,15 @@ class Bridge:
         password = str(payload.get("password", ""))
         excel = str(payload.get("excel", "")).strip()
         date_text = str(payload.get("date", "")).strip()
-        try:
-            count = int(str(payload.get("count", "0")))
-        except (TypeError, ValueError):
-            count = 0
-        if not 1 <= count <= MAX_ORDER_COUNT:
-            fields["count"] = {"message": f"请输入 1～{MAX_ORDER_COUNT} 的整数"}
+        count_text = str(payload.get("count", "")).strip()
+        count: int | None = None
+        if count_text:
+            try:
+                count = int(count_text)
+            except (TypeError, ValueError):
+                count = 0
+            if not 1 <= count <= MAX_ORDER_COUNT:
+                fields["count"] = {"message": f"请输入 1～{MAX_ORDER_COUNT} 的整数，或留空处理全部"}
         if not url:
             fields["url"] = {"message": "请输入管理网址"}
         if not phone:
@@ -199,6 +207,24 @@ class Bridge:
         excel_error = _excel_field_error(excel)
         if excel_error:
             fields["excel"] = {"message": excel_error}
+        use_fixed_address = bool(payload.get("use_fixed_address", False))
+        fixed_lnt = str(payload.get("fixed_lnt", "")).strip()
+        fixed_lat = str(payload.get("fixed_lat", "")).strip()
+        fixed_area_code = str(payload.get("fixed_area_code", "")).strip()
+        fixed_address_detail = str(payload.get("fixed_address_detail", "")).strip()
+        if use_fixed_address:
+            try:
+                float(fixed_lnt)
+            except (TypeError, ValueError):
+                fields["fixed_lnt"] = {"message": "请输入有效的经度"}
+            try:
+                float(fixed_lat)
+            except (TypeError, ValueError):
+                fields["fixed_lat"] = {"message": "请输入有效的纬度"}
+            if not fixed_area_code:
+                fields["fixed_area_code"] = {"message": "请输入地区编码"}
+            if not fixed_address_detail:
+                fields["fixed_address_detail"] = {"message": "请输入详细地址"}
         if fields:
             self._set_status("error")
             return {"ok": False, "fields": fields}
@@ -207,6 +233,11 @@ class Bridge:
             sss_url=url, sss_account=account, sss_excel_path=excel,
             sss_product_name=str(payload.get("product_name", "轻食")).strip() or "轻食",
             sss_common_address=str(payload.get("common_address", "")).strip(),
+            sss_use_fixed_address=use_fixed_address,
+            sss_fixed_lnt=float(fixed_lnt) if use_fixed_address and fixed_lnt else 119.728224,
+            sss_fixed_lat=float(fixed_lat) if use_fixed_address and fixed_lat else 30.256632,
+            sss_fixed_area_code=fixed_area_code or "330110",
+            sss_fixed_address_detail=fixed_address_detail or "浙江农林大学东湖校区",
             # dry_run：只组装并打印下单报文，不真实提交（联调/验收用）。
             sss_dry_run=bool(payload.get("dry_run", False)),
             browser_mode="auto",
@@ -227,7 +258,7 @@ class Bridge:
         self._worker = threading.Thread(target=target, args=args, daemon=True)
         self._worker.start()
 
-    def _run_order(self, config: AppConfig, count: int, password: str) -> None:
+    def _run_order(self, config: AppConfig, count: int | None, password: str) -> None:
         try:
             result = run_job(config, count, self._stop_event, lambda msg: self.log(msg), password=password,
                              order_decision_callback=self._order_decision,
