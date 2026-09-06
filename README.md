@@ -43,7 +43,7 @@ python run.py
 
 ## Linux 构建
 
-普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建）。Linux 版本使用系统 GTK 3 + WebKitGTK 4.0/4.1 作为 pywebview 渲染内核；Ubuntu/Debian 通常需要先安装对应运行库：
+普通用户可在 GitHub [Releases](https://github.com/zimu5683/yikou-light-food-desktop/releases/latest) 页面下载 `yikou-light-food-linux-x64.tar.gz`（x86_64 发行版，基于 glibc 2.35 构建）。Linux 版本使用系统 GTK 3 + WebKitGTK 4.0/4.1 作为 pywebview 渲染内核；Ubuntu/Debian 通常需要先安装对应运行库。从 v3.0.2 起，Linux 打包不再捆绑 GTK/GLib/C++ 运行库，运行时直接使用当前系统的对应库，避免在新版发行版上因捆绑旧库导致 WebKit 启动失败：
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1

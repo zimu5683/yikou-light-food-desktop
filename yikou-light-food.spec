@@ -51,6 +51,76 @@ for _toc in ("datas", "binaries"):
         entry for entry in getattr(analysis, _toc)
         if ".local-browsers" not in str(entry[0]) and ".local-browsers" not in str(entry[1])
     ])
+
+# Linux 版本依赖系统 GTK/WebKitGTK/GLib。PyInstaller 会把构建机上的整套
+# GTK/Glib/C++ 运行库也收进单文件包里；当用户发行版比构建机新时，包内旧版
+# libstdc++/libglib/libmount 等会遮蔽系统新库，导致 WebKitGTK 初始化失败
+# （例如 CXXABI_1.3.15 not found）。这里在 Linux 上把这些系统库从包中去掉，
+# 让程序运行时始终使用当前系统的 GTK/WebKitGTK/GLib，而不是捆绑的旧副本。
+if sys.platform.startswith("linux"):
+    _LINUX_SYSTEM_LIB_NAMES = {
+        # C/C++ runtime
+        "libstdc++.so.6",
+        "libgcc_s.so.1",
+        # GLib/GObject/GIO/ introspection
+        "libglib-2.0.so.0",
+        "libgobject-2.0.so.0",
+        "libgio-2.0.so.0",
+        "libgmodule-2.0.so.0",
+        "libgirepository-1.0.so.1",
+        "libmount.so.1",
+        "libblkid.so.1",
+        "libuuid.so.1",
+        "libselinux.so.1",
+        # GTK 3 / GDK / Pango / Cairo stack
+        "libgtk-3.so.0",
+        "libgdk-3.so.0",
+        "libgdk_pixbuf-2.0.so.0",
+        "libatk-1.0.so.0",
+        "libatk-bridge-2.0.so.0",
+        "libatspi.so.0",
+        "libcairo.so.2",
+        "libcairo-gobject.so.2",
+        "libpango-1.0.so.0",
+        "libpangocairo-1.0.so.0",
+        "libpangoft2-1.0.so.0",
+        "libepoxy.so.0",
+        "libharfbuzz.so.0",
+        "libfontconfig.so.1",
+        "libfreetype.so.6",
+        "libfribidi.so.0",
+        "libpixman-1.so.0",
+        "libpng16.so.16",
+        "libjpeg.so.8",
+        "libtiff.so.5",
+        "libwebp.so.7",
+        "librsvg-2.so.2",
+        # ICU: 避免包内 Ubuntu 22.04 的 ICU 70 遮蔽新版系统 ICU
+        "libicudata.so.70",
+        "libicuuc.so.70",
+        # 其它 GLib/GTK 常见依赖
+        "libpcre.so.3",
+        "libpcre2-8.so.0",
+        "libffi.so.8",
+        "libxml2.so.2",
+    }
+    _LINUX_SYSTEM_LIB_DIR_PREFIXES = (
+        "gio_modules/",
+        "lib/gdk-pixbuf/",
+    )
+
+    def _use_system_linux_lib(entry: tuple) -> bool:
+        dest = str(entry[0])
+        name = Path(dest).name
+        if dest.startswith(_LINUX_SYSTEM_LIB_DIR_PREFIXES):
+            return False
+        if name in _LINUX_SYSTEM_LIB_NAMES:
+            return False
+        return True
+
+    analysis.binaries = [
+        entry for entry in analysis.binaries if _use_system_linux_lib(entry)
+    ]
 pyz = PYZ(analysis.pure)
 exe = EXE(
     pyz,
