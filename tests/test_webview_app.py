@@ -3,10 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+import pytest
+
 from app.webview_app import _frontend_target
 
 
 def test_production_frontend_uses_file_uri() -> None:
+    dist_index = Path(__file__).resolve().parent.parent / "frontend" / "dist" / "index.html"
+    if not dist_index.is_file():
+        # Tests 工作流不构建前端（release 工作流才构建）；无产物时跳过。
+        pytest.skip("frontend/dist/index.html 尚未构建")
     target, debug = _frontend_target()
 
     assert debug is False

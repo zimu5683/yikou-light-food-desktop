@@ -187,11 +187,17 @@ jobs:
   # distributions than ubuntu-latest would.
   build-linux:
     runs-on: ubuntu-22.04
+    env:
+      # Build with the system interpreter: PyGObject (gi) comes from apt and
+      # is compiled against it; setup-python interpreters cannot import it.
+      PYTHON_BIN: python3
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
+      - name: Install GTK/WebKitGTK bindings for pywebview
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-gi python3-pip \
+            gir1.2-gtk-3.0 gir1.2-webkit2-4.1 libwebkit2gtk-4.1-0
       - uses: pnpm/action-setup@v4
         with:
           version: 11
