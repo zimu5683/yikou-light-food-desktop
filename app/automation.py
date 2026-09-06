@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -35,9 +36,11 @@ except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     )
 
 try:
+    from .api_client import AdminApiClient
     from .config import user_data_dir
     from .locators import DEFAULT_LOCATORS, load_locators
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
+    from api_client import AdminApiClient
     from config import user_data_dir
     from locators import DEFAULT_LOCATORS, load_locators
 
@@ -668,18 +671,18 @@ def _api_get_json(page: Any, path: str) -> dict[str, Any]:
     return payload
 
 
-def _api_list_waimai_orders(page: Any, selected_date: _dt.date,
+def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
+                            selected_date: _dt.date,
                             callback: Callable[[str], Any] | None = None,
                             page_size: int = 50, max_pages: int = 200) -> list[dict[str, Any]]:
     """分页拉取外送订单（scene=1，新单在前），整页早于目标日期即停。
 
-    站点 DOM 列表在程序化访问下会被弹回 #/home、表格随机渲染为空，而该
-    接口返回完整数据；取单号跨天重复，日期过滤由调用侧完成。
+    ``api_get`` 接收接口路径并返回解析后的 JSON，支持浏览器会话内 fetch
+    或纯接口 HTTP 客户端两种实现。
     """
     rows: list[dict[str, Any]] = []
     for page_no in range(1, max_pages + 1):
-        payload = _api_get_json(
-            page,
+        payload = api_get(
             "/channel/order?scene=1&storeId=&orderSn=&userKeyword=&state=&payType=&source="
             f"&pageNo={page_no}&pageSize={page_size}&startTime=&endTime=",
         )
@@ -714,13 +717,14 @@ def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str
     return grouped
 
 
-def _order_detail_by_id(page: Any, code: str, order_id: str, store_id: str) -> OrderInfo | None:
+def _order_detail_by_id(api_get: Callable[[str], dict[str, Any]],
+                         code: str, order_id: str, store_id: str) -> OrderInfo | None:
     """直接从详情接口读取订单，偶发失败自动重试一次。"""
     for attempt in range(2):
         try:
-            payload = _api_get_json(page, f"/channel/order/{order_id}?storeId={store_id}")
+            payload = api_get(f"/channel/order/{order_id}?storeId={store_id}")
             data = payload.get("data")
-        except RuntimeError:
+        except Exception:
             data = None
         if isinstance(data, dict):
             order = _order_from_api_data(code, data)
@@ -728,7 +732,7 @@ def _order_detail_by_id(page: Any, code: str, order_id: str, store_id: str) -> O
                 order.metadata["order_id"] = order_id
                 return order
         if attempt == 0:
-            page.wait_for_timeout(1000)
+            time.sleep(1)
     return None
 
 
@@ -824,10 +828,7 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
         password = getattr(config, "password", "")
     if locators is None:
         locators = load_locators()
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
+    api_mode = bool(getattr(config, "api_mode", True))
     backup_dir = excel_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
     stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -837,95 +838,116 @@ def run_job(config: Any, order_count: int, stop_event: Any, progress_callback: C
     processed = 0
     found = 0
     timeout = int(getattr(config, "element_timeout_ms", 8000))
-    try:
-        with sync_playwright() as playwright:
-            browser = _launch_browser(playwright, getattr(config, "browser_mode", "auto"), bool(getattr(config, "headless", False)))
-            page = browser.new_page()
-            try:
-                _emit(progress_callback, "正在登录...")
-                page.goto(getattr(config, "target_url", getattr(config, "url", "")), timeout=timeout, wait_until="networkidle")
-
-                account_input, _ = _find_by_candidates(page, _locator_step(locators, "login_account_input"), timeout)
-                if account_input is None:
-                    raise _locator_failure(page, "账号输入框")
-                account_input.fill(getattr(config, "phone_number", getattr(config, "phone", "")))
-
-                password_input, _ = _find_by_candidates(page, _locator_step(locators, "login_password_input"), timeout)
-                if password_input is None:
-                    raise _locator_failure(page, "密码输入框")
-                password_input.fill(password or "")
-
-                submit, _ = _find_by_candidates(page, _locator_step(locators, "login_submit"), timeout)
-                if submit is None:
-                    raise _locator_failure(page, "登录按钮")
-                submit.click(timeout=timeout)
-                login_step = _locator_step(locators, "登录成功")
-                page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
-
-                # 站点 SPA 在程序化操作节奏下会把页面弹回 #/home、把已渲染
-                # 的表格随机清空（2026-09-05 实测：接口返回 6150 笔订单而
-                # DOM 表格为 0 行），因此列表与详情一律直接走后端接口，
-                # 界面只负责登录与产生会话 token。
-                _emit(progress_callback, "登录成功，开始处理订单")
-                rows = _api_list_waimai_orders(page, selected_date, progress_callback)
-                rows_by_pick = _group_orders_by_pick(rows)
-                for number in range(order_count, 0, -1):
-                    if stop_event.is_set():
-                        break
-                    code = f"W{number}"
-                    order: OrderInfo | None = None
-                    entries = rows_by_pick.get(code, [])
-                    candidates = [e for e in entries if e["date"] == selected_date]
-                    if not candidates:
-                        if entries:
-                            dates = "、".join(sorted({e["date"].isoformat() for e in entries if e["date"]}))
-                            _emit(progress_callback,
-                                  f"{code} 只有 {dates} 的订单，没有 {selected_date.isoformat()} 的订单，未写入 Excel")
-                        else:
-                            _emit(progress_callback, f"{code} 不在订单列表中，未写入 Excel")
-                        processed += 1
-                        _emit(progress_callback, "-------")
-                        continue
-                    while candidates and not stop_event.is_set():
-                        entry = candidates.pop(0)
-                        try:
-                            order = _order_detail_by_id(page, code, entry["order_id"], entry["store_id"])
-                            if order is None:
-                                raise LookupError(
-                                    f"订单 {code}（接口编号 {entry['order_id']}）未读到姓名/电话/地址/餐品")
-                        except Exception as exc:
-                            _emit(progress_callback, f"{code} 处理失败：{exc}")
-                            decision = "skip"
-                            if order_decision_callback:
-                                decision = order_decision_callback(code, str(exc)).lower()
-                            if decision == "retry":
-                                _emit(progress_callback, f"重试 {code}")
-                                candidates.insert(0, entry)
-                                continue
-                            if decision == "stop":
-                                _emit(progress_callback, f"{code} 已选择停止，本轮结束")
-                                stop_event.set()
-                                break
-                            _emit(progress_callback, f"{code} 未找到，跳过")
-                            order = None
-                            break
-                        break
-                    if stop_event.is_set():
-                        break
-                    processed += 1
+    def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
+        nonlocal processed, found
+        rows = _api_list_waimai_orders(api_get, selected_date, progress_callback)
+        rows_by_pick = _group_orders_by_pick(rows)
+        for number in range(order_count, 0, -1):
+            if stop_event.is_set():
+                break
+            code = f"W{number}"
+            order: OrderInfo | None = None
+            entries = rows_by_pick.get(code, [])
+            candidates = [e for e in entries if e["date"] == selected_date]
+            if not candidates:
+                if entries:
+                    dates = "、".join(sorted({e["date"].isoformat() for e in entries if e["date"]}))
+                    _emit(progress_callback,
+                          f"{code} 只有 {dates} 的订单，没有 {selected_date.isoformat()} 的订单，未写入 Excel")
+                else:
+                    _emit(progress_callback, f"{code} 不在订单列表中，未写入 Excel")
+                processed += 1
+                _emit(progress_callback, "-------")
+                continue
+            while candidates and not stop_event.is_set():
+                entry = candidates.pop(0)
+                try:
+                    order = _order_detail_by_id(api_get, code, entry["order_id"], entry["store_id"])
                     if order is None:
-                        _emit(progress_callback, "-------")
+                        raise LookupError(
+                            f"订单 {code}（接口编号 {entry['order_id']}）未读到姓名/电话/地址/餐品")
+                except Exception as exc:
+                    _emit(progress_callback, f"{code} 处理失败：{exc}")
+                    decision = "skip"
+                    if order_decision_callback:
+                        decision = order_decision_callback(code, str(exc)).lower()
+                    if decision == "retry":
+                        _emit(progress_callback, f"重试 {code}")
+                        candidates.insert(0, entry)
                         continue
-                    for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
-                        for meal in meals:
-                            for _ in range(max(1, meal.count)):
-                                _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
-                    meal_text = _format_order_meals(order)
-                    _emit(progress_callback, _format_order_summary(order, meal_text))
-                    found += 1
-                    _emit(progress_callback, "-------")
-            finally:
-                browser.close()
+                    if decision == "stop":
+                        _emit(progress_callback, f"{code} 已选择停止，本轮结束")
+                        stop_event.set()
+                        break
+                    _emit(progress_callback, f"{code} 未找到，跳过")
+                    order = None
+                    break
+                break
+            if stop_event.is_set():
+                break
+            processed += 1
+            if order is None:
+                _emit(progress_callback, "-------")
+                continue
+            for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
+                for meal in meals:
+                    for _ in range(max(1, meal.count)):
+                        _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
+            meal_text = _format_order_meals(order)
+            _emit(progress_callback, _format_order_summary(order, meal_text))
+            found += 1
+            _emit(progress_callback, "-------")
+
+    try:
+        if api_mode:
+            _emit(progress_callback, "正在通过接口登录管理后台…")
+            client = AdminApiClient(
+                str(getattr(config, "target_url", getattr(config, "url", ""))),
+                str(getattr(config, "phone_number", getattr(config, "phone", "")) or ""),
+                password or "",
+            )
+            client.login()
+            _emit(progress_callback, "登录成功，开始处理订单")
+
+            process_orders(client.get_json)
+        else:
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError as exc:
+                raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
+
+            with sync_playwright() as playwright:
+                browser = _launch_browser(playwright, getattr(config, "browser_mode", "auto"), bool(getattr(config, "headless", False)))
+                page = browser.new_page()
+                try:
+                    _emit(progress_callback, "正在登录...")
+                    page.goto(getattr(config, "target_url", getattr(config, "url", "")), timeout=timeout, wait_until="networkidle")
+
+                    account_input, _ = _find_by_candidates(page, _locator_step(locators, "login_account_input"), timeout)
+                    if account_input is None:
+                        raise _locator_failure(page, "账号输入框")
+                    account_input.fill(getattr(config, "phone_number", getattr(config, "phone", "")))
+
+                    password_input, _ = _find_by_candidates(page, _locator_step(locators, "login_password_input"), timeout)
+                    if password_input is None:
+                        raise _locator_failure(page, "密码输入框")
+                    password_input.fill(password or "")
+
+                    submit, _ = _find_by_candidates(page, _locator_step(locators, "login_submit"), timeout)
+                    if submit is None:
+                        raise _locator_failure(page, "登录按钮")
+                    submit.click(timeout=timeout)
+                    login_step = _locator_step(locators, "登录成功")
+                    page.wait_for_url(str(login_step.get("wait_url") or "**/workbench/store"), timeout=timeout)
+
+                    # 站点 SPA 在程序化操作节奏下会把页面弹回 #/home、把已渲染
+                    # 的表格随机清空（2026-09-05 实测：接口返回 6150 笔订单而
+                    # DOM 表格为 0 行），因此列表与详情一律直接走后端接口，
+                    # 界面只负责登录与产生会话 token。
+                    _emit(progress_callback, "登录成功，开始处理订单")
+                    process_orders(lambda path: _api_get_json(page, path))
+                finally:
+                    browser.close()
         _save_workbook_with_retry(wb, excel_path, save_decision_callback)
     finally:
         wb.close()

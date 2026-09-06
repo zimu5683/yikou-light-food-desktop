@@ -62,6 +62,64 @@ export function DecisionDialog() {
   )
 }
 
+/** 闪时送图形验证码（纯接口模式）：在应用内显示验证码图片，不启动浏览器 */
+export function CaptchaDialog() {
+  const { captcha, resolveCaptcha } = useApp()
+  const [code, setCode] = useState('')
+  if (!captcha) return null
+  const current = captcha
+
+  function submit() {
+    resolveCaptcha(current.id, code.trim())
+    setCode('')
+  }
+
+  function cancel() {
+    resolveCaptcha(current.id, '')
+    setCode('')
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => { if (!open) cancel() }}>
+      <DialogContent className="max-w-sm rounded-lg">
+        <DialogHeader>
+          <DialogTitle className="font-serif">闪时送登录验证</DialogTitle>
+          <DialogDescription>
+            请输入图片中的验证码。验证码用于纯接口登录，不会弹出浏览器。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col items-center gap-3 py-2">
+          <img
+            src={`data:image/png;base64,${current.image}`}
+            alt="验证码"
+            className="h-24 rounded border border-border bg-card object-contain"
+          />
+          <input
+            autoFocus
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') submit() }}
+            placeholder="请输入验证码"
+            className="h-9 w-full rounded-[4px] border border-border bg-secondary px-3 text-center font-mono text-base tracking-[0.3em] outline-none focus:border-primary focus:ring-2 focus:ring-primary/30"
+          />
+        </div>
+        <DialogFooter className="gap-2">
+          <Button variant="ghost" className="h-8 text-xs" onClick={cancel}>
+            取消
+          </Button>
+          <Button
+            className="h-8 rounded-[6px] text-xs"
+            onClick={submit}
+            disabled={code.trim().length < 4}
+          >
+            确定
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 /** 发现新版本（对应旧版 askyesno「发现新版本」） */
 export function UpdateAvailableDialog() {
   const { available, setAvailable } = useUpdateAvailable()

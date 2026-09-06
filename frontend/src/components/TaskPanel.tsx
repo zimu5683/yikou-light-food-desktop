@@ -98,6 +98,7 @@ function OrderForm() {
   const [date, setDate] = useState('')
   const [count, setCount] = useState(1)
   const [remember, setRemember] = useState(true)
+  const [apiMode, setApiMode] = useState(true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -109,6 +110,7 @@ function OrderForm() {
       setExcel(config.excel_path)
       setDate(config.order_date)
       setPassword(passwords.order)
+      setApiMode(config.api_mode)
       setLoaded(true)
     }
   }, [config, passwords.order, loaded])
@@ -121,7 +123,7 @@ function OrderForm() {
     setBusy(true)
     setFields(null)
     try {
-      const payload: OrderFormPayload = { url, phone, password, excel, date, count: String(count), remember }
+      const payload: OrderFormPayload = { url, phone, password, excel, date, count: String(count), remember, api_mode: apiMode }
       const errors = await startOrder(payload)
       if (errors) setFields(errors)
     } finally {
@@ -199,6 +201,11 @@ function OrderForm() {
         <span>保存到系统凭据管理器</span>
       </div>
 
+      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+        <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
+        <span>纯接口模式（不启动浏览器）</span>
+      </div>
+
       <BottomDock>
         <ActionBar
           startLabel="开始处理"
@@ -225,6 +232,7 @@ function SssForm() {
   const [productName, setProductName] = useState('轻食')
   const [commonAddress, setCommonAddress] = useState('')
   const [remember, setRemember] = useState(true)
+  const [apiMode, setApiMode] = useState(true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
   const [loaded, setLoaded] = useState(false)
@@ -237,6 +245,7 @@ function SssForm() {
       setProductName(config.sss_product_name)
       setCommonAddress(config.sss_common_address)
       setPassword(passwords.sss)
+      setApiMode(config.api_mode)
       setLoaded(true)
     }
   }, [config, passwords.sss, loaded])
@@ -249,7 +258,7 @@ function SssForm() {
     setBusy(true)
     setFields(null)
     try {
-      const payload: SssFormPayload = { url, account, password, excel, product_name: productName, common_address: commonAddress, remember }
+      const payload: SssFormPayload = { url, account, password, excel, product_name: productName, common_address: commonAddress, remember, api_mode: apiMode }
       const errors = await startSss(payload)
       if (errors) setFields(errors)
     } finally {
@@ -330,6 +339,11 @@ function SssForm() {
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
         <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
         <span>保存到系统凭据管理器</span>
+      </div>
+
+      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+        <Switch checked={apiMode} onCheckedChange={setApiMode} aria-label="纯接口模式（不启动浏览器）" />
+        <span>纯接口模式（不启动浏览器）</span>
       </div>
 
       <BottomDock>

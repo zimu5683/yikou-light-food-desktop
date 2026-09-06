@@ -43,6 +43,8 @@ class AppConfig:
     excel_path: Path | None = None
     browser_mode: str = "auto"  # auto, msedge, chromium
     headless: bool = False
+    # 默认使用纯接口模式（不启动浏览器）；False 时退回 Playwright 浏览器模式。
+    api_mode: bool = True
     max_page_search: int = 20
     element_timeout_ms: int = 8000
     network_idle_timeout_ms: int = 5000
@@ -65,7 +67,7 @@ class AppConfig:
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
-                 excel_path: str | os.PathLike[str] = "", browser_mode: str = "auto", headless: bool = False,
+                 excel_path: str | os.PathLike[str] = "", browser_mode: str = "auto", headless: bool = False, api_mode: bool = True,
                  max_page_search: int = 20, element_timeout_ms: int = 8000,
                  network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
                  retry_wait_ms: int = 1000, order_search_attempts: int = 3,
@@ -90,6 +92,7 @@ class AppConfig:
         self.excel_path = Path(excel_path) if excel_path else None
         self.browser_mode = browser if browser is not None else browser_mode
         self.headless = headless
+        self.api_mode = bool(api_mode)
         self.max_page_search = max_page_search
         self.element_timeout_ms = element_timeout_ms
         self.network_idle_timeout_ms = network_idle_timeout_ms

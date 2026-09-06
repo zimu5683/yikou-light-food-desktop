@@ -35,6 +35,7 @@ export interface AppConfigState {
   sss_excel_path: string
   sss_product_name: string
   sss_common_address: string
+  api_mode: boolean
 }
 
 export interface AppState {
@@ -61,6 +62,11 @@ export interface DecisionRequest {
   choices: DecisionChoice[]
 }
 
+export interface CaptchaRequest {
+  id: string
+  image: string
+}
+
 export interface UpdateAvailable {
   tag: string
   current: string
@@ -85,6 +91,7 @@ export type BridgeEvent =
   | { event: 'update:install_error'; payload: { message: string } }
   | { event: 'update:installed'; payload: { message: string } }
   | { event: 'decision'; payload: DecisionRequest }
+  | { event: 'captcha'; payload: CaptchaRequest }
 
 // ---------- js_api 载荷 ----------
 
@@ -96,6 +103,7 @@ export interface OrderFormPayload {
   date: string
   count: string
   remember: boolean
+  api_mode: boolean
 }
 
 export interface SssFormPayload {
@@ -106,6 +114,7 @@ export interface SssFormPayload {
   product_name: string
   common_address: string
   remember: boolean
+  api_mode: boolean
 }
 
 export interface FieldErrors {
@@ -122,6 +131,7 @@ interface PywebviewApi {
   stop_task(): Promise<{ ok: boolean }>
   worker_alive(): Promise<boolean>
   resolve_decision(id: string, choice: string): Promise<{ ok: boolean }>
+  resolve_captcha(id: string, code: string): Promise<{ ok: boolean }>
   choose_excel(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   new_template(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   check_browser(): Promise<{ ok: boolean }>
@@ -246,6 +256,7 @@ function mockState(): AppState {
       sss_excel_path: '/home/zimu/文档/闪时送.xlsx',
       sss_product_name: '轻食',
       sss_common_address: '嗯哼',
+      api_mode: true,
     },
     passwords: { order: '', sss: '' },
   }

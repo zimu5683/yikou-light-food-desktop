@@ -23,6 +23,7 @@ import {
   isApiReady,
   onBridgeEvent,
   type AppState,
+  type CaptchaRequest,
   type DecisionRequest,
   type LogEntry,
   type OrderFormPayload,
@@ -56,6 +57,7 @@ interface AppStateBundle {
   passwords: { order: string; sss: string }
   logs: LogRow[]
   decision: DecisionRequest | null
+  captcha: CaptchaRequest | null
   updateProgress: UpdateProgress | null
   workerAlive: boolean
   mode: TaskMode
@@ -74,6 +76,7 @@ interface AppStateBundle {
   setSplitRatio: (ratio: number) => void
   clearLogs: () => void
   resolveDecision: (id: string, choice: string) => void
+  resolveCaptcha: (id: string, code: string) => void
 }
 
 const AppContext = createContext<AppStateBundle | null>(null)
@@ -106,6 +109,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [passwords, setPasswords] = useState({ order: '', sss: '' })
   const [logs, setLogs] = useState<LogRow[]>([])
   const [decision, setDecision] = useState<DecisionRequest | null>(null)
+  const [captcha, setCaptcha] = useState<CaptchaRequest | null>(null)
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const [updateAvailable, setAvailableState] = useState<UpdateAvailable | null>(null)
   const [mode, setMode] = useState<TaskMode>('order')
@@ -206,6 +210,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         case 'decision':
           setDecision(event.payload)
           break
+        case 'captcha':
+          setCaptcha(event.payload)
+          break
       }
     },
     [appendLog],
@@ -302,6 +309,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api().resolve_decision(id, choice).catch(() => {})
   }, [])
 
+  const resolveCaptcha = useCallback((id: string, code: string) => {
+    setCaptcha(null)
+    api().resolve_captcha(id, code).catch(() => {})
+  }, [])
+
   const value = useMemo<AppStateBundle>(
     () => ({
       ready,
@@ -313,6 +325,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       passwords,
       logs,
       decision,
+      captcha,
       updateProgress,
       workerAlive: status === 'running' || status === 'stopping',
       mode,
@@ -331,11 +344,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setSplitRatio,
       clearLogs,
       resolveDecision,
+      resolveCaptcha,
     }),
     [ready, mocked, version, status, frozen, config, passwords, logs, decision,
-      updateProgress, mode, startOrder, startSss, stopTask, chooseExcel,
+      updateProgress, mode, captcha, startOrder, startSss, stopTask, chooseExcel,
       newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
-      openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision],
+      openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha],
   )
 
   const updateAvailableValue = useMemo(

@@ -4,7 +4,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { Toaster } from '@/components/ui/sonner'
-import { DecisionDialog, UpdateAvailableDialog, UpdateProgressDialog } from '@/components/dialogs'
+import { CaptchaDialog, DecisionDialog, UpdateAvailableDialog, UpdateProgressDialog } from '@/components/dialogs'
 import { LogConsole } from '@/components/LogConsole'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
@@ -85,6 +85,7 @@ export default function App() {
 
       {/* 对话框与通知 */}
       <DecisionDialog />
+      <CaptchaDialog />
       <UpdateAvailableDialog />
       <UpdateProgressDialog />
       <Toaster position="bottom-right" richColors closeButton />

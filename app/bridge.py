@@ -132,6 +132,7 @@ class Bridge:
                 "sss_excel_path": str(config.sss_excel_path) if config.sss_excel_path else "",
                 "sss_product_name": config.sss_product_name,
                 "sss_common_address": config.sss_common_address,
+                "api_mode": config.api_mode,
             },
             # 与旧 GUI 启动行为一致：按账号从系统凭据管理器读回密码。
             "passwords": {
@@ -175,7 +176,8 @@ class Bridge:
             return {"ok": False, "fields": fields}
 
         config = AppConfig(target_url=url, phone_number=phone, excel_path=excel,
-                           order_date=date_text, browser_mode="auto")
+                           order_date=date_text, browser_mode="auto",
+                           api_mode=bool(payload.get("api_mode", True)))
         config.save()
         if payload.get("remember", True):
             set_password(phone, password)
@@ -208,6 +210,7 @@ class Bridge:
             # dry_run：只组装并打印下单报文，不真实提交（联调/验收用）。
             sss_dry_run=bool(payload.get("dry_run", False)),
             browser_mode="auto",
+            api_mode=bool(payload.get("api_mode", True)),
         )
         config.save()
         if payload.get("remember", True):
@@ -239,7 +242,8 @@ class Bridge:
     def _run_sss(self, config: AppConfig, password: str) -> None:
         try:
             result = run_sss_job(config, self._stop_event, lambda msg: self.log(msg),
-                                 password=password, decision_callback=self._sss_decision)
+                                 password=password, decision_callback=self._sss_decision,
+                                 captcha_callback=self._sss_captcha)
             self._finish_task(f"闪时送下单完成：已创建 {result.get('created', '?')} 单，"
                               f"处理 {result.get('processed', '?')} 项", result)
         except BrowserNotFoundError as exc:
@@ -311,6 +315,31 @@ class Bridge:
         return self._request_decision(
             "sss_retry", "下单失败",
             f"订单 {identifier} 创建失败：\n{error}", RETRY_CHOICES)
+
+    def _request_captcha(self, image_bytes: bytes) -> str:
+        import base64
+
+        with self._push_lock:
+            self._decision_seq += 1
+            captcha_id = f"c{self._decision_seq}"
+            decided = threading.Event()
+            holder: list[str] = []
+            self._decisions[captcha_id] = (decided, holder)
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        self._emit_event("captcha", {"id": captcha_id, "image": image_b64})
+        decided.wait()
+        return holder[0]
+
+    def _sss_captcha(self, image_bytes: bytes) -> str:
+        return self._request_captcha(image_bytes)
+
+    def resolve_captcha(self, captcha_id: str, code: str) -> dict[str, Any]:
+        entry = self._decisions.pop(str(captcha_id), None)
+        if entry is not None:
+            decided, holder = entry
+            holder.append(str(code))
+            decided.set()
+        return {"ok": entry is not None}
 
     def _save_decision(self, error: str) -> str:
         return self._request_decision(

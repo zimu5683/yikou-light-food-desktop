@@ -3,11 +3,9 @@
 本模块与管理后台订单处理（:mod:`app.automation`）方向相反：从独立的
 《闪时送.xlsx》读取订单（午餐/晚餐两表），再在闪时送平台逐单创建预约单。
 
-界面只负责登录：程序自动切换“账户密码登录”并填写账号密码，用户只需输入
-图形验证码（输完第 4 位自动点登录，验证码错误会提示重输）。下单本身不再
-操作页面表单——登录成功后通过页面内 ``fetch`` 直调后端接口（``token`` 头
-取自 ``localStorage.tokenObj``），与订单处理侧的
-:func:`app.automation.run_job` 同一套思路，不受页面弹回与渲染缺陷影响。
+默认使用纯接口模式：直接请求闪时送 HTTP 接口完成登录与下单；用户只需在应用内
+输入图形验证码，不再弹出浏览器。备用浏览器模式仍会启动 Playwright，自动填写
+账号密码后由用户在浏览器中输入图形验证码。
 
 干跑模式：配置 ``sss_dry_run = true`` 时只组装并打印下单报文，不真实提交。
 凭据与路径由 GUI 通过 :class:`AppConfig` 传入，不写入源码。
@@ -21,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
+    from .api_client import ApiError, SssApiClient
     from .automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -29,6 +28,7 @@ try:
     )
     from .locators import SSS_LOCATORS, load_sss_locators
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
+    from api_client import ApiError, SssApiClient
     from automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -292,12 +292,14 @@ def run_sss_job(config: Any, stop_event: Any,
                 progress_callback: Callable[[str], Any] | None = None,
                 password: str | None = None,
                 decision_callback: Callable[[str, str], str] | None = None,
-                locators: dict[str, Any] | None = None) -> dict[str, int]:
+                locators: dict[str, Any] | None = None,
+                captcha_callback: Callable[[bytes], str] | None = None) -> dict[str, int]:
     """读取《闪时送.xlsx》并通过接口逐单创建预约单。
 
     ``decision_callback(identifier, error)`` 返回 ``retry``/``skip``/``stop``，
     用于单个订单创建失败时的交互决策（与订单处理的 order_decision 一致）。
     ``config.sss_dry_run`` 为真时只组装并打印报文，不真实提交。
+    ``captcha_callback`` 在纯接口模式接收验证码 PNG 字节，返回用户输入的验证码。
     """
     configured_excel = getattr(config, "sss_excel_path", None)
     if not configured_excel:
@@ -312,11 +314,6 @@ def run_sss_job(config: Any, stop_event: Any,
     if locators is None:
         locators = load_sss_locators()
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
-
     account = str(getattr(config, "sss_account", "") or "")
     if not account:
         raise ValueError("尚未填写闪时送账号")
@@ -324,6 +321,7 @@ def run_sss_job(config: Any, stop_event: Any,
     store_name = str(getattr(config, "sss_store_name", "") or "一口轻食")
     common_address = str(getattr(config, "sss_common_address", "") or "")
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
+    api_mode = bool(getattr(config, "api_mode", True))
 
     orders_by_sheet = load_sss_orders(excel_path)
     total = sum(len(orders) for orders in orders_by_sheet.values())
@@ -335,6 +333,108 @@ def run_sss_job(config: Any, stop_event: Any,
     url = str(getattr(config, "sss_url", "") or "").strip() or DEFAULT_SSS_URL
     processed = 0
     created = 0
+
+    if api_mode:
+        _emit(progress_callback, "正在获取闪时送验证码…")
+        client = SssApiClient(url, account, password or "", timeout=timeout)
+        captcha = client.fetch_captcha()
+        if captcha_callback is None:
+            raise RuntimeError("纯接口模式需要验证码输入回调，当前界面未提供 captcha 弹窗")
+        code = captcha_callback(captcha)
+        _emit(progress_callback, "正在登录闪时送…")
+        client.login(code)
+        _emit(progress_callback, "登录成功，读取门店与常用地址…")
+
+        store_payload = client.get_json(_STORE_LIST_PATH)
+        store_record = _match_record(_result_records(store_payload), store_name, "门店")
+        store_id = _pick(store_record, ("id", "storeId", "storeNo"))
+        if store_id in (None, ""):
+            raise LookupError("门店记录缺少 id："
+                              + json.dumps(store_record, ensure_ascii=False)[:300])
+
+        addr_payload = client.get_json(_FREQUENT_ADDR_PATH)
+        address_record = _match_record(_result_records(addr_payload),
+                                       common_address, "常用地址")
+        _emit(progress_callback,
+              f"常用地址记录：{json.dumps(address_record, ensure_ascii=False)[:400]}")
+        address = _address_from_record(address_record)
+        _emit(progress_callback,
+              f"门店「{store_name}」与常用地址「{common_address}」就绪"
+              f"（{address['addressDetail']} @ {address['lnt']},{address['lat']}）")
+        if dry_run:
+            _emit(progress_callback, "【干跑模式】只组装报文，不真实提交")
+
+        def relogin() -> None:
+            _emit(progress_callback, "登录态过期，重新获取验证码并登录…")
+            img = client.fetch_captcha()
+            if captcha_callback is None:
+                raise RuntimeError("纯接口模式需要验证码输入回调")
+            client.login(captcha_callback(img))
+            _emit(progress_callback, "重新登录成功")
+
+        for sheet_name in DEFAULT_SHEETS:
+            orders = orders_by_sheet.get(sheet_name, [])
+            if not orders:
+                continue
+            is_dinner = sheet_name == "晚餐"
+            _emit(progress_callback, f"开始处理【{sheet_name}】表，共 {len(orders)} 单")
+            for order in orders:
+                if stop_event.is_set():
+                    break
+                processed += 1
+                identifier = f"第 {order['row']} 行 {order.get('name') or '未填写'}"
+                payload = build_order_payload(order, is_dinner, int(store_id),
+                                              address, goods_name)
+                if dry_run:
+                    _emit(progress_callback,
+                          f"【干跑】{identifier} 报文：{json.dumps(payload, ensure_ascii=False)}")
+                    created += 1
+                    continue
+                _emit(progress_callback, f"正在创建【{sheet_name}】{identifier}")
+                try:
+                    try:
+                        resp = client.post_json(_CREATE_ORDER_PATH, payload)
+                    except ApiError as exc:
+                        if "401" in str(exc) or "登录态已失效" in str(exc):
+                            relogin()
+                            resp = client.post_json(_CREATE_ORDER_PATH, payload)
+                        else:
+                            raise
+                    if not resp.get("success"):
+                        raise LookupError(
+                            resp.get("message") or json.dumps(resp, ensure_ascii=False)[:200])
+                    created += 1
+                    _emit(progress_callback,
+                          f"订单创建成功：{identifier}（预约 {payload['expectedDeliveryTime']}）")
+                except Exception as exc:
+                    _emit(progress_callback, f"订单创建失败：{identifier}：{exc}")
+                    if decision_callback is not None:
+                        decision = decision_callback(identifier, str(exc)).lower()
+                        if decision == "retry":
+                            _emit(progress_callback, f"重试 {identifier}")
+                            try:
+                                resp = client.post_json(_CREATE_ORDER_PATH, payload)
+                                if not resp.get("success"):
+                                    raise LookupError(
+                                        resp.get("message") or "创建失败")
+                                created += 1
+                                _emit(progress_callback, f"重试成功：{identifier}")
+                            except Exception as exc2:
+                                _emit(progress_callback, f"重试仍失败：{identifier}：{exc2}")
+                        elif decision == "stop":
+                            stop_event.set()
+                            break
+            if stop_event.is_set():
+                break
+
+        mode = "（干跑）" if dry_run else ""
+        _emit(progress_callback, f"闪时送下单完成{mode}：成功 {created}/{processed}")
+        return {"processed": processed, "created": created}
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
 
     with sync_playwright() as playwright:
         browser = _launch_browser(
