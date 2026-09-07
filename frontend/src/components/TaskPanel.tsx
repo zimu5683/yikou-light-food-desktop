@@ -2,7 +2,7 @@
  * 任务面板：模式切换（下划线 tab）+ 订单处理 / 闪时送下单 表单 + 主操作条 + 更多菜单。
  * 校验结果由桥接层返回（start_order/start_sss 的 fields），前端渲染字段错误态。
  */
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { MoreHorizontal } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -48,7 +48,14 @@ export function TaskPanel() {
           </ModeTab>
         </div>
 
-        {mode === 'order' ? <OrderForm /> : <SssForm />}
+        {/* 两个表单常驻渲染（仅切换可见性）：卸载会清空各字段的 useState，
+            导致切页签后已输入内容丢失并被旧 config 重新填充。 */}
+        <div className={cn(mode === 'order' ? 'block' : 'hidden')}>
+          <OrderForm />
+        </div>
+        <div className={cn(mode === 'sss' ? 'block' : 'hidden')}>
+          <SssForm />
+        </div>
       </div>
       {workerAlive && (
         <p className="border-t px-5 py-1.5 text-[11px] text-muted-foreground">
@@ -109,11 +116,28 @@ function OrderForm() {
       setPhone(config.phone_number)
       setExcel(config.excel_path)
       setDate(config.order_date)
-      setPassword(passwords.order)
+      setCount(config.order_count ?? null)
       setApiMode(config.api_mode)
+      setPassword(passwords.order)
       setLoaded(true)
     }
   }, [config, passwords.order, loaded])
+
+  // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
+  const scheduleSave = useDebouncedSave(() => {
+    if (!isApiReady()) return
+    api()
+      .save_order_config({ url, phone, excel, date, count, api_mode: apiMode })
+      .catch(() => {})
+  })
+  const prevLoaded = useRef(false)
+  useEffect(() => {
+    if (!loaded || !prevLoaded.current) {
+      prevLoaded.current = loaded
+      return
+    }
+    scheduleSave()
+  }, [url, phone, excel, date, count, apiMode, loaded, scheduleSave])
 
   const excelError = modeError(fields, 'excel')
   const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
@@ -260,6 +284,38 @@ function SssForm() {
       setLoaded(true)
     }
   }, [config, passwords.sss, loaded])
+
+  // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
+  const scheduleSave = useDebouncedSave(() => {
+    if (!isApiReady()) return
+    api()
+      .save_sss_config({
+        url,
+        account,
+        excel,
+        product_name: productName,
+        common_address: commonAddress,
+        use_fixed_address: useFixedAddress,
+        fixed_lnt: fixedLnt,
+        fixed_lat: fixedLat,
+        fixed_area_code: fixedAreaCode,
+        fixed_address_detail: fixedAddressDetail,
+        api_mode: apiMode,
+      })
+      .catch(() => {})
+  })
+  const prevLoaded = useRef(false)
+  useEffect(() => {
+    if (!loaded || !prevLoaded.current) {
+      prevLoaded.current = loaded
+      return
+    }
+    scheduleSave()
+  }, [
+    url, account, excel, productName, commonAddress, useFixedAddress,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, apiMode,
+    loaded, scheduleSave,
+  ])
 
   const excelError = modeError(fields, 'excel')
   const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
@@ -540,4 +596,30 @@ function ConfirmClearPassword({
       </DialogContent>
     </Dialog>
   )
+}
+
+/* ------------------------------------------------------------------ */
+/* 防抖自动保存：字段停止变化 delay ms 后把表单值持久化到后端配置。          */
+/* 只在 isApiReady（真实桌面端）且已从 config 完成首次填充后触发，避免     */
+/* 初始化瞬间把默认值写回配置，也避免浏览器 mock 态空跑。                  */
+/* ------------------------------------------------------------------ */
+function useDebouncedSave(save: () => void, delay = 500): () => void {
+  const timer = useRef<number | undefined>(undefined)
+  const saveRef = useRef(save)
+  saveRef.current = save
+  const cancel = useCallback(() => {
+    if (timer.current !== undefined) {
+      clearTimeout(timer.current)
+      timer.current = undefined
+    }
+  }, [])
+  const trigger = useCallback(() => {
+    cancel()
+    timer.current = window.setTimeout(() => {
+      timer.current = undefined
+      saveRef.current()
+    }, delay)
+  }, [cancel, delay])
+  useEffect(() => cancel, [cancel])
+  return trigger
 }

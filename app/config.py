@@ -54,6 +54,8 @@ class AppConfig:
     order_search_attempts: int = 3
     # Empty means "today". The GUI validates the YYYY-MM-DD form before a run.
     order_date: str = ""
+    # 待处理订单数；None 表示「留空 = 处理全部」（与表单语义一致，随配置持久化）。
+    order_count: int | None = None
     split_ratio: float = 0.38
     # 闪时送（sss）下单任务的独立配置，与管理后台订单处理互不影响。
     sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout"
@@ -78,6 +80,7 @@ class AppConfig:
                  network_idle_timeout_ms: int = 5000, order_search_timeout_ms: int = 8000,
                  retry_wait_ms: int = 1000, order_search_attempts: int = 3,
                  order_date: str = "",
+                 order_count: int | None = None,
                  split_ratio: float = 0.38,
                  sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout",
                  sss_account: str = "",
@@ -111,6 +114,7 @@ class AppConfig:
         self.retry_wait_ms = retry_wait_ms
         self.order_search_attempts = order_search_attempts
         self.order_date = str(order_date or "").strip()
+        self.order_count = order_count
         self.split_ratio = clamp_split_ratio(split_ratio)
         self.sss_url = sss_url
         self.sss_account = sss_account

@@ -22,6 +22,7 @@ tests 与 README。
 """
 from __future__ import annotations
 
+import copy
 import os
 import sys
 import threading
@@ -57,9 +58,10 @@ RETRY_CHOICES = [{"value": "retry", "label": "重试", "style": "primary"},
 class Bridge:
     """js_api 对象。公开方法（无下划线）均可被前端 Promise 调用。"""
 
-    def __init__(self) -> None:
+    def __init__(self, config_path: os.PathLike[str] | str | None = None) -> None:
         self._window: Any = None
-        self._config = AppConfig.load()
+        # config_path 供测试注入临时配置文件；生产环境沿用默认用户配置目录。
+        self._config = AppConfig.load(config_path) if config_path else AppConfig.load()
         self._stop_event = threading.Event()
         self._worker: threading.Thread | None = None
         self._closing = False
@@ -126,6 +128,7 @@ class Bridge:
                 "phone_number": config.phone_number,
                 "excel_path": str(config.excel_path) if config.excel_path else "",
                 "order_date": config.order_date,
+                "order_count": config.order_count,
                 "split_ratio": config.split_ratio,
                 "sss_url": config.sss_url,
                 "sss_account": config.sss_account,
@@ -183,13 +186,17 @@ class Bridge:
             self._set_status("error")
             return {"ok": False, "fields": fields}
 
-        config = AppConfig(target_url=url, phone_number=phone, excel_path=excel,
-                           order_date=date_text, browser_mode="auto",
-                           api_mode=bool(payload.get("api_mode", True)))
-        config.save()
+        # 就地更新已加载配置并保存，避免用「全默认值新对象」覆盖另一半模式
+        # （跑一次订单任务就把闪时送配置重置成默认值的同源问题）。
+        _apply_order_payload(self._config, {
+            "url": url, "phone": phone, "excel": excel, "date": date_text,
+            "count": count, "api_mode": bool(payload.get("api_mode", True)),
+        })
+        self._config.save()
         if payload.get("remember", True):
             set_password(phone, password)
-        self._launch("order", config, count, password)
+        # 运行线程拿到配置快照，避免任务执行期间被后续防抖保存改写。
+        self._launch("order", copy.deepcopy(self._config), count, password)
         return {"ok": True}
 
     def start_sss(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -229,24 +236,43 @@ class Bridge:
             self._set_status("error")
             return {"ok": False, "fields": fields}
 
-        config = AppConfig(
-            sss_url=url, sss_account=account, sss_excel_path=excel,
-            sss_product_name=str(payload.get("product_name", "轻食")).strip() or "轻食",
-            sss_common_address=str(payload.get("common_address", "")).strip(),
-            sss_use_fixed_address=use_fixed_address,
-            sss_fixed_lnt=float(fixed_lnt) if use_fixed_address and fixed_lnt else 119.728224,
-            sss_fixed_lat=float(fixed_lat) if use_fixed_address and fixed_lat else 30.256632,
-            sss_fixed_area_code=fixed_area_code or "330110",
-            sss_fixed_address_detail=fixed_address_detail or "浙江农林大学东湖校区",
+        # 就地更新并保存：避免全新 AppConfig 把订单处理侧配置重置成默认。
+        _apply_sss_payload(self._config, {
+            "url": url, "account": account, "excel": excel,
+            "product_name": str(payload.get("product_name", "轻食")).strip() or "轻食",
+            "common_address": str(payload.get("common_address", "")).strip(),
+            "use_fixed_address": use_fixed_address,
+            "fixed_lnt": fixed_lnt, "fixed_lat": fixed_lat,
+            "fixed_area_code": fixed_area_code,
+            "fixed_address_detail": fixed_address_detail,
             # dry_run：只组装并打印下单报文，不真实提交（联调/验收用）。
-            sss_dry_run=bool(payload.get("dry_run", False)),
-            browser_mode="auto",
-            api_mode=bool(payload.get("api_mode", True)),
-        )
-        config.save()
+            "dry_run": bool(payload.get("dry_run", False)),
+            "api_mode": bool(payload.get("api_mode", True)),
+        })
+        self._config.save()
         if payload.get("remember", True):
             set_sss_password(account, password)
-        self._launch("sss", config, None, password)
+        self._launch("sss", copy.deepcopy(self._config), None, password)
+        return {"ok": True}
+
+    # 表单防抖即时保存：只落盘本次改动，不做启动校验、不触发任务。
+    def save_order_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        _apply_order_payload(self._config, payload)
+        try:
+            self._config.save()
+        except OSError:
+            return {"ok": False, "reason": "write_failed"}
+        return {"ok": True, "saved": {
+            "order_date": self._config.order_date,
+            "order_count": self._config.order_count,
+        }}
+
+    def save_sss_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        _apply_sss_payload(self._config, payload)
+        try:
+            self._config.save()
+        except OSError:
+            return {"ok": False, "reason": "write_failed"}
         return {"ok": True}
 
     def _launch(self, mode: str, config: AppConfig, count: int | None, password: str) -> None:
@@ -654,3 +680,46 @@ def _with_excel_suffix(path: _Path) -> _Path:
     if path.suffix.lower() not in EXCEL_EXTS:
         return path.with_suffix(".xlsx")
     return path
+
+
+def _apply_order_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
+    """就地更新订单处理侧配置字段（不触碰闪时送侧配置）。"""
+    cfg.target_url = str(p.get("url", cfg.target_url) or "").strip()
+    cfg.phone_number = str(p.get("phone", cfg.phone_number) or "").strip()
+    excel = str(p.get("excel", "") or "").strip()
+    if excel:
+        cfg.excel_path = _Path(excel)
+    cfg.order_date = str(p.get("date", cfg.order_date) or "").strip()
+    if "count" in p:
+        cfg.order_count = p["count"]  # None 表示「处理全部」，其余为 int|None
+    cfg.api_mode = bool(p.get("api_mode", cfg.api_mode))
+
+
+def _apply_sss_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
+    """就地更新闪时送侧配置字段（不触碰订单处理侧配置）。
+
+    空值如实覆盖（用户清空输入就保存为空），与订单侧一致；真正开始下单时
+    start_sss 会做非空校验，防抖保存本身不做启动校验。
+    """
+    cfg.sss_url = str(p.get("url", cfg.sss_url) or "").strip()
+    cfg.sss_account = str(p.get("account", cfg.sss_account) or "").strip()
+    excel = str(p.get("excel", "") or "").strip()
+    if excel:
+        cfg.sss_excel_path = _Path(excel)
+    cfg.sss_product_name = str(p.get("product_name", cfg.sss_product_name) or "").strip()
+    cfg.sss_common_address = str(p.get("common_address", cfg.sss_common_address) or "").strip()
+    use_fixed = bool(p.get("use_fixed_address", cfg.sss_use_fixed_address))
+    cfg.sss_use_fixed_address = use_fixed
+    if use_fixed:
+        try:
+            cfg.sss_fixed_lnt = float(p.get("fixed_lnt", cfg.sss_fixed_lnt))
+        except (TypeError, ValueError):
+            pass
+        try:
+            cfg.sss_fixed_lat = float(p.get("fixed_lat", cfg.sss_fixed_lat))
+        except (TypeError, ValueError):
+            pass
+        cfg.sss_fixed_area_code = str(p.get("fixed_area_code", cfg.sss_fixed_area_code) or "").strip()
+        cfg.sss_fixed_address_detail = str(p.get("fixed_address_detail", cfg.sss_fixed_address_detail) or "").strip()
+    cfg.sss_dry_run = bool(p.get("dry_run", cfg.sss_dry_run))
+    cfg.api_mode = bool(p.get("api_mode", cfg.api_mode))

@@ -65,6 +65,71 @@ def test_config_persists_order_date(tmp_path):
     assert loaded.order_date == "2026-09-03"
 
 
+def test_config_persists_order_count(tmp_path):
+    from app.config import AppConfig
+
+    path = tmp_path / "config.json"
+    AppConfig(order_count=6).save(path)
+    assert AppConfig.load(path).order_count == 6
+    # None（留空=全部）也应往返无损，并兼容旧配置缺失该键。
+    AppConfig(order_count=None).save(path)
+    assert AppConfig.load(path).order_count is None
+
+
+def test_bridge_save_order_config_preserves_sss_side(tmp_path):
+    """就地保存订单侧配置时，闪时送侧既有字段不被重置成默认。"""
+    from app.bridge import Bridge
+
+    path = tmp_path / "config.json"
+    bridge = Bridge(config_path=str(path))
+    bridge._config.sss_account = "keep-sss"
+    bridge._config.sss_fixed_lnt = 119.7
+    bridge._config.save()
+
+    result = bridge.save_order_config({
+        "url": "https://order.example.com",
+        "phone": "13800000000",
+        "excel": str(tmp_path / "排单.xlsx"),
+        "date": "2026-09-07",
+        "count": 6,
+        "api_mode": True,
+    })
+    assert result["ok"] is True
+    loaded = AppConfig.load(path)
+    assert loaded.target_url == "https://order.example.com"
+    assert loaded.order_date == "2026-09-07"
+    assert loaded.order_count == 6
+    assert loaded.sss_account == "keep-sss"  # 闪时送侧不受影响
+    assert loaded.sss_fixed_lnt == 119.7
+
+
+def test_bridge_save_sss_config_preserves_order_side(tmp_path):
+    """就地保存闪时送侧配置时，订单侧既有字段不被重置成默认。"""
+    from app.bridge import Bridge
+
+    path = tmp_path / "config.json"
+    bridge = Bridge(config_path=str(path))
+    bridge._config.order_date = "2026-09-07"
+    bridge._config.order_count = 3
+    bridge._config.target_url = "https://order.example.com"
+    bridge._config.save()
+
+    result = bridge.save_sss_config({
+        "account": "sss-user", "url": "https://sss.example.com",
+        "use_fixed_address": True, "fixed_lnt": "120.1", "fixed_lat": "30.2",
+        "fixed_area_code": "330110", "fixed_address_detail": "衣锦校区",
+    })
+    assert result["ok"] is True
+    loaded = AppConfig.load(path)
+    assert loaded.sss_account == "sss-user"
+    assert loaded.sss_fixed_lnt == 120.1
+    assert loaded.sss_fixed_lat == 30.2
+    # 订单侧不受影响
+    assert loaded.order_date == "2026-09-07"
+    assert loaded.order_count == 3
+    assert loaded.target_url == "https://order.example.com"
+
+
 def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
     from app.automation import _load_order_workbook
 

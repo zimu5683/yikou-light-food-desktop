@@ -114,6 +114,46 @@ def test_historical_order_writes_to_a_dated_sheet():
     assert sheet.cell(2, 12).value == "午餐"
 
 
+def test_weekday_sheet_fills_lunch_dinner_columns_contiguously(tmp_path):
+    """回归：周表的中餐/晚餐两栏必须各自从第 3 行连续填充，不能对角错位。"""
+    from openpyxl import load_workbook
+
+    from app.automation import _write_order
+    from app.excel_templates import write_order_template
+
+    excel = tmp_path / "排单.xlsx"
+    write_order_template(excel)
+    wb = load_workbook(excel)
+
+    today = dt.date(2026, 9, 7)  # 周一 → 写入「周二」表
+
+    def commit(order_no: str, meals: list[tuple[str, str, int]]):
+        order = OrderInfo(order_no=order_no, name=f"顾客{order_no}", address="校门口",
+                          phone="13800000000", address_base_sheet="衣锦")
+        for meal_type, grade, total in meals:
+            meal = MealInfo(total_meals=total, grade=grade, count=1, meal_type=meal_type)
+            _write_order(wb, order, meal, meal_type, target_date=today, today=today)
+
+    # 交替顺序写：午餐、晚餐、午+晚双餐订单 —— 旧实现会因整表 max_row 定位而错位。
+    commit("W19", [("午餐", "豪华", 1)])
+    commit("W18", [("晚餐", "经济", 1)])
+    commit("W14", [("午餐", "经济", 6), ("晚餐", "豪华", 1)])
+
+    sheet = wb["周二"]
+    # 中餐栏(A)与晚餐栏(G)各自从第 3 行开始连续、顶部对齐；双餐订单两栏落在同一行。
+    assert [sheet["A3"].value, sheet["A4"].value] == ["W19", "W14"]
+    assert sheet["A5"].value is None
+    assert [sheet["G3"].value, sheet["G4"].value] == ["W18", "W14"]
+    assert sheet["G5"].value is None
+    # 表头(第2行)与合并标题(第1行)保持完整。
+    assert [sheet.cell(2, c).value for c in range(1, 7)] == ["订单", "姓名", "地址", "电话", "餐种", "餐次"]
+    assert sorted(str(m) for m in sheet.merged_cells.ranges) == ["A1:F1", "G1:L1", "N1:S1"]
+    # 总餐区逐条汇总每一餐：W19午、W18晚、W14午、W14晚。
+    assert [sheet[f"N{r}"].value for r in range(3, 7)] == ["W19", "W18", "W14", "W14"]
+    assert sheet["N7"].value is None
+    wb.close()
+
+
 def test_group_orders_by_pick_keeps_api_order_and_skips_empty_pick_no():
     from app.automation import _group_orders_by_pick
 
@@ -250,3 +290,117 @@ def test_api_list_waimai_orders_concurrent_pages_fetches_all():
     assert rows[-1]["pick_no"] == "W25"
     assert any("pageNo=2" in call for call in calls)
     assert any("pageNo=3" in call for call in calls)
+
+
+def test_split_refund_orders_categorises_by_state():
+    """退款订单分类：state=8 已退款 / state=7 申请退款中，正常单保留。"""
+    from app.automation import _filter_rows_by_date, _group_orders_by_pick, \
+        _order_numbers_for_date, split_refund_orders
+
+    rows = [
+        {"pick_no": "W8", "date": dt.date(2026, 9, 7), "state": 8},
+        {"pick_no": "W7", "date": dt.date(2026, 9, 7), "state": 7},
+        {"pick_no": "W6", "date": dt.date(2026, 9, 7), "state": 6},
+        {"pick_no": "W5", "date": dt.date(2026, 9, 7)},
+    ]
+    rpb = _group_orders_by_pick(_filter_rows_by_date(rows, dt.date(2026, 9, 7)))
+    numbers = _order_numbers_for_date(rpb, None)
+    normal, refunded, applied = split_refund_orders(rpb, numbers)
+    assert normal == [6, 5]
+    assert refunded == [8]
+    assert applied == [7]
+
+
+def test_parse_batch_keeps_refund_state():
+    """列表接口解析保留 state 字段；缺失时按非退款容忍。"""
+    from app.automation import _api_list_waimai_orders
+
+    def api_get(path: str) -> dict:
+        return {"data": {"list": [
+            {"id": "1", "pickNo": "W8", "created_at": "2026-09-07 10:00:00", "state": 8},
+            {"id": "2", "pickNo": "W7", "created_at": "2026-09-07 10:00:00", "state": 7},
+            {"id": "3", "pickNo": "W6", "created_at": "2026-09-07 10:00:00", "state": 6},
+            {"id": "4", "pickNo": "W5", "created_at": "2026-09-07 10:00:00"},
+        ], "total": 4}}
+
+    rows = _api_list_waimai_orders(api_get, dt.date(2026, 9, 7))
+    by_pick = {r["pick_no"]: r for r in rows}
+    assert by_pick["W8"]["state"] == 8
+    assert by_pick["W7"]["state"] == 7
+    assert by_pick["W6"]["state"] == 6
+    assert by_pick["W5"].get("state") is None
+
+
+def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path):
+    """端到端：退款订单不写表，日志与返回值含两类退款汇总。"""
+    import threading
+
+    from openpyxl import load_workbook
+
+    from app import automation as automod
+    from app.automation import run_job
+    from app.excel_templates import write_order_template
+
+    excel = tmp_path / "排单.xlsx"
+    write_order_template(excel)
+
+    class FakeConfig:
+        excel_path = str(excel)
+        target_url = "https://example.com"
+        phone_number = "13900000000"
+        order_date = "2026-09-07"
+        api_mode = True
+        element_timeout_ms = 8000
+        browser_mode = "auto"
+
+    def api_get(path: str) -> dict:
+        if "/channel/order?" in path and "pageNo=1" in path:
+            return {"data": {"list": [
+                {"id": "101", "pickNo": "W8", "storeId": "1",
+                 "created_at": "2026-09-07 10:00:00", "state": 8},
+                {"id": "102", "pickNo": "W7", "storeId": "1",
+                 "created_at": "2026-09-07 10:00:00", "state": 7},
+                {"id": "103", "pickNo": "W6", "storeId": "1",
+                 "created_at": "2026-09-07 10:00:00", "state": 6},
+            ], "total": 3}}
+        if "/channel/order/103" in path:
+            return {"data": {"id": "103", "pickNo": "W6",
+                    "address": {"contact": "张三", "mobile": "13800000000",
+                                "address": "浙江农林大学东湖校区"},
+                    "goods": [{"name": "单点经济餐（午餐） x1", "num": 1}]}}
+        return {"data": {}}
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def login(self):
+            pass
+
+        def get_json(self, path):
+            return api_get(path)
+
+    orig_client = automod.AdminApiClient
+    automod.AdminApiClient = FakeClient
+    logs: list[str] = []
+    try:
+        result = run_job(FakeConfig(), None, threading.Event(), lambda m: logs.append(m),
+                         password="pw", order_decision_callback=lambda c, e: "skip",
+                         save_decision_callback=lambda e: "cancel")
+    finally:
+        automod.AdminApiClient = orig_client
+
+    assert result["processed"] == 1  # 只有 W6
+    assert result["found"] == 1
+    assert result["refunded"] == [8]
+    assert result["refund_applied"] == [7]
+    full_log = "\n".join(logs)
+    assert "退款成功（已退款，不排单）：W8" in full_log
+    assert "还在申请退款（待审批，不排单）：W7" in full_log
+
+    wb = load_workbook(excel)
+    cells = [cell.value for ws in wb.worksheets for row in ws.iter_rows() for cell in row]
+    wb.close()
+    assert "W6" in cells
+    assert "W7" not in cells
+    assert "W8" not in cells

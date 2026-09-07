@@ -55,6 +55,12 @@ HISTORICAL_SHEET_HEADERS = (
     "取单号", "姓名", "地址", "电话", *WEEKDAYS, "餐别", "经济/豪华", "总餐次",
 )
 
+# 订单列表接口 state 取值（2026-09-11 抓包确认）：state=8 为已退款（同意后退款
+# 成功），state=7 为「用户申请退款」即退款待审批（商家还没同意，对应界面上的
+# 「退款详情/申请退款」）。这两种订单都不应写入排班表格。
+ORDER_STATE_REFUND_DONE = 8
+ORDER_STATE_REFUND_APPLIED = 7
+
 
 def parse_target_date(value: object = None, *, today: _dt.date | None = None) -> _dt.date:
     """Parse a target date, defaulting to the local current date."""
@@ -535,17 +541,26 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
     base = order.address_base_sheet
     if not base:
         return
-    weekday = WEEKDAYS[(_dt.datetime.now().weekday() + 1) % 7]
+    weekday = WEEKDAYS[(today.weekday() + 1) % 7]
     weekday_sheet = wb[weekday] if weekday in wb.sheetnames else wb.create_sheet(weekday)
     target_name = f"{base}{SHEET_MEAL_SUFFIX.get(meal_type, meal_type)}"
     target = wb[target_name] if target_name in wb.sheetnames else wb.create_sheet(target_name)
     columns = ("A", "B", "C", "D", "E", "F") if meal_type == "午餐" else ("G", "H", "I", "J", "K", "L")
-    row = max(3, weekday_sheet.max_row + 1)
+    # 中餐/晚餐两栏各自从第 3 行起连续填充：只找本栏首列（A 或 G）的空行，
+    # 不再以整表 max_row 定位——否则两栏互相把对方顶到下一行，形成对角错位。
+    row = 3
     while weekday_sheet[f"{columns[0]}{row}"].value not in (None, ""):
         row += 1
     values = (order.order_no, order.name, order.address, order.phone, meal.grade or "", meal.total_meals or "")
     for col, value in zip(columns, values):
         weekday_sheet[f"{col}{row}"] = value
+    # 总餐区（N~S）逐条汇总当天每一餐：与两栏一样从第 3 行起连续向下。
+    total_columns = ("N", "O", "P", "Q", "R", "S")
+    total_row = 3
+    while weekday_sheet[f"{total_columns[0]}{total_row}"].value not in (None, ""):
+        total_row += 1
+    for col, value in zip(total_columns, values):
+        weekday_sheet[f"{col}{total_row}"] = value
     row2 = max(3, target.max_row + 1)
     while target[f"A{row2}"].value not in (None, ""):
         row2 += 1
@@ -699,6 +714,9 @@ def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
                 "store_id": str(item.get("storeId") or ""),
                 "created_at": created,
                 "date": parse_order_created_date(created),
+                # 退款状态字段：state=8 已退款 / state=7 用户申请退款（待审批）。
+                # 列表接口完整响应里直接携带，详情页反而没有统一字段，故在此保留。
+                "state": item.get("state"),
             })
         return out
 
@@ -796,6 +814,31 @@ def _order_numbers_for_date(rows_by_pick: dict[str, list[dict[str, Any]]],
     if order_count:
         numbers = [n for n in numbers if n <= order_count]
     return numbers
+
+
+def split_refund_orders(rows_by_pick: dict[str, list[dict[str, Any]]],
+                        numbers: list[int]) -> tuple[list[int], list[int], list[int]]:
+    """把待处理编号按退款状态分成三类：(正常, 退款成功, 申请退款中)。
+
+    每行来自已按目标日期过滤的列表接口记录，携带 ``state`` 字段：
+    state=8 已退款（同意后退款成功）、state=7 用户申请退款（待审批）。
+    一个取单号若含多条记录，任一记录命中退款状态即归入对应退款类，
+    且从正常列表剔除（后续不再拉详情/写表）。返回的编号均为从大到小。
+    """
+    refunded: list[int] = []
+    applied: list[int] = []
+    normal: list[int] = []
+    for number in numbers:
+        code = f"W{number}"
+        rows = rows_by_pick.get(code, [])
+        if any(int(r.get("state") or 0) == ORDER_STATE_REFUND_DONE for r in rows):
+            refunded.append(number)
+        elif any(int(r.get("state") or 0) == ORDER_STATE_REFUND_APPLIED for r in rows):
+            applied.append(number)
+        else:
+            normal.append(number)
+    # 保持原有从大到小顺序。
+    return (normal, refunded, applied)
 
 
 def _order_detail_by_id(api_get: Callable[[str], dict[str, Any]],
@@ -943,9 +986,12 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     wb = _load_order_workbook(excel_path)
     processed = 0
     found = 0
+    # 退款订单汇总（外层容器供结尾统一打印）：申请退款中 / 已退款 两类 W 编号。
+    refunded_numbers: list[int] = []
+    applied_numbers: list[int] = []
     timeout = int(getattr(config, "element_timeout_ms", 8000))
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
-        nonlocal processed, found
+        nonlocal processed, found, refunded_numbers, applied_numbers
         list_start = time.perf_counter()
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
                                         concurrent_pages=api_mode)
@@ -959,6 +1005,17 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             _emit(progress_callback,
                   f"目标日期 {selected_date.isoformat()} 没有找到订单，未写入 Excel")
             return
+        # 退款订单（state=7 申请退款中 / state=8 已退款）不写入表格：从实际处理
+        # 列表剔除，但保留编号用于结尾日志汇总「退款成功 / 申请退款中」两类。
+        normal_numbers, refunded_numbers, applied_numbers = split_refund_orders(
+            rows_by_pick, numbers)
+        refund_label = []
+        if refunded_numbers:
+            refund_label.append(f"已退款 {len(refunded_numbers)} 单："
+                                + "、".join(f"W{n}" for n in refunded_numbers))
+        if applied_numbers:
+            refund_label.append(f"申请退款中 {len(applied_numbers)} 单："
+                                + "、".join(f"W{n}" for n in applied_numbers))
         if order_count:
             _emit(progress_callback,
                   f"已按目标日期筛选，共 {len(numbers)} 个订单待处理："
@@ -967,14 +1024,21 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             _emit(progress_callback,
                   f"留空模式：自动识别目标日期订单，共 {len(numbers)} 个："
                   + "、".join(f"W{n}" for n in numbers))
+        if refund_label:
+            _emit(progress_callback, "；".join(refund_label) + "，已跳过不写入表格")
+        if not normal_numbers:
+            # 目标日期的订单全部处于退款状态（申请中或已退款），无需拉详情与写表。
+            _emit(progress_callback, "目标日期订单全部为退款状态，未写入 Excel")
+            return
 
         # 纯接口模式下并发预取订单详情；失败项仍走下方串行重试/决策流程。
+        # 退款订单不预取也不写表，只对正常订单发起。
         prefetched: dict[int, OrderInfo] | None = None
-        if api_mode and len(numbers) > 1:
+        if api_mode and len(normal_numbers) > 1:
             detail_start = time.perf_counter()
-            prefetched = _prefetch_order_details(api_get, rows_by_pick, numbers, max_workers=5)
+            prefetched = _prefetch_order_details(api_get, rows_by_pick, normal_numbers, max_workers=5)
             _emit(progress_callback,
-                  f"并发预取订单详情完成：成功 {len(prefetched)}/{len(numbers)}，"
+                  f"并发预取订单详情完成：成功 {len(prefetched)}/{len(normal_numbers)}，"
                   f"耗时 {(time.perf_counter() - detail_start):.1f} 秒")
 
         def commit_order(order: OrderInfo) -> None:
@@ -989,7 +1053,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             _emit(progress_callback, "-------")
 
         write_start = time.perf_counter()
-        for number in numbers:
+        for number in normal_numbers:
             if stop_event.is_set():
                 break
             code = f"W{number}"
@@ -1092,7 +1156,17 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     finally:
         wb.close()
     _emit(progress_callback, f"处理完成：找到 {found}/{processed} 个订单")
-    return {"processed": processed, "found": found}
+    # 结尾统一汇总退款订单：哪些已退款、哪些仍在申请退款中（均为本次目标日期内）。
+    if refunded_numbers or applied_numbers:
+        _emit(progress_callback, "----------")
+        if refunded_numbers:
+            _emit(progress_callback, "退款成功（已退款，不排单）："
+                  + "、".join(f"W{n}" for n in refunded_numbers))
+        if applied_numbers:
+            _emit(progress_callback, "还在申请退款（待审批，不排单）："
+                  + "、".join(f"W{n}" for n in applied_numbers))
+    return {"processed": processed, "found": found,
+            "refunded": refunded_numbers, "refund_applied": applied_numbers}
 
 
 def _save_workbook_with_retry(workbook: Any, excel_path: Path,

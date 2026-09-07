@@ -29,6 +29,7 @@ export interface AppConfigState {
   phone_number: string
   excel_path: string
   order_date: string
+  order_count: number | null
   split_ratio: number
   sss_url: string
   sss_account: string
@@ -111,6 +112,31 @@ export interface OrderFormPayload {
   api_mode: boolean
 }
 
+/** 订单表单防抖即时保存的载荷（不触发任务、不带密码）。 */
+export interface OrderConfigPayload {
+  url?: string
+  phone?: string
+  excel?: string
+  date?: string
+  count?: number | null
+  api_mode?: boolean
+}
+
+/** 闪时送表单防抖即时保存的载荷（不触发任务、不带密码）。 */
+export interface SssConfigPayload {
+  url?: string
+  account?: string
+  excel?: string
+  product_name?: string
+  common_address?: string
+  use_fixed_address?: boolean
+  fixed_lnt?: string | number
+  fixed_lat?: string | number
+  fixed_area_code?: string
+  fixed_address_detail?: string
+  api_mode?: boolean
+}
+
 export interface SssFormPayload {
   url: string
   account: string
@@ -156,6 +182,8 @@ interface PywebviewApi {
   window_action(action: 'minimize' | 'toggle_maximize' | 'close'): Promise<{ action?: string }>
   request_close(): Promise<{ action: string }>
   set_split_ratio(ratio: number): Promise<{ ok: boolean; ratio: number }>
+  save_order_config(payload: OrderConfigPayload): Promise<{ ok: boolean; reason?: string; saved?: { order_date: string; order_count: number | null } }>
+  save_sss_config(payload: SssConfigPayload): Promise<{ ok: boolean; reason?: string }>
 }
 
 declare global {
@@ -260,6 +288,7 @@ function mockState(): AppState {
       phone_number: '13968033834',
       excel_path: '/home/zimu/文档/排单.xlsx',
       order_date: '2026-09-05',
+      order_count: null,
       split_ratio: 0.38,
       sss_url: 'https://sssplusnew.zhuopaikeji.com/takeout',
       sss_account: '18758187837',

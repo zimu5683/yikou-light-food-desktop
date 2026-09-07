@@ -256,7 +256,15 @@ export function DateField({
             </span>
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-[264px] rounded-lg border bg-card p-3" align="start">
+        {/* 固定向下弹出并关闭自动翻转：avoidCollisions 默认会让日历在空间
+            不足时自动翻到上方，翻月导致高度变化时会上下跳位、箭头漂移。 */}
+        <PopoverContent
+          className="w-[264px] rounded-lg border bg-card p-3"
+          align="start"
+          side="bottom"
+          avoidCollisions={false}
+          collisionPadding={8}
+        >
           <div className="mb-2 flex items-center justify-between">
             <button
               type="button"
