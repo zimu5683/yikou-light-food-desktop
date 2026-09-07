@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -548,7 +549,10 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
     row2 = max(3, target.max_row + 1)
     while target[f"A{row2}"].value not in (None, ""):
         row2 += 1
-    vals = [order.order_no, order.name, order.address, order.phone] + [1 if d == weekday else "" for d in WEEKDAYS] + [meal_type, meal.grade or "", meal.total_meals or ""]
+    # 「类型」列沿用表名后缀（中餐/晚餐），与工作簿里手工维护的行保持一致；
+    # 例如写入「衣锦中餐」表时类型填「中餐」，而不是接口分类「午餐」。
+    type_label = SHEET_MEAL_SUFFIX.get(meal_type, meal_type)
+    vals = [order.order_no, order.name, order.address, order.phone] + [1 if d == weekday else "" for d in WEEKDAYS] + [type_label, meal.grade or "", meal.total_meals or ""]
     for idx, value in enumerate(vals, 1):
         target.cell(row2, idx).value = value
 
@@ -674,37 +678,92 @@ def _api_get_json(page: Any, path: str) -> dict[str, Any]:
 def _api_list_waimai_orders(api_get: Callable[[str], dict[str, Any]],
                             selected_date: _dt.date,
                             callback: Callable[[str], Any] | None = None,
-                            page_size: int = 50, max_pages: int = 200) -> list[dict[str, Any]]:
-    """分页拉取外送订单（scene=1，新单在前），整页早于目标日期即停。
+                            page_size: int = 200, max_pages: int = 200,
+                            concurrent_pages: bool = False) -> list[dict[str, Any]]:
+    """分页拉取外送订单（scene=1，新单在前）。
 
-    ``api_get`` 接收接口路径并返回解析后的 JSON，支持浏览器会话内 fetch
-    或纯接口 HTTP 客户端两种实现。
+    实测 m.icall.me 的 ``/channel/order`` GET 接口不支持 ``startTime/endTime``
+    服务端过滤，只能整表分页拉取后由本程序按目标日期筛选。因此这里直接
+    并发拉取全部分页，并使用较大的 ``pageSize=200`` 减少请求次数。
+
+    ``concurrent_pages=True`` 时（纯接口模式）剩余分页并发拉取；浏览器模式
+    保持串行，避免 Playwright 并发问题。
     """
-    rows: list[dict[str, Any]] = []
-    for page_no in range(1, max_pages + 1):
-        payload = api_get(
-            "/channel/order?scene=1&storeId=&orderSn=&userKeyword=&state=&payType=&source="
-            f"&pageNo={page_no}&pageSize={page_size}&startTime=&endTime=",
-        )
-        data = payload.get("data") or {}
-        batch = data.get("list") or []
-        if not batch:
-            break
+    def parse_batch(batch: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
         for item in batch:
             created = item.get("created_at")
-            rows.append({
+            out.append({
                 "order_id": str(item.get("id") or ""),
                 "pick_no": str(item.get("pickNo") or "").strip(),
                 "store_id": str(item.get("storeId") or ""),
                 "created_at": created,
                 "date": parse_order_created_date(created),
             })
+        return out
+
+    def fetch_page(page_no: int, page_size_arg: int,
+                   start_time: str = "", end_time: str = "") -> tuple[list[dict[str, Any]], int | None]:
+        payload = api_get(
+            "/channel/order?scene=1&storeId=&orderSn=&userKeyword=&state=&payType=&source="
+            f"&pageNo={page_no}&pageSize={page_size_arg}&startTime={start_time}&endTime={end_time}",
+        )
+        data = payload.get("data") or {}
+        batch = data.get("list") or []
         total = data.get("total")
-        oldest = rows[-1]["date"]
-        if (oldest is not None and oldest < selected_date) \
-                or (isinstance(total, int) and page_no * page_size >= total):
-            break
-    return rows
+        return parse_batch(batch), (int(total) if isinstance(total, int) else None)
+
+    def fetch_serial(page_size_arg: int, start_time: str = "", end_time: str = "") -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for page_no in range(1, max_pages + 1):
+            batch, total = fetch_page(page_no, page_size_arg, start_time, end_time)
+            if not batch:
+                break
+            rows.extend(batch)
+            if total is not None and page_no * page_size_arg >= total:
+                break
+        return rows
+
+    def fetch_concurrent(page_size_arg: int, start_time: str = "", end_time: str = "") -> list[dict[str, Any]]:
+        first_batch, total = fetch_page(1, page_size_arg, start_time, end_time)
+        if not first_batch:
+            return []
+        rows = list(first_batch)
+        effective = len(first_batch)
+        if total is None or total <= len(rows) or effective <= 0:
+            return rows
+        total_pages = (total + effective - 1) // effective
+        remaining = list(range(2, min(total_pages, max_pages) + 1))
+        if not remaining:
+            return rows
+
+        def load(page_no: int) -> list[dict[str, Any]]:
+            batch, _ = fetch_page(page_no, page_size_arg, start_time, end_time)
+            return batch
+
+        # 实测 pageSize=200 + 10 并发时，6150 条订单约 3~4 秒拉完。
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for batch in executor.map(load, remaining):
+                rows.extend(batch)
+        return rows
+
+    def fetch_safe(page_size_arg: int) -> list[dict[str, Any]]:
+        try:
+            if concurrent_pages:
+                return fetch_concurrent(page_size_arg)
+            return fetch_serial(page_size_arg)
+        except Exception:
+            # 大 pageSize 不被支持时逐级回退，优先保证能完成任务。
+            for fallback in (100, 50):
+                if page_size_arg > fallback:
+                    try:
+                        return fetch_serial(fallback)
+                    except Exception:
+                        continue
+            raise
+
+    return fetch_safe(page_size)
+
 
 
 def _group_orders_by_pick(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -756,6 +815,30 @@ def _order_detail_by_id(api_get: Callable[[str], dict[str, Any]],
         if attempt == 0:
             time.sleep(1)
     return None
+
+
+def _prefetch_order_details(api_get: Callable[[str], dict[str, Any]],
+                            rows_by_pick: dict[str, list[dict[str, Any]]],
+                            numbers: list[int], max_workers: int = 5) -> dict[int, OrderInfo]:
+    """并发预取订单详情（纯接口模式），返回 {W编号: 订单}，失败项不包含在内。
+
+    成功项在串行写表时直接复用；失败项仍走原有串行重试/决策流程。
+    """
+    tasks = []
+    for number in numbers:
+        candidates = rows_by_pick.get(f"W{number}", [])
+        if candidates:
+            tasks.append((number, candidates[0]))
+
+    def fetch(task: tuple[int, dict[str, Any]]) -> tuple[int, OrderInfo | None]:
+        number, entry = task
+        order = _order_detail_by_id(
+            api_get, f"W{number}", entry["order_id"], entry["store_id"])
+        return number, order
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        results = executor.map(fetch, tasks)
+    return {number: order for number, order in results if order is not None}
 
 
 def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | None,
@@ -863,14 +946,20 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     timeout = int(getattr(config, "element_timeout_ms", 8000))
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
         nonlocal processed, found
-        rows = _api_list_waimai_orders(api_get, selected_date, progress_callback)
+        list_start = time.perf_counter()
+        rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
+                                        concurrent_pages=api_mode)
+        _emit(progress_callback,
+              f"拉取订单列表耗时 {(time.perf_counter() - list_start):.1f} 秒")
+
         # 先按目标日期筛选，再遍历当天实际存在的订单，避免先遍历全部 W 编号。
         rows_by_pick = _group_orders_by_pick(_filter_rows_by_date(rows, selected_date))
         numbers = _order_numbers_for_date(rows_by_pick, order_count)
         if not numbers:
             _emit(progress_callback,
                   f"目标日期 {selected_date.isoformat()} 没有找到订单，未写入 Excel")
-        elif order_count:
+            return
+        if order_count:
             _emit(progress_callback,
                   f"已按目标日期筛选，共 {len(numbers)} 个订单待处理："
                   + "、".join(f"W{n}" for n in numbers))
@@ -878,10 +967,39 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             _emit(progress_callback,
                   f"留空模式：自动识别目标日期订单，共 {len(numbers)} 个："
                   + "、".join(f"W{n}" for n in numbers))
+
+        # 纯接口模式下并发预取订单详情；失败项仍走下方串行重试/决策流程。
+        prefetched: dict[int, OrderInfo] | None = None
+        if api_mode and len(numbers) > 1:
+            detail_start = time.perf_counter()
+            prefetched = _prefetch_order_details(api_get, rows_by_pick, numbers, max_workers=5)
+            _emit(progress_callback,
+                  f"并发预取订单详情完成：成功 {len(prefetched)}/{len(numbers)}，"
+                  f"耗时 {(time.perf_counter() - detail_start):.1f} 秒")
+
+        def commit_order(order: OrderInfo) -> None:
+            nonlocal found
+            for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
+                for meal in meals:
+                    for _ in range(max(1, meal.count)):
+                        _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
+            meal_text = _format_order_meals(order)
+            _emit(progress_callback, _format_order_summary(order, meal_text))
+            found += 1
+            _emit(progress_callback, "-------")
+
+        write_start = time.perf_counter()
         for number in numbers:
             if stop_event.is_set():
                 break
             code = f"W{number}"
+
+            # 已并发预取成功：直接复用，跳过详情请求。
+            if prefetched is not None and number in prefetched:
+                processed += 1
+                commit_order(prefetched[number])
+                continue
+
             order: OrderInfo | None = None
             candidates = list(rows_by_pick.get(code, []))
             while candidates and not stop_event.is_set():
@@ -914,14 +1032,11 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             if order is None:
                 _emit(progress_callback, "-------")
                 continue
-            for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
-                for meal in meals:
-                    for _ in range(max(1, meal.count)):
-                        _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
-            meal_text = _format_order_meals(order)
-            _emit(progress_callback, _format_order_summary(order, meal_text))
-            found += 1
-            _emit(progress_callback, "-------")
+            commit_order(order)
+
+        if not stop_event.is_set():
+            _emit(progress_callback,
+                  f"写入 Excel 耗时 {(time.perf_counter() - write_start):.1f} 秒")
 
     try:
         if api_mode:

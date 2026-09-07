@@ -170,3 +170,83 @@ def test_order_numbers_for_date_returns_descending_existing_numbers():
     assert _order_numbers_for_date(rows_by_pick, 3) == [3, 1]
     # 没有订单时为空
     assert _order_numbers_for_date({}, None) == []
+
+
+def test_api_list_waimai_orders_falls_back_to_page_size_50_on_exception():
+    from app.automation import _api_list_waimai_orders
+
+    calls: list[str] = []
+
+    def api_get(path: str) -> dict:
+        calls.append(path)
+        if "pageSize=100" in path or "pageSize=200" in path:
+            raise RuntimeError("large pageSize unsupported")
+        return {
+            "data": {
+                "list": [{
+                    "id": "1", "pickNo": "W1", "storeId": "1",
+                    "created_at": "2026-09-07 10:00:00",
+                }],
+                "total": 1,
+            }
+        }
+
+    rows = _api_list_waimai_orders(api_get, dt.date(2026, 9, 7))
+    assert rows and rows[0]["pick_no"] == "W1"
+    # 默认 200 失败 -> 回退 100 失败 -> 回退 50 成功
+    assert len(calls) == 3
+    assert "pageSize=50" in calls[2]
+
+
+def test_prefetch_order_details_keeps_only_successes_in_order():
+    from app.automation import _prefetch_order_details
+
+    def api_get(path: str) -> dict:
+        if "1001" in path:
+            return {
+                "data": {
+                    "address": {"contact": "张三", "mobile": "13800000000",
+                                "address": "浙江农林大学东湖校区"},
+                    "goods": [{"name": "轻食（午餐）", "num": 1}],
+                }
+            }
+        return {"data": {}}
+
+    rows_by_pick = {
+        "W1": [{"order_id": "1001", "store_id": "1"}],
+        "W2": [{"order_id": "1002", "store_id": "1"}],
+    }
+    result = _prefetch_order_details(api_get, rows_by_pick, [1, 2], max_workers=2)
+    assert set(result) == {1}
+    assert result[1].name == "张三"
+
+
+def test_api_list_waimai_orders_concurrent_pages_fetches_all():
+    import re
+
+    from app.automation import _api_list_waimai_orders
+
+    calls: list[str] = []
+
+    def api_get(path: str) -> dict:
+        calls.append(path)
+        match = re.search(r"pageNo=(\d+)", path)
+        page_no = int(match.group(1)) if match else 1
+        batch = []
+        for i in range(10):
+            idx = (page_no - 1) * 10 + i
+            if idx < 25:
+                batch.append({
+                    "id": str(idx + 1),
+                    "pickNo": f"W{idx + 1}",
+                    "storeId": "1",
+                    "created_at": "2026-09-07 10:00:00",
+                })
+        return {"data": {"list": batch, "total": 25}}
+
+    rows = _api_list_waimai_orders(api_get, dt.date(2026, 9, 7), concurrent_pages=True)
+    assert len(rows) == 25
+    assert rows[0]["pick_no"] == "W1"
+    assert rows[-1]["pick_no"] == "W25"
+    assert any("pageNo=2" in call for call in calls)
+    assert any("pageNo=3" in call for call in calls)
