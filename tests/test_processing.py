@@ -331,7 +331,7 @@ def test_parse_batch_keeps_refund_state():
     assert by_pick["W5"].get("state") is None
 
 
-def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path):
+def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path, monkeypatch):
     """端到端：退款订单不写表，日志与返回值含两类退款汇总。"""
     import threading
 
@@ -382,6 +382,12 @@ def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path):
 
     orig_client = automod.AdminApiClient
     automod.AdminApiClient = FakeClient
+    monkeypatch.setattr(automod, "load_aliases", lambda: {})
+    monkeypatch.setattr(automod, "aliases_path", lambda: tmp_path / "address_aliases.json")
+    monkeypatch.setattr(
+        automod, "write_pending",
+        lambda items, target_date: tmp_path / "pending_addresses.json",
+    )
     logs: list[str] = []
     try:
         result = run_job(FakeConfig(), None, threading.Event(), lambda m: logs.append(m),
@@ -404,3 +410,298 @@ def test_run_job_skips_refunded_orders_and_reports_summary(tmp_path):
     assert "W6" in cells
     assert "W7" not in cells
     assert "W8" not in cells
+
+
+def test_run_job_writes_pending_addresses_after_certain_orders(tmp_path, monkeypatch):
+    """确定点先写，已知校区异常写表尾，未知校区写待确认专表。"""
+    import json
+    import threading
+
+    from openpyxl import load_workbook
+
+    from app import automation as automod
+    from app.automation import run_job
+    from app.excel_templates import write_order_template
+
+    today = dt.date.today()
+    date_text = today.isoformat()
+    excel = tmp_path / "排单.xlsx"
+    report = tmp_path / "pending_addresses.json"
+    write_order_template(excel)
+
+    class FakeConfig:
+        excel_path = str(excel)
+        target_url = "https://example.com"
+        phone_number = "13900000000"
+        order_date = date_text
+        api_mode = True
+        element_timeout_ms = 8000
+        browser_mode = "auto"
+
+    addresses = {
+        "3": "浙江农林大学东湖校区 A5 506",
+        "2": "浙江农林大学东湖校区 B2号楼 b1-2外卖柜",
+        "1": "完全陌生地址",
+    }
+
+    def api_get(path: str) -> dict:
+        if "/channel/order?" in path and "pageNo=1" in path:
+            return {"data": {"list": [
+                {"id": oid, "pickNo": f"W{oid}", "storeId": "1",
+                 "created_at": f"{date_text} 10:00:00", "state": 6}
+                for oid in ("3", "2", "1")
+            ], "total": 3}}
+        for oid, address in addresses.items():
+            if f"/channel/order/{oid}" in path:
+                return {"data": {
+                    "id": oid,
+                    "address": {"contact": f"顾客{oid}", "mobile": "13800000000",
+                                "address": address},
+                    "goods": [{"name": "单点经济餐（午餐）", "num": 1}],
+                }}
+        return {"data": {}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def login(self):
+            pass
+
+        def get_json(self, path):
+            return api_get(path)
+
+    monkeypatch.setattr(automod, "AdminApiClient", FakeClient)
+    monkeypatch.setattr(automod, "load_aliases", lambda: {})
+    monkeypatch.setattr(automod, "aliases_path", lambda: tmp_path / "address_aliases.json")
+    monkeypatch.setattr(
+        automod, "write_pending",
+        lambda items, target_date: report.write_text(
+            json.dumps({"target_date": str(target_date), "items": items}, ensure_ascii=False),
+            encoding="utf-8",
+        ) or report,
+    )
+
+    result = run_job(FakeConfig(), None, threading.Event(), password="pw")
+
+    assert result["processed"] == 3
+    assert result["found"] == 3
+    assert result["address_pending"] == 2
+    assert result["address_pending_orders"] == ["W2", "W1"]
+
+    wb = load_workbook(excel)
+    weekday = automod.WEEKDAYS[(today.weekday() + 1) % 7]
+    day_sheet = wb[weekday]
+    assert [day_sheet["A3"].value, day_sheet["C3"].value] == ["W3", "A5"]
+    assert [day_sheet["A4"].value, day_sheet["C4"].value] == ["W2", addresses["2"]]
+    assert [day_sheet["N3"].value, day_sheet["N4"].value] == ["W3", "W2"]
+    campus = wb["东湖中餐"]
+    assert [campus["A3"].value, campus["C3"].value] == ["W3", "A5"]
+    assert [campus["A4"].value, campus["C4"].value] == ["W2", addresses["2"]]
+    review = wb["待确认地址"]
+    assert [review["A2"].value, review["C2"].value] == ["W1", addresses["1"]]
+    wb.close()
+
+    items = json.loads(report.read_text(encoding="utf-8"))["items"]
+    assert [item["order_numbers"] for item in items] == [["W2"], ["W1"]]
+
+
+def test_pending_report_deduplicates_address_and_keeps_all_orders():
+    from app.automation import _pending_report_items, _prepare_order_address
+
+    raw = "浙江农林大学东湖校区 B1号楼 b2宿舍楼"
+    orders = [
+        OrderInfo(order_no="W2", address=raw, delivery_address=raw),
+        OrderInfo(order_no="W1", address=raw, delivery_address=raw),
+    ]
+    for order in orders:
+        _prepare_order_address(order, {})
+
+    items = _pending_report_items(orders)
+    assert len(items) == 1
+    assert items[0]["order_numbers"] == ["W2", "W1"]
+    assert items[0]["raw_address"] == raw
+    assert items[0]["confidence"] == "medium"
+
+
+def test_historical_pending_order_is_appended_after_certain_order():
+    from app.automation import _prepare_order_address, _write_order
+
+    workbook = Workbook()
+    meal = MealInfo(total_meals=1, grade="经济", meal_type="午餐")
+    certain = OrderInfo(
+        order_no="W2", name="正常", phone="13800000000",
+        address="浙江农林大学东湖校区 A5 506",
+        delivery_address="浙江农林大学东湖校区 A5 506",
+    )
+    pending = OrderInfo(
+        order_no="W1", name="待确认", phone="13800000001",
+        address="浙江农林大学东湖校区 B1号楼 b2宿舍楼",
+        delivery_address="浙江农林大学东湖校区 B1号楼 b2宿舍楼",
+    )
+    _prepare_order_address(certain, {})
+    _prepare_order_address(pending, {})
+    pending.address = pending.delivery_address
+    target = dt.date(2026, 9, 3)
+
+    _write_order(workbook, certain, meal, "午餐", target_date=target,
+                 today=dt.date(2026, 9, 4))
+    _write_order(workbook, pending, meal, "午餐", target_date=target,
+                 today=dt.date(2026, 9, 4))
+
+    sheet = workbook["2026年9月3日 周四"]
+    assert [sheet["A2"].value, sheet["C2"].value] == ["W2", "A5"]
+    assert [sheet["A3"].value, sheet["C3"].value] == [
+        "W1", pending.delivery_address,
+    ]
+
+
+def _build_sheet(ws, addresses, campus_title):
+    ws.title = campus_title
+    ws.append(["标题", None])
+    ws.append(["订单", "姓名", "地址", "电话", "周一"])
+    for i, addr in enumerate(addresses, 1):
+        ws.append([f"W{i}", f"姓名{i}", addr, f"13{i:09d}", 1])
+    return ws
+
+
+def _col_c(ws):
+    return [ws.cell(row=r, column=3).value for r in range(3, ws.max_row + 1)
+            if ws.cell(row=r, column=1).value not in (None, "")]
+
+
+def test_sort_donghu_sub_sheet_order():
+    from openpyxl import Workbook
+    from app.processing import sort_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    _build_sheet(ws, ["D2", "B5", "大西", "小西", "A1", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他", "C9"], "东湖中餐")
+    sort_campus_sub_sheets(wb)
+    assert _col_c(ws) == ["大西", "小西", "A1", "B5", "C9", "D2", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他"]
+
+
+def test_sort_yijin_sub_sheet_order():
+    from openpyxl import Workbook
+    from app.processing import sort_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    _build_sheet(ws, ["外卖柜", "校门口", "浙江省杭州市临安区浙江农林大学联建公寓 E2"], "衣锦中餐")
+    sort_campus_sub_sheets(wb)
+    assert _col_c(ws) == ["校门口", "外卖柜", "浙江省杭州市临安区浙江农林大学联建公寓 E2"]
+
+
+def test_sort_yixue_sub_sheet_order():
+    from openpyxl import Workbook
+    from app.processing import sort_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    _build_sheet(ws, ["医8号", "医3号", "医10号", "5号楼", "未识别点"], "医学院中餐")
+    sort_campus_sub_sheets(wb)
+    # 医N号按数字升序在前，之后其他地址保持原相对顺序
+    assert _col_c(ws)[:4] == ["医3号", "医8号", "医10号", "5号楼"]
+
+
+def test_sort_leaves_weekday_sheet_untouched():
+    from openpyxl import Workbook
+    from app.processing import sort_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "周一"
+    _build_sheet(ws, ["D2", "A1"], "周一")  # 周一表不参与排序
+    ws2 = wb.create_sheet("东湖晚餐")
+    _build_sheet(ws2, ["D2", "A1"], "东湖晚餐")
+    sort_campus_sub_sheets(wb)
+    assert _col_c(ws) == ["D2", "A1"]
+    assert _col_c(ws2) == ["A1", "D2"]
+
+
+def test_clear_campus_sub_sheets_keeps_headers():
+    from openpyxl import Workbook
+    from app.processing import clear_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "东湖中餐"
+    ws.merge_cells("A1:N1")
+    ws["A1"] = "东湖中餐"
+    headers = ["订单", "姓名", "地址", "电话", "周一", "周二", "周三", "周四", "周五", "周六", "周日", "类型", "餐种", "餐次"]
+    ws.append(headers)
+    ws.append(["W1", "张三", "大西", "138", 1, None, None, None, None, None, None, "中餐", "经济", 1])
+    ws.append(["W2", "李四", "A5", "139", 1, None, None, None, None, None, None, "中餐", "经济", 1])
+    ws2 = wb.create_sheet("周一")
+    ws2.merge_cells("A1:F1")
+    ws2["A1"] = "中餐"
+    ws2.append(["订单", "姓名", "地址", "电话", "餐种", "餐次"])
+    ws2.append(["W1", "张三", "大西", "138", "经济", 1])
+
+    cleared = clear_campus_sub_sheets(wb)
+    assert cleared == ["东湖中餐"]
+    # 第1行标题、第2行表头不变
+    assert ws["A1"].value == "东湖中餐"
+    assert ws.cell(2, 1).value == "订单"
+    assert ws.cell(2, 3).value == "地址"
+    # 第3行起全部清空
+    assert ws.cell(3, 1).value is None
+    assert ws.cell(3, 3).value is None
+    assert ws.cell(4, 1).value is None
+    # 周表不动
+    assert ws2.cell(3, 1).value == "W1"
+
+
+def test_clear_campus_sub_sheets_empty_sheet_not_reported():
+    from openpyxl import Workbook
+    from app.processing import clear_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "医学院中餐"
+    ws.merge_cells("A1:N1")
+    ws["A1"] = "医学院中餐"
+    ws.append(["订单", "姓名", "地址", "电话"])
+    assert clear_campus_sub_sheets(wb) == []
+
+
+def test_sort_handles_gap_rows_and_compacts():
+    """回归：数据区中间有空行、数据在后时，排序必须扫描全表并压缩。"""
+    from openpyxl import Workbook
+    from app.processing import sort_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "东湖中餐"
+    ws.append(["东湖中餐"])
+    ws.append(["订单", "姓名", "地址", "电话", "周一"])
+    for _ in range(5):
+        ws.append([None] * 5)  # 中间空行
+    for i, addr in enumerate(["D2", "大西", "B2"], 1):
+        ws.append([f"W{i}", f"n{i}", addr, "1", 1])
+
+    assert sort_campus_sub_sheets(wb) == ["东湖中餐"]
+    got = [(ws.cell(r, 1).value, ws.cell(r, 3).value)
+           for r in range(3, ws.max_row + 1) if ws.cell(r, 1).value not in (None, "")]
+    assert got == [("W2", "大西"), ("W3", "B2"), ("W1", "D2")]
+    # 尾部无残留重复行
+    assert ws.cell(6, 1).value is None
+
+
+def test_clear_deletes_rows_and_shrinks_sheet():
+    """回归：清空必须真删行，max_row 收缩，新数据从第3行起写。"""
+    from openpyxl import Workbook
+    from app.processing import clear_campus_sub_sheets
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "东湖晚餐"
+    ws.append(["东湖晚餐"])
+    ws.append(["订单", "姓名", "地址", "电话", "周一"])
+    for i in range(3):
+        ws.append([f"W{i}", "n", "大西", "1", 1])
+
+    assert clear_campus_sub_sheets(wb) == ["东湖晚餐"]
+    assert ws.max_row == 2
+    assert ws["A1"].value == "东湖晚餐"
+    assert ws.cell(2, 1).value == "订单"

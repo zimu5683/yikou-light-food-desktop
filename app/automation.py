@@ -22,28 +22,36 @@ from typing import Any, Callable, Iterable
 try:
     from .models import MealInfo, OrderInfo
     from .processing import (
+        clear_campus_sub_sheets,
         get_address_base_sheet_name,
         get_donghu_address_segment,
         get_yijin_address_from_product_note,
         parse_receiver_info,
+        sort_campus_sub_sheets,
     )
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     from models import MealInfo, OrderInfo
     from processing import (
+        clear_campus_sub_sheets,
         get_address_base_sheet_name,
         get_donghu_address_segment,
         get_yijin_address_from_product_note,
         parse_receiver_info,
+        sort_campus_sub_sheets,
     )
 
 try:
     from .api_client import AdminApiClient
     from .config import user_data_dir
     from .locators import DEFAULT_LOCATORS, load_locators
+    from .address_aliases import aliases_path, load_aliases, write_pending
+    from .delivery_point import DEFAULT_ALIASES, normalize_delivery_point
 except ImportError:  # pragma: no cover - allows ``python app/automation.py``
     from api_client import AdminApiClient
     from config import user_data_dir
     from locators import DEFAULT_LOCATORS, load_locators
+    from address_aliases import aliases_path, load_aliases, write_pending
+    from delivery_point import DEFAULT_ALIASES, normalize_delivery_point
 
 REG_MEAL_COUNT = re.compile(r"x\s*(\d+)", re.I)
 REG_MEAL_SPLIT = re.compile(r"（午餐）|（晚餐）")
@@ -53,6 +61,10 @@ SHEET_MEAL_SUFFIX = {"午餐": "中餐", "晚餐": "晚餐"}
 WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
 HISTORICAL_SHEET_HEADERS = (
     "取单号", "姓名", "地址", "电话", *WEEKDAYS, "餐别", "经济/豪华", "总餐次",
+)
+PENDING_ADDRESS_HEADERS = (
+    "取单号", "姓名", "地址", "电话", "餐别", "餐种", "餐次",
+    "校区", "置信度", "原因", "候选点",
 )
 
 # 订单列表接口 state 取值（2026-09-11 抓包确认）：state=8 为已退款（同意后退款
@@ -572,6 +584,74 @@ def _write_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str,
         target.cell(row2, idx).value = value
 
 
+def _write_unrouted_order(wb: Any, order: OrderInfo, meal: MealInfo, meal_type: str) -> None:
+    """Write an order whose campus is unknown to a dedicated review sheet."""
+    sheet = wb["待确认地址"] if "待确认地址" in wb.sheetnames else wb.create_sheet("待确认地址")
+    if sheet.max_row == 1 and all(sheet.cell(1, i).value in (None, "")
+                                  for i in range(1, len(PENDING_ADDRESS_HEADERS) + 1)):
+        for i, title in enumerate(PENDING_ADDRESS_HEADERS, 1):
+            sheet.cell(1, i).value = title
+    row = max(2, sheet.max_row + 1)
+    while sheet.cell(row, 1).value not in (None, ""):
+        row += 1
+    dp = order.metadata.get("delivery_point") or {}
+    values = [
+        order.order_no, order.name, order.delivery_address or order.address, order.phone,
+        meal_type, meal.grade or "", meal.total_meals or "", dp.get("campus", "未知"),
+        dp.get("confidence", "unknown"), dp.get("reason", ""),
+        "、".join((dp.get("candidates") or {}).keys()),
+    ]
+    for i, value in enumerate(values, 1):
+        sheet.cell(row, i).value = value
+
+
+def _prepare_order_address(order: OrderInfo, aliases: dict[str, str]) -> dict[str, Any]:
+    """Apply canonical address rules while retaining the platform address."""
+    raw = order.delivery_address or order.address or ""
+    result = normalize_delivery_point(raw, aliases=aliases)
+    campus = result.get("campus")
+    base = order.address_base_sheet
+    if campus == "东湖农林":
+        base = "东湖"
+    elif campus == "医学院":
+        base = "医学院"
+    elif campus == "衣锦联建":
+        base = "衣锦"
+    order.delivery_address = raw
+    order.address_base_sheet = base
+    if campus == "衣锦联建":
+        point = order.address or "校门口"
+        result = {
+            **result, "point": point, "confidence": "high",
+            "reason": "衣锦沿用商品备注规则", "candidates": {point: 1},
+        }
+    order.metadata["delivery_point"] = result
+    if campus in {"东湖农林", "医学院"}:
+        order.address = result.get("point") or raw
+    elif campus == "衣锦联建":
+        order.address = order.address or "校门口"
+    else:
+        order.address = raw
+    return result
+
+
+def _pending_report_items(orders: list[OrderInfo]) -> list[dict[str, Any]]:
+    """Deduplicate pending addresses while retaining every affected order."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for order in orders:
+        dp = order.metadata.get("delivery_point") or {}
+        raw = order.delivery_address or order.address or ""
+        item = grouped.setdefault(raw, {
+            "order_numbers": [], "campus": dp.get("campus", "未知"),
+            "raw_address": raw, "confidence": dp.get("confidence", "unknown"),
+            "reason": dp.get("reason", ""), "candidates": dp.get("candidates") or {},
+            "suggested_point": dp.get("point") or "",
+        })
+        if order.order_no not in item["order_numbers"]:
+            item["order_numbers"].append(order.order_no)
+    return list(grouped.values())
+
+
 def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = None) -> Any:
     if loader is None:
         from openpyxl import load_workbook
@@ -626,7 +706,10 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
     （名称自带（午餐）/（晚餐）标签）、attrData.matal=商品备注。
     """
     address_info = data.get("address") or {}
-    address = " ".join(str(address_info.get(k) or "").strip() for k in ("address", "description")).strip()
+    raw_address = " ".join(
+        str(address_info.get(k) or "").strip() for k in ("address", "description")
+    ).strip()
+    address = raw_address
     name = str(address_info.get("contact") or "").strip()
     phone = str(address_info.get("mobile") or data.get("mobile") or "").strip()
     if not name:
@@ -642,9 +725,7 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
             if isinstance(material, dict) and material.get("name"):
                 notes.append(str(material["name"]))
     base = get_address_base_sheet_name(address)
-    if base == "东湖":
-        address = get_donghu_address_segment(address)
-    elif base == "衣锦":
+    if base == "衣锦":
         address = get_yijin_address_from_product_note(" ".join(notes))
     metadata = {
         "order_id": str(data.get("id") or ""),
@@ -652,7 +733,9 @@ def _order_from_api_data(code: str, data: dict[str, Any]) -> OrderInfo | None:
                              ("created_at", "createdAt", "create_time", "createTime", "order_time", "orderTime")
                              if data.get(key) not in (None, "")), None),
     }
-    candidate = OrderInfo(code, name, phone, address, base, delivery_address=address, metadata=metadata)
+    candidate = OrderInfo(
+        code, name, phone, address, base, delivery_address=raw_address, metadata=metadata
+    )
     candidate.lunch = parse_meal_rows(rows, "午餐")
     candidate.dinner = parse_meal_rows(rows, "晚餐")
     if not (name or phone or address or candidate.lunch or candidate.dinner):
@@ -918,13 +1001,12 @@ def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | N
             except Exception:
                 pass
         name, phone = _read_contact(page, timeout, locators)
-        address = _read_address(page, timeout, locators)
-        base = get_address_base_sheet_name(address)
-        if base == "东湖":
-            address = get_donghu_address_segment(address)
-        elif base == "衣锦":
+        raw_address = _read_address(page, timeout, locators)
+        address = raw_address
+        base = get_address_base_sheet_name(raw_address)
+        if base == "衣锦":
             address = get_yijin_address_from_product_note(extract_product_note_text(page, locators))
-        candidate = OrderInfo(code, name, phone, address, base, delivery_address=address)
+        candidate = OrderInfo(code, name, phone, address, base, delivery_address=raw_address)
         for typ, attr in (("午餐", "lunch"), ("晚餐", "dinner")):
             setattr(candidate, attr, extract_meal_info(page, typ, locators))
         if (name or phone or address or candidate.lunch or candidate.dinner) \
@@ -956,7 +1038,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             order_decision_callback: Callable[[str, str], str] | None = None,
             save_decision_callback: Callable[[str], str] | None = None,
             locators: dict[str, Any] | None = None,
-            target_date: object = None) -> dict[str, int]:
+            target_date: object = None) -> dict[str, Any]:
     """Process the newest W orders and append their meals to the workbook.
 
     ``order_count`` 为空或 0 时表示自动处理目标日期当天的全部订单。
@@ -977,6 +1059,10 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         password = getattr(config, "password", "")
     if locators is None:
         locators = load_locators()
+    # Validate aliases before backing up or touching the workbook.
+    user_aliases = load_aliases()
+    _emit(progress_callback,
+          f"地址别名：{aliases_path()}（用户 {len(user_aliases)} 条，内置 {len(DEFAULT_ALIASES)} 条）")
     api_mode = bool(getattr(config, "api_mode", True))
     backup_dir = excel_path.parent / "backups"
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -989,9 +1075,10 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
     # 退款订单汇总（外层容器供结尾统一打印）：申请退款中 / 已退款 两类 W 编号。
     refunded_numbers: list[int] = []
     applied_numbers: list[int] = []
+    pending_orders: list[OrderInfo] = []
     timeout = int(getattr(config, "element_timeout_ms", 8000))
     def process_orders(api_get: Callable[[str], dict[str, Any]]) -> None:
-        nonlocal processed, found, refunded_numbers, applied_numbers
+        nonlocal processed, found, refunded_numbers, applied_numbers, pending_orders
         list_start = time.perf_counter()
         rows = _api_list_waimai_orders(api_get, selected_date, progress_callback,
                                         concurrent_pages=api_mode)
@@ -1041,18 +1128,27 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                   f"并发预取订单详情完成：成功 {len(prefetched)}/{len(normal_numbers)}，"
                   f"耗时 {(time.perf_counter() - detail_start):.1f} 秒")
 
-        def commit_order(order: OrderInfo) -> None:
+        def commit_order(order: OrderInfo, *, pending: bool) -> None:
             nonlocal found
+            written = 0
             for typ, meals in (("午餐", order.lunch), ("晚餐", order.dinner)):
                 for meal in meals:
                     for _ in range(max(1, meal.count)):
-                        _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
+                        if pending and not order.address_base_sheet:
+                            _write_unrouted_order(wb, order, meal, typ)
+                        else:
+                            _write_order(wb, order, meal, typ, target_date=selected_date, today=today)
+                        written += 1
             meal_text = _format_order_meals(order)
             _emit(progress_callback, _format_order_summary(order, meal_text))
-            found += 1
+            if written:
+                found += 1
+            else:
+                _emit(progress_callback, f"{order.order_no} 未识别到午餐或晚餐，未写入表格")
             _emit(progress_callback, "-------")
 
         write_start = time.perf_counter()
+        collected: list[OrderInfo] = []
         for number in normal_numbers:
             if stop_event.is_set():
                 break
@@ -1061,7 +1157,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             # 已并发预取成功：直接复用，跳过详情请求。
             if prefetched is not None and number in prefetched:
                 processed += 1
-                commit_order(prefetched[number])
+                collected.append(prefetched[number])
                 continue
 
             order: OrderInfo | None = None
@@ -1096,7 +1192,35 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
             if order is None:
                 _emit(progress_callback, "-------")
                 continue
-            commit_order(order)
+            collected.append(order)
+
+        certain_orders: list[OrderInfo] = []
+        pending_orders = []
+        for order in collected:
+            result = _prepare_order_address(order, user_aliases)
+            is_pending = result.get("confidence") != "high" or not order.address_base_sheet
+            if is_pending:
+                order.address = order.delivery_address
+                pending_orders.append(order)
+            else:
+                certain_orders.append(order)
+
+        # 每次写入前先清空六张校区子表第 2 行后的旧数据，避免新旧混排；
+        # 清空只发生在确认当天有订单要写之后（numbers 为空已提前返回）。
+        try:
+            if clear_campus_sub_sheets(wb):
+                _emit(progress_callback, "已清空六张校区子表旧数据")
+        except Exception as exc:  # 清空失败则按原样追加写入，避免丢单。
+            _emit(progress_callback, f"清空旧数据失败（已跳过，继续写入）：{exc}")
+
+        for order in certain_orders:
+            commit_order(order, pending=False)
+        for order in pending_orders:
+            dp = order.metadata.get("delivery_point") or {}
+            _emit(progress_callback,
+                  f"{order.order_no} 地址待确认（{dp.get('reason') or '无法确定点位'}），"
+                  "已以原始地址追加到表尾")
+            commit_order(order, pending=True)
 
         if not stop_event.is_set():
             _emit(progress_callback,
@@ -1152,6 +1276,14 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                     process_orders(lambda path: _api_get_json(page, path))
                 finally:
                     browser.close()
+        report_items = _pending_report_items(pending_orders)
+        report_path = write_pending(report_items, target_date=selected_date)
+        _emit(progress_callback, f"待确认地址报告：{report_path}（{len(report_items)} 种写法）")
+        try:
+            if sort_campus_sub_sheets(wb):
+                _emit(progress_callback, "已按地址整理")
+        except Exception as exc:  # 排序失败不应阻断主流程，原样保存并提示。
+            _emit(progress_callback, f"地址排序失败（已跳过，按原顺序保存）：{exc}")
         _save_workbook_with_retry(wb, excel_path, save_decision_callback)
     finally:
         wb.close()
@@ -1165,8 +1297,13 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
         if applied_numbers:
             _emit(progress_callback, "还在申请退款（待审批，不排单）："
                   + "、".join(f"W{n}" for n in applied_numbers))
+    pending_numbers = [order.order_no for order in pending_orders]
+    if pending_numbers:
+        _emit(progress_callback, "待确认地址（已用原始地址写到表尾）：" + "、".join(pending_numbers))
     return {"processed": processed, "found": found,
-            "refunded": refunded_numbers, "refund_applied": applied_numbers}
+            "refunded": refunded_numbers, "refund_applied": applied_numbers,
+            "address_pending": len(pending_numbers),
+            "address_pending_orders": pending_numbers}
 
 
 def _save_workbook_with_retry(workbook: Any, excel_path: Path,
@@ -1194,6 +1331,20 @@ def _format_order_meals(order: OrderInfo) -> str:
     return "、".join(parts) if parts else "未识别"
 
 
+def _format_address_change(order: OrderInfo) -> str:
+    """Platform address rewritten into the sheet point, joined by an arrow.
+
+    订单摘要里需要一眼看出「平台原地址被改成了排单用的哪个取餐点」：
+    原地址与写入地址一致时（未改动或待确认）只显示原地址；有改动时
+    显示 ``原地址 → 取餐点``，方便人工在日志里复核改写是否合理。
+    """
+    raw = (order.delivery_address or "").strip()
+    point = (order.address or "").strip()
+    if raw and point and raw != point:
+        return f"{raw} → {point}"
+    return point or raw or "未填写"
+
+
 def _format_order_summary(order: OrderInfo, meal_text: str | None = None) -> str:
     """Render one compact, user-facing line for a successfully read order."""
     meals = meal_text if meal_text is not None else _format_order_meals(order)
@@ -1201,7 +1352,7 @@ def _format_order_summary(order: OrderInfo, meal_text: str | None = None) -> str
         order.order_no or "未知订单",
         order.name or "未填写",
         order.phone or "未填写",
-        order.address or "未填写",
+        _format_address_change(order),
         meals,
     ))
 

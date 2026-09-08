@@ -53,6 +53,35 @@ def test_order_log_contains_order_details():
     assert _format_order_summary(order) == "W8｜测试用户｜未填写｜未填写｜午餐经济6餐 x2"
 
 
+def test_order_log_shows_platform_address_to_point_arrow():
+    from app.automation import _format_order_summary
+
+    order = OrderInfo(
+        order_no="W8",
+        name="测试用户",
+        address="A5",
+        delivery_address="浙江省杭州市临安区浙江农林大学(东湖校区) A5 506",
+        lunch=[MealInfo(total_meals=1, meal_type="午餐")],
+    )
+    line = _format_order_summary(order)
+    assert "…校区) A5 506 → A5" in line or "A5 506 → A5" in line
+
+
+def test_order_log_address_unchanged_has_no_arrow():
+    from app.automation import _format_order_summary
+
+    order = OrderInfo(
+        order_no="W8",
+        name="测试用户",
+        address="大西",
+        delivery_address="大西",
+        lunch=[MealInfo(total_meals=1, meal_type="午餐")],
+    )
+    line = _format_order_summary(order)
+    assert "→" not in line
+    assert "大西" in line
+
+
 def test_new_config_has_no_implicit_current_directory_workbook():
     assert AppConfig().excel_path is None
 

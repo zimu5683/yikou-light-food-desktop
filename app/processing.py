@@ -178,3 +178,149 @@ def get_weekday_fill_value(now: Optional[_dt.datetime] = None) -> Dict[str, Any]
     current = (now or _dt.datetime.now()).weekday()
     target = names[(current + 1) % 7]
     return {name: (1 if name == target else "") for name in names}
+
+
+# 校区子表（如「东湖中餐」）的地址排序规则。表名以校区开头、以中餐/晚餐结尾。
+_CAMPUS_SHEET_PREFIXES = ("东湖", "衣锦", "医学院")
+_CAMPUS_SHEET_SUFFIXES = ("中餐", "晚餐")
+_ADDRESS_HEADER_ROWS = 2  # 第 1 行标题、第 2 行表头，数据自第 3 行起
+
+
+def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
+    """Return a comparable key for one address cell value.
+
+    东湖：大西 → 小西 → A/B/C/D（按数字升序）→ 其他；
+    衣锦：校门口 → 外卖柜 → 其他；
+    医学院：医N号（按数字升序）→ 其他。
+    """
+    value = str(address or "").strip()
+    if not value:
+        return (9, 0, 0)
+    if campus == "东湖":
+        if value == "大西":
+            return (0, 0, 0)
+        if value == "小西":
+            return (1, 0, 0)
+        match = re.fullmatch(r"([A-Da-d])\s*(\d{1,3})", value)
+        if match:
+            zone = match.group(1).upper()
+            zone_order = "ABCD".index(zone)
+            return (2, zone_order, int(match.group(2)))
+        return (9, 0, 0)
+    if campus == "衣锦":
+        if "校门口" in value:
+            return (0, 0, 0)
+        if "外卖柜" in value:
+            return (1, 0, 0)
+        return (9, 0, 0)
+    if campus == "医学院":
+        match = re.fullmatch(r"医(\d{1,3})号", value)
+        if match:
+            return (0, int(match.group(1)), 0)
+        return (9, 0, 0)
+    return (9, 0, 0)
+
+
+def clear_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = None) -> list[str]:
+    """Clear all data rows of the six campus sub-sheets before writing.
+
+    仅清空六张校区子表（东湖/衣锦/医学院 × 中餐/晚餐）第 3 行起的数据，
+    第 1 行标题与第 2 行表头保持不动。删除整行（而非仅置空单元格），
+    否则工作表的 max_row 不会收缩、后续写入仍从旧尾部续写。数据区若有
+    合并单元格则退化为逐格置空并提示。返回实际被清空的表名列表。
+    """
+    if log is None:
+        log = lambda _message: None  # noqa: E731
+    cleared: list[str] = []
+
+    for ws in workbook.worksheets:
+        title = ws.title or ""
+        if not any(title.startswith(p) for p in _CAMPUS_SHEET_PREFIXES):
+            continue
+        if not any(title.endswith(s) for s in _CAMPUS_SHEET_SUFFIXES):
+            continue
+        if ws.max_row <= _ADDRESS_HEADER_ROWS:
+            continue
+        data_rows = sum(
+            1 for row in range(_ADDRESS_HEADER_ROWS + 1, ws.max_row + 1)
+            if any(ws.cell(row, col).value not in (None, "") for col in range(1, ws.max_column + 1))
+        )
+        if not data_rows:
+            continue
+        if any(rng.min_row >= _ADDRESS_HEADER_ROWS + 1 for rng in ws.merged_cells.ranges):
+            # 罕见：用户在数据区手加了合并，删行会破坏合并关系，退化为逐格置空。
+            for row in range(_ADDRESS_HEADER_ROWS + 1, ws.max_row + 1):
+                for col in range(1, ws.max_column + 1):
+                    cell = ws.cell(row, col)
+                    if cell.value in (None, ""):
+                        continue
+                    try:
+                        cell.value = None
+                    except AttributeError:
+                        continue  # 合并区从格只读，跳过以不断开合并关系。
+            cleared.append(title)
+            log(f"{title}：已清空旧数据（{data_rows} 行，含合并区仅置空）")
+            continue
+        ws.delete_rows(_ADDRESS_HEADER_ROWS + 1, ws.max_row - _ADDRESS_HEADER_ROWS)
+        cleared.append(title)
+        log(f"{title}：已清空旧数据（{data_rows} 行）")
+
+    return cleared
+
+
+def sort_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = None) -> list[str]:
+    """Sort each campus sub-sheet's rows by address after the run finishes.
+
+    仅整理六张校区子表（东湖/衣锦/医学院 × 中餐/晚餐），周表与历史日期表不动。
+    扫描整张表第 3 行起**所有**非空行一起排序（中间空行会被压缩掉），
+    排好后从第 3 行起连续写回。表头与行样式保持不变。
+    返回已整理的表名列表（便于上层写日志）。
+    """
+    if log is None:
+        log = lambda _message: None  # noqa: E731
+    sorted_sheets: list[str] = []
+
+    for ws in workbook.worksheets:
+        title = ws.title or ""
+        campus = next((p for p in _CAMPUS_SHEET_PREFIXES if title.startswith(p)), None)
+        if campus is None or not any(title.endswith(s) for s in _CAMPUS_SHEET_SUFFIXES):
+            continue
+        # 数据区若有合并单元格则跳过（模板/程序写入的校区表无合并，防御用户手改）。
+        if any(rng.min_row >= _ADDRESS_HEADER_ROWS + 1 for rng in ws.merged_cells.ranges):
+            log(f"{title}：数据区含合并单元格，跳过地址排序")
+            continue
+
+        # 收集整张表第 3 行起所有非空行（A 列有值即算一行），不再遇空行停止。
+        max_col = ws.max_column
+        rows: list[tuple[int, tuple[Any, ...]]] = []
+        for row_index in range(_ADDRESS_HEADER_ROWS + 1, ws.max_row + 1):
+            if ws.cell(row_index, 1).value in (None, ""):
+                continue
+            values = tuple(ws.cell(row_index, col).value for col in range(1, max_col + 1))
+            rows.append((row_index, values))
+        if len(rows) <= 1:
+            continue
+
+        # 地址在第 3 列（C）；Python 排序稳定，同组保持原先后顺序。
+        ordered = sorted(
+            rows,
+            key=lambda item: (_sort_key_for_address(item[1][2], campus), item[0]),
+        )
+        for target_index, (source_index, values) in enumerate(ordered):
+            row = _ADDRESS_HEADER_ROWS + 1 + target_index
+            for col, value in enumerate(values, start=1):
+                ws.cell(row, col).value = value
+        # 排好后多余的尾部旧行清掉（中间空行被压缩后，尾部会残留重复数据）。
+        tail_start = _ADDRESS_HEADER_ROWS + 1 + len(ordered)
+        for row in range(tail_start, ws.max_row + 1):
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row, col)
+                if cell.value not in (None, ""):
+                    try:
+                        cell.value = None
+                    except AttributeError:
+                        pass
+        sorted_sheets.append(title)
+        log(f"{title}：已按地址整理（{len(rows)} 行）")
+
+    return sorted_sheets
