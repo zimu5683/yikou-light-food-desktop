@@ -805,7 +805,7 @@ def test_reconcile_delay_polls_without_duplicate_post(monkeypatch):
         def submit(payload):
             submits.append(payload)
             on_site.append(_full_station_record(
-                task, created_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                task, created_at=int(dt.datetime.now().timestamp() * 1000)))
             return {"success": True}
 
         return submit, lambda: None
@@ -857,12 +857,12 @@ def test_auth_expiry_preserves_successes_confirmed_after_relogin():
             submits.append(payload)
             if len(submits) == 1:
                 on_site.append(_full_station_record(
-                    first, created_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                    first, created_at=int(dt.datetime.now().timestamp() * 1000)))
                 return {"success": True}
             if len(submits) == 2:
                 raise sss._AuthExpired("401")
             on_site.append(_full_station_record(
-                second, created_at=dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+                second, created_at=int(dt.datetime.now().timestamp() * 1000)))
             return {"success": True}
 
         return submit, lambda: None
