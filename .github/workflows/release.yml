@@ -51,6 +51,7 @@ jobs:
       - name: Write update trust config
         env:
           WINDOWS_AUTHENTICODE_PUBLISHER: ${{ vars.YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER }}
+          YIKOU_ALLOW_UNSIGNED_UPDATE: ${{ vars.YIKOU_ALLOW_UNSIGNED_UPDATE }}
         run: python scripts/write_update_trust.py
 
       - name: Build executable
@@ -149,6 +150,7 @@ jobs:
       - name: Write update trust config
         env:
           MACOS_TEAM_ID: ${{ vars.YIKOU_MACOS_TEAM_ID }}
+          YIKOU_ALLOW_UNSIGNED_UPDATE: ${{ vars.YIKOU_ALLOW_UNSIGNED_UPDATE }}
         run: python3 scripts/write_update_trust.py
 
       - name: Build app
@@ -228,6 +230,7 @@ jobs:
         env:
           WINDOWS_AUTHENTICODE_PUBLISHER: ${{ vars.YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER }}
           MACOS_TEAM_ID: ${{ vars.YIKOU_MACOS_TEAM_ID }}
+          YIKOU_ALLOW_UNSIGNED_UPDATE: ${{ vars.YIKOU_ALLOW_UNSIGNED_UPDATE }}
         run: python3 scripts/write_update_trust.py
 
       - name: Build tarball

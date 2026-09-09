@@ -44,12 +44,15 @@ UPDATE_MANIFEST_PUBLIC_KEY = "dnIqg6Tj0ytkB4mk/2I1fbLrpf55TRAH2EyhR73LTHo="
 UPDATE_MANIFEST_KEY_ID = "5b9ba0388caffa07"
 
 
-def _load_update_trust() -> tuple[str, str]:
+def _load_update_trust() -> tuple[str, str, bool]:
     """Load public code-signing trust anchors from the packaged config.
 
     The values are written into ``app/update_trust.json`` during release so the
     final installed app does not depend on end-user environment variables.
     Environment variables still override for development/testing.
+    ``allow_unsigned_update`` is an explicit self-use switch: when no
+    Authenticode/Team ID anchor is available, the updater may skip only the OS
+    publisher check.  Signed manifest and SHA-256 checks are always enforced.
     """
     data: dict[str, Any] = {}
     try:
@@ -66,11 +69,17 @@ def _load_update_trust() -> tuple[str, str]:
         or data.get("macos_team_id")
         or ""
     )
-    return str(windows).strip(), str(macos).strip()
+    raw_allow = os.environ.get("YIKOU_ALLOW_UNSIGNED_UPDATE")
+    if raw_allow is None:
+        allow_unsigned = bool(data.get("allow_unsigned_update", False))
+    else:
+        allow_unsigned = str(raw_allow).strip().lower() not in {"0", "false", "no", "off", ""}
+    return str(windows).strip(), str(macos).strip(), allow_unsigned
 
 
-# 发布者签名主体/Team ID 打包时写入；未配置时对应平台的自动更新 fail-closed。
-WINDOWS_AUTHENTICODE_PUBLISHER, MACOS_TEAM_ID = _load_update_trust()
+# 发布者签名主体/Team ID 打包时写入；未配置时默认 fail-closed。
+# 个人自用构建可显式设置 allow_unsigned_update=true：仍强制校验签名清单与 SHA-256。
+WINDOWS_AUTHENTICODE_PUBLISHER, MACOS_TEAM_ID, ALLOW_UNSIGNED_UPDATE = _load_update_trust()
 # GitHub 直连在国内经常不可达，检查更新与下载都依次尝试：直连 → 国内加速镜像。
 # 前缀只到镜像域名，候选 = 前缀 + 完整 GitHub URL（ghproxy 类服务要求保持原路径）。
 GITHUB_MIRROR_PREFIXES = (
@@ -735,6 +744,9 @@ def _verify_windows_authenticode(path: Path) -> None:
         return
     publisher = str(WINDOWS_AUTHENTICODE_PUBLISHER or "").strip()
     if not publisher:
+        if ALLOW_UNSIGNED_UPDATE:
+            logger.warning("个人自用配置允许未签名更新：跳过 Windows Authenticode 发布者校验")
+            return
         raise UpdateError(
             "未配置 Windows Authenticode 发布者（YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER），"
             "拒绝安装未验证发布者签名的更新")
@@ -771,6 +783,9 @@ def _verify_macos_bundle(app_bundle: Path) -> None:
         return
     team_id = str(MACOS_TEAM_ID or "").strip()
     if not team_id:
+        if ALLOW_UNSIGNED_UPDATE:
+            logger.warning("个人自用配置允许未签名更新：跳过 macOS codesign/Team ID 校验")
+            return
         raise UpdateError(
             "未配置 macOS Team ID（YIKOU_MACOS_TEAM_ID），拒绝安装未验证签名的更新")
     if not _is_macos_platform():

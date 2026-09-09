@@ -621,8 +621,25 @@ def test_windows_authenticode_requires_configured_publisher(monkeypatch):
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
     monkeypatch.setattr(updater, "_is_windows_platform", lambda: True)
     monkeypatch.setattr(updater, "WINDOWS_AUTHENTICODE_PUBLISHER", "")
+    monkeypatch.setattr(updater, "ALLOW_UNSIGNED_UPDATE", False)
     with pytest.raises(UpdateError, match="未配置 Windows Authenticode 发布者"):
         updater._verify_windows_authenticode(Path("app.exe"))
+
+
+def test_windows_authenticode_can_be_explicitly_skipped_for_self_use(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater, "_is_windows_platform", lambda: True)
+    monkeypatch.setattr(updater, "WINDOWS_AUTHENTICODE_PUBLISHER", "")
+    monkeypatch.setattr(updater, "ALLOW_UNSIGNED_UPDATE", True)
+    updater._verify_windows_authenticode(Path("app.exe"))
+
+
+def test_macos_codesign_can_be_explicitly_skipped_for_self_use(monkeypatch):
+    monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(updater, "_is_macos_platform", lambda: True)
+    monkeypatch.setattr(updater, "MACOS_TEAM_ID", "")
+    monkeypatch.setattr(updater, "ALLOW_UNSIGNED_UPDATE", True)
+    updater._verify_macos_bundle(Path("/tmp/App.app"))
 
 
 def test_windows_authenticode_accepts_matching_publisher(monkeypatch):
@@ -821,6 +838,8 @@ def test_manifest_generator_platform_metadata_helper():
 def test_update_trust_loader_allows_packaged_config_or_env_override(monkeypatch):
     monkeypatch.setenv("YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER", "CN=Packaged Publisher")
     monkeypatch.setenv("YIKOU_MACOS_TEAM_ID", "PACKAGEDTEAM")
-    windows, macos = updater._load_update_trust()
+    monkeypatch.setenv("YIKOU_ALLOW_UNSIGNED_UPDATE", "false")
+    windows, macos, allow_unsigned = updater._load_update_trust()
     assert windows == "CN=Packaged Publisher"
     assert macos == "PACKAGEDTEAM"
+    assert allow_unsigned is False
