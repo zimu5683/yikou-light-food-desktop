@@ -28,7 +28,8 @@ from typing import Any, Callable, NamedTuple
 from urllib.parse import urlencode
 
 try:
-    from .api_client import ApiError, SssApiClient, SssTransportError
+    from .api_client import (ApiError, SssApiClient, SssTransportError,
+                             auth_error_message, is_auth_expired_payload)
     from .automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -37,7 +38,8 @@ try:
     )
     from .locators import SSS_LOCATORS, load_sss_locators
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
-    from api_client import ApiError, SssApiClient, SssTransportError
+    from api_client import (ApiError, SssApiClient, SssTransportError,
+                            auth_error_message, is_auth_expired_payload)
     from automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -652,9 +654,33 @@ class _Reconciliation:
 
 
 def _is_auth_expired(exc: BaseException) -> bool:
-    """判断是否为登录态过期（401），过期才值得打断整批去重登。"""
+    """判断是否为登录态过期，过期才值得打断整批去重登。
+
+    闪时送实际使用 HTTP 200 + code=10000 + “token失效，请重新登陆”，
+    因此不能只看 401。
+    """
     text = str(exc)
-    return "401" in text or "登录态已失效" in text
+    lowered = text.lower()
+    keywords = (
+        "401", "code=10000", "code: 10000", "code:10000",
+        "token失效", "token 失效", "token invalid", "invalid token",
+        "登录态失效", "登录已失效", "登录过期", "登录已过期",
+        "请重新登陆", "请重新登录", "unauthorized", "login expired",
+    )
+    return any(keyword in text or keyword in lowered for keyword in keywords)
+
+
+def _with_auth_relogin(operation: Callable[[], Any], relogin: Callable[[], None],
+                       callback: Callable[[str], Any] | None, label: str) -> Any:
+    """执行只读/准备操作；确认登录态失效时重登一次并重试。"""
+    try:
+        return operation()
+    except Exception as exc:
+        if not _is_auth_expired(exc):
+            raise
+        _emit(callback, f"{label}时登录态失效，正在重新登录…")
+        relogin()
+        return operation()
 
 
 def _post_one(client: Any, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1092,11 +1118,19 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
 
 
 def query_balance(fetch_json: Callable[[str], dict[str, Any]]) -> tuple[float | None, float | None]:
-    """查询账户余额，返回 ``(可用余额, 冻结金额)``；查不到返回 ``(None, None)``。"""
+    """查询账户余额，返回 ``(可用余额, 冻结金额)``。
+
+    登录态失效必须向上抛出 ``_AuthExpired``，不能静默返回未知余额；普通
+    接口异常仍按旧策略返回 ``(None, None)`` 以便继续展示日志。
+    """
     try:
         payload = fetch_json(_ACCOUNT_PATH)
-    except Exception:
+    except Exception as exc:
+        if _is_auth_expired(exc):
+            raise _AuthExpired(str(exc)) from exc
         return None, None
+    if is_auth_expired_payload(payload):
+        raise _AuthExpired(auth_error_message(payload))
     result = payload.get("result") if isinstance(payload, dict) else None
     if not isinstance(result, dict):
         return None, None
@@ -1452,14 +1486,6 @@ def run_sss_job(config: Any, stop_event: Any,
             code = captcha_callback(captcha)
             _emit(progress_callback, "正在登录闪时送…")
             client.login(code)
-            _emit(progress_callback, "登录成功，读取门店与常用地址…")
-            prep_start = time.perf_counter()
-            store_id, address = _prepare_store_and_address(
-                client.get_json, config, store_name, common_address,
-                use_fixed_address, progress_callback,
-                store_cache_callback=store_cache_callback)
-            _emit(progress_callback,
-                  f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
 
             def relogin() -> None:
                 _emit(progress_callback, "登录态过期，重新获取验证码并登录…")
@@ -1468,6 +1494,24 @@ def run_sss_job(config: Any, stop_event: Any,
                     raise RuntimeError("纯接口模式需要验证码输入回调")
                 client.login(captcha_callback(img))
                 _emit(progress_callback, "重新登录成功")
+
+            def prepare_session_data() -> tuple[int, dict[str, Any], tuple[float | None, float | None]]:
+                _emit(progress_callback, "登录成功，读取门店与常用地址…")
+                prep_start = time.perf_counter()
+                # 接口模式也串行：requests.Session 不保证线程安全，门店/地址两个
+                # GET 并发共用同一 Session 会出现偶发失败。
+                store_id, address = _prepare_store_and_address(
+                    client.get_json, config, store_name, common_address,
+                    use_fixed_address, progress_callback, parallel=False,
+                    store_cache_callback=store_cache_callback)
+                _emit(progress_callback,
+                      f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
+                balance = query_balance(client.get_json)
+                return store_id, address, balance
+
+            store_id, address, (balance_total, balance_frozen) = _with_auth_relogin(
+                prepare_session_data, relogin, progress_callback, "读取门店/地址/余额")
+            _emit(progress_callback, _format_balance(balance_total, balance_frozen))
 
             tasks = _collect_tasks(
                 orders_by_sheet, store_id, address, goods_name,
@@ -1480,8 +1524,6 @@ def run_sss_job(config: Any, stop_event: Any,
                 unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
             except (TypeError, ValueError):
                 unit_price = 0
-            balance_total, balance_frozen = query_balance(client.get_json)
-            _emit(progress_callback, _format_balance(balance_total, balance_frozen))
             if unit_price > 0:
                 estimate = round(unit_price * len(tasks), 2)
                 _emit(progress_callback,
@@ -1507,7 +1549,16 @@ def run_sss_job(config: Any, stop_event: Any,
             _emit(progress_callback,
                   f"下单与对账耗时 {(time.perf_counter() - submit_start):.1f} 秒，"
                   f"确认 {created}/{processed}")
-            end_total, end_frozen = query_balance(client.get_json)
+            try:
+                end_total, end_frozen = query_balance(client.get_json)
+            except _AuthExpired:
+                _emit(progress_callback, "余额查询时登录态失效，正在重新登录…")
+                relogin()
+                try:
+                    end_total, end_frozen = query_balance(client.get_json)
+                except _AuthExpired as exc:
+                    _emit(progress_callback, f"重新登录后余额查询仍失败：{exc}", "WARN")
+                    end_total, end_frozen = None, None
             _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
             stopped = bool(stop_event.is_set())
             partial = bool(reconciled and final is not None and final.missing and not stopped)
@@ -1560,20 +1611,33 @@ def run_sss_job(config: Any, stop_event: Any,
             _ensure_logged_in(page, account, password, stop_event, progress_callback)
             _minimize_window(browser, progress_callback)
 
-            # 登录会话就绪：门店与地址走共用准备逻辑（门店缓存同样生效）。
-            _emit(progress_callback, "读取门店与常用地址…")
-            prep_start = time.perf_counter()
+            def relogin_browser() -> None:
+                _emit(progress_callback, "登录态过期，重新登录…")
+                page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                _ensure_logged_in(page, account, password, stop_event,
+                                  progress_callback)
+                _minimize_window(browser, progress_callback)
 
             def fetch_json(path: str) -> dict[str, Any]:
                 _, payload = _sss_api(page, "GET", path)
+                if is_auth_expired_payload(payload):
+                    raise _AuthExpired(auth_error_message(payload))
                 return payload
 
-            store_id, address = _prepare_store_and_address(
-                fetch_json, config, store_name, common_address,
-                use_fixed_address, progress_callback, parallel=False,
-                store_cache_callback=store_cache_callback)
-            _emit(progress_callback,
-                  f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
+            def prepare_browser_session_data() -> tuple[int, dict[str, Any]]:
+                _emit(progress_callback, "读取门店与常用地址…")
+                prep_start = time.perf_counter()
+                store_id, address = _prepare_store_and_address(
+                    fetch_json, config, store_name, common_address,
+                    use_fixed_address, progress_callback, parallel=False,
+                    store_cache_callback=store_cache_callback)
+                _emit(progress_callback,
+                      f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
+                return store_id, address
+
+            store_id, address = _with_auth_relogin(
+                prepare_browser_session_data, relogin_browser,
+                progress_callback, "读取门店/地址")
 
             tasks = _collect_tasks(
                 orders_by_sheet, store_id, address, goods_name,
@@ -1586,17 +1650,10 @@ def run_sss_job(config: Any, stop_event: Any,
                   f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行")
             submit_start = time.perf_counter()
 
-            def relogin_browser() -> None:
-                _emit(progress_callback, "登录态过期，重新登录…")
-                page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-                _ensure_logged_in(page, account, password, stop_event,
-                                  progress_callback)
-                _minimize_window(browser, progress_callback)
-
             def submit_browser(payload: dict[str, Any]) -> dict[str, Any]:
                 http, resp = _submit_order(page, payload)
-                if http == 401 or resp.get("code") == 401:
-                    raise _AuthExpired("浏览器会话 401")
+                if http == 401 or is_auth_expired_payload(resp):
+                    raise _AuthExpired(auth_error_message(resp, fallback="浏览器会话登录态失效"))
                 return resp
 
             final, reconciled = _run_reconciled_submission(

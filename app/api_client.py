@@ -19,6 +19,45 @@ class ApiError(RuntimeError):
     """纯接口模式下请求失败或响应异常时抛出。"""
 
 
+AUTH_ERROR_CODES = {401, 10000}
+AUTH_MESSAGE_KEYWORDS = (
+    "token失效", "token 失效", "token invalid", "invalid token",
+    "登录态失效", "登录已失效", "登录过期", "登录已过期",
+    "请重新登陆", "请重新登录", "unauthorized", "login expired",
+)
+
+
+def is_auth_expired_payload(payload: Any) -> bool:
+    """Return True when a Sss JSON payload means "login expired".
+
+    The platform currently uses HTTP 200 + ``code=10000`` with
+    ``message="token失效，请重新登陆"``, so HTTP status alone is not enough.
+    """
+    if not isinstance(payload, dict):
+        return False
+    try:
+        code = int(payload.get("code"))
+    except (TypeError, ValueError):
+        code = None
+    if code in AUTH_ERROR_CODES:
+        return True
+    message = str(payload.get("message") or payload.get("msg") or "")
+    lowered = message.lower()
+    return any(keyword in message or keyword in lowered
+               for keyword in AUTH_MESSAGE_KEYWORDS)
+
+
+def auth_error_message(payload: Any = None, fallback: str = "") -> str:
+    if isinstance(payload, dict):
+        message = str(payload.get("message") or payload.get("msg") or "").strip()
+        code = payload.get("code")
+        if message:
+            return f"闪时送登录态已失效（code={code}，{message}），请重新登录"
+        if code is not None:
+            return f"闪时送登录态已失效（code={code}），请重新登录"
+    return fallback or "闪时送登录态已失效，请重新登录"
+
+
 class SssTransportError(ApiError):
     """闪时送请求未取得可确认响应。
 
@@ -288,8 +327,8 @@ class SssApiClient:
             raise SssTransportError(
                 f"接口 {path} 返回非 JSON（HTTP {resp.status_code}）") from exc
 
-        if payload.get("code") == 401:
-            raise ApiError("闪时送登录态已失效（接口 401），请重新登录")
+        if is_auth_expired_payload(payload):
+            raise ApiError(auth_error_message(payload))
         return payload
 
     def get_json(self, path: str) -> dict[str, Any]:

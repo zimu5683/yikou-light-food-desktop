@@ -897,3 +897,92 @@ def test_collect_tasks_reuses_stable_client_request_id_on_retry():
     enabled = sss._collect_tasks(orders, 99, address, "轻食", account="acct",
                                  idempotency_field="clientRequestId")
     assert enabled[0]["payload"]["clientRequestId"] == enabled[0]["client_request_id"]
+
+
+# ---------------------------------------------------------------------------
+# 闪时送登录态失效识别（HTTP 200 + code=10000）
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("payload", [
+    {"success": False, "message": "token失效，请重新登陆", "code": 10000},
+    {"success": False, "message": "登录态失效，请重新登录", "code": 10000},
+    {"success": False, "message": "TOKEN INVALID", "code": 500},
+    {"success": False, "message": "Unauthorized", "code": 500},
+])
+def test_sss_client_detects_auth_expired_payload(payload):
+    from app.api_client import ApiError, SssApiClient
+
+    class Response:
+        status_code = 200
+
+        def json(self):
+            return payload
+
+    client = SssApiClient("https://example.invalid/takeout", "a", "p")
+    client.session.request = lambda *args, **kwargs: Response()  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ApiError, match="登录态已失效|token|TOKEN|Unauthorized"):
+            client.get_json(sss._ORDER_LIST_PATH)
+    finally:
+        client.close()
+
+
+def test_post_one_maps_code_10000_api_error_to_auth_expired():
+    class Client:
+        def post_json(self, path, payload):
+            raise sss.ApiError("闪时送登录态已失效（code=10000，token失效，请重新登陆），请重新登录")
+
+    with pytest.raises(sss._AuthExpired, match="10000"):
+        sss._post_one(Client(), {})
+
+
+def test_query_balance_propagates_auth_expired_instead_of_silent_none():
+    def fetch_auth(path):
+        raise sss.ApiError("闪时送登录态已失效（code=10000，token失效），请重新登录")
+
+    with pytest.raises(sss._AuthExpired):
+        sss.query_balance(fetch_auth)
+
+    def fetch_payload(path):
+        return {"success": False, "message": "登录态失效，请重新登录", "code": 10000}
+
+    with pytest.raises(sss._AuthExpired):
+        sss.query_balance(fetch_payload)
+
+
+def test_prepare_store_and_address_serial_mode_uses_single_thread():
+    import threading
+    from types import SimpleNamespace
+
+    threads = []
+    responses = {
+        sss._STORE_LIST_PATH: {"result": {"records": [{"id": 1, "name": "一口轻食"}]}},
+        sss._FREQUENT_ADDR_PATH: {"result": {"records": [{
+            "contactName": "嗯哼", "longitude": 1.0, "latitude": 2.0,
+            "code": "330110", "position": "X"}]}},
+    }
+
+    def fetch_json(path):
+        threads.append(threading.current_thread().name)
+        return responses[path]
+
+    cfg = SimpleNamespace(sss_store_id=None, sss_store_name_cached="")
+    store_id, address = sss._prepare_store_and_address(
+        fetch_json, cfg, "一口轻食", "嗯哼", False, None, parallel=False)
+    assert store_id == 1
+    assert address["areaCode"] == "330110"
+    assert len(set(threads)) == 1
+
+
+def test_with_auth_relogin_retries_once_after_token_expired():
+    calls = []
+
+    def operation():
+        calls.append("operation")
+        if calls.count("operation") == 1:
+            raise sss._AuthExpired("token失效，请重新登陆 code=10000")
+        return "ok"
+
+    result = sss._with_auth_relogin(operation, lambda: calls.append("relogin"), None, "读取余额")
+    assert result == "ok"
+    assert calls == ["operation", "relogin", "operation"]
