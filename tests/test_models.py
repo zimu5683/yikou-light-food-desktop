@@ -315,3 +315,11 @@ def test_bridge_reports_reconciliation_failure_as_uncertain(tmp_path, monkeypatc
     assert "站内对账失败" in done["payload"]["message"]
     assert "请勿手动重复提交" in done["payload"]["message"]
     assert bridge.status == "partial"
+
+
+def test_can_auto_install_supports_macos(monkeypatch):
+    import app.bridge as bridge_mod
+
+    monkeypatch.setattr(bridge_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(bridge_mod.sys, "frozen", True, raising=False)
+    assert bridge_mod._can_auto_install() is True

@@ -954,7 +954,12 @@ class Bridge:
 # 模块级工具
 # ----------------------------------------------------------------------
 def _can_auto_install() -> bool:
-    return (os.name == "nt" or sys.platform.startswith("linux")) and getattr(sys, "frozen", False)
+    """Windows / Linux / macOS 打包版均支持自用自动更新。"""
+    return (
+        os.name == "nt"
+        or sys.platform.startswith("linux")
+        or sys.platform == "darwin"
+    ) and getattr(sys, "frozen", False)
 
 
 def _excel_field_error(path: str) -> str:

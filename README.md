@@ -110,7 +110,7 @@ git tag v1.1.0
 git push origin main --tags
 ```
 
-推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 与 Linux 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版安装包，源码运行模式也只提示前往 Release 页面。Linux 自动更新会把新版 tar.gz 解压到程序目录下的 `.yikou-light-food.update-<pid>/` 暂存目录，待本进程退出后由后台脚本原子替换可执行文件并重启，安装目录不可写时回退为提示手动下载。
+推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows、Linux 与 macOS 打包版均可校验、下载并自动安装（macOS 自用模式允许未签名更新，但仍强制校验签名清单与 SHA-256），源码运行模式只提示前往 Release 页面。Linux 自动更新会把新版 tar.gz 解压到程序目录下的 `.yikou-light-food.update-<pid>/` 暂存目录，待本进程退出后由后台脚本原子替换可执行文件并重启；macOS 会替换整个 `.app` bundle 并重启；安装目录不可写时回退为提示手动下载。
 
 更新真实性不再依赖 SHA-256 或镜像：发布工作流用 Ed25519 私钥对 `latest.json` 生成 `latest.json.sig`，客户端只使用内置公钥（`app/updater.py` 中的 `UPDATE_MANIFEST_PUBLIC_KEY`）验证通过的清单。SHA-256 仅用于完整性校验；镜像只负责传输字节流，不能成为信任根。更新器严格拒绝降级、同版本覆盖、非 SemVer 版本、平台/架构不匹配和超过大小限制的资源。
 
