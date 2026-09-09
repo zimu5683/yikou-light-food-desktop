@@ -6,7 +6,9 @@ never prevent the main application from starting.
 """
 from __future__ import annotations
 
+import base64
 import json
+import logging
 import re
 import os
 import shlex
@@ -27,10 +29,48 @@ from urllib.request import Request, urlopen
 
 from . import __version__
 from . import bspatch
+from .update_health import (begin_update_health_check, clear_update_health,
+                            wait_for_health)
+
+logger = logging.getLogger(__name__)
 
 REPOSITORY = "zimu5683/yikou-light-food-desktop"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 LATEST_MANIFEST_URL = f"https://github.com/{REPOSITORY}/releases/latest/download/latest.json"
+LATEST_MANIFEST_SIGNATURE_URL = f"{LATEST_MANIFEST_URL}.sig"
+# 内置 Ed25519 公钥：仅由它验证 latest.json 的真实性，SHA-256 只用于完整性。
+# 私钥保存在发布方机器/CI Secret（UPDATE_SIGNING_KEY）中，绝不进入仓库。
+UPDATE_MANIFEST_PUBLIC_KEY = "dnIqg6Tj0ytkB4mk/2I1fbLrpf55TRAH2EyhR73LTHo="
+UPDATE_MANIFEST_KEY_ID = "5b9ba0388caffa07"
+
+
+def _load_update_trust() -> tuple[str, str]:
+    """Load public code-signing trust anchors from the packaged config.
+
+    The values are written into ``app/update_trust.json`` during release so the
+    final installed app does not depend on end-user environment variables.
+    Environment variables still override for development/testing.
+    """
+    data: dict[str, Any] = {}
+    try:
+        data = json.loads((Path(__file__).with_name("update_trust.json")).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        data = {}
+    windows = (
+        os.environ.get("YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER")
+        or data.get("windows_authenticode_publisher")
+        or ""
+    )
+    macos = (
+        os.environ.get("YIKOU_MACOS_TEAM_ID")
+        or data.get("macos_team_id")
+        or ""
+    )
+    return str(windows).strip(), str(macos).strip()
+
+
+# 发布者签名主体/Team ID 打包时写入；未配置时对应平台的自动更新 fail-closed。
+WINDOWS_AUTHENTICODE_PUBLISHER, MACOS_TEAM_ID = _load_update_trust()
 # GitHub 直连在国内经常不可达，检查更新与下载都依次尝试：直连 → 国内加速镜像。
 # 前缀只到镜像域名，候选 = 前缀 + 完整 GitHub URL（ghproxy 类服务要求保持原路径）。
 GITHUB_MIRROR_PREFIXES = (
@@ -61,6 +101,11 @@ class ReleaseInfo:
     patches: tuple[dict[str, Any], ...] = ()
     manifest_source: str = "api"
     manifest_url: str = ""
+    minimum_supported_version: str = ""
+    manifest_sha256: str = ""
+    manifest_signature: str = ""
+    manifest_key_id: str = ""
+    require_platform_fields: bool = False
 
     @property
     def version(self) -> str:
@@ -173,6 +218,60 @@ def _embedded_asset_sha256(asset: dict[str, Any] | None) -> str:
     return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
 
 
+def _current_architecture(platform_name: str) -> str:
+    if platform_name == "windows":
+        return "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
+    machine = os.uname().machine.lower() if hasattr(os, "uname") else ""
+    return "arm64" if machine in {"arm64", "aarch64"} else "x64"
+
+
+def _asset_matches_platform(asset: dict[str, Any] | None, platform_name: str,
+                            architecture: str, *, require_declared: bool = False) -> bool:
+    """校验清单条目声明的平台/架构。
+
+    ``require_declared=True`` 时（新清单 ``requires_platform_metadata``）
+    未声明 platform/architecture 的条目直接拒绝，避免“没字段就放行”。
+    """
+    if not isinstance(asset, dict):
+        return False
+    declared_platform = str(asset.get("platform") or "").strip().lower()
+    declared_arch = str(asset.get("architecture") or asset.get("arch") or "").strip().lower()
+    if require_declared and (not declared_platform or not declared_arch):
+        return False
+    if declared_platform and declared_platform not in {platform_name, "any"}:
+        return False
+    aliases = {architecture, "any", "universal"}
+    if architecture == "x64":
+        aliases.update({"amd64", "x86_64"})
+    if declared_arch and declared_arch not in aliases:
+        return False
+    return True
+
+
+def _resolve_asset_hash(asset: dict[str, Any] | None, checksum_url: str, *,
+                        opener: Callable[..., Any], timeout: float,
+                        stage_callback: Callable[[str], None] | None = None) -> str:
+    """Return the expected SHA-256 for an asset.
+
+    The signed manifest is the trust root, so an embedded hash always wins over
+    a separately fetched ``.sha256`` file.  The latter is only a compatibility
+    fallback for old releases that do not embed hashes.
+    """
+    if stage_callback:
+        stage_callback("校验安装包")
+    embedded = _embedded_asset_sha256(asset)
+    if embedded:
+        return embedded
+    if not _trusted_url(checksum_url):
+        raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+    try:
+        checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
+        with opener(checksum_request, timeout=timeout) as response:
+            return response.read().decode("ascii").strip().split()[0].lower()
+    except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
+        raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
+
+
 def select_platform_assets(assets: list[dict[str, Any]] | tuple[dict[str, Any], ...],
                            *, platform: str | None = None, architecture: str | None = None) -> tuple[dict[str, Any], ...]:
     """Filter release assets by platform/architecture and safe file names."""
@@ -184,6 +283,8 @@ def select_platform_assets(assets: list[dict[str, Any]] | tuple[dict[str, Any], 
         lower = name.lower()
         if not safe_asset_name(name):
             continue
+        if not _asset_matches_platform(asset, platform, architecture):
+            continue
         if platform == "windows" and lower.endswith(".exe") and "macos" not in lower and "linux" not in lower:
             result.append(asset)
         elif platform == "macos" and lower.endswith(".zip") and "macos" in lower and (architecture in lower or "arm64" not in lower and "x64" not in lower):
@@ -193,15 +294,29 @@ def select_platform_assets(assets: list[dict[str, Any]] | tuple[dict[str, Any], 
     return tuple(result)
 
 
+_SEMVER_RE = re.compile(
+    r"^v?\d+\.\d+\.\d+"
+    r"(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
+    r"(?:\+[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?$"
+)
+
+
 def normalize_version(value: str) -> str:
     """Return a comparable version string (``v1.2.3`` -> ``1.2.3``)."""
-    return str(value or "0").strip().lstrip("vV")
+    text = str(value or "0").strip()
+    return text[1:] if text.lower().startswith("v") else text
+
+
+def is_valid_semver(value: str) -> bool:
+    """严格 SemVer（允许可选的 v 前缀），拒绝 ``1.2``、``latest`` 等格式。"""
+    return bool(_SEMVER_RE.fullmatch(str(value or "").strip()))
 
 
 def _version_parts(value: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
     value = normalize_version(value)
     # Ignore build metadata; compare prerelease identifiers according to the
     # SemVer rule where a release is newer than its prerelease.
+    value = value.split("+", 1)[0]
     core, _, prerelease = value.partition("-")
     numbers = tuple(int(part) if part.isdigit() else 0 for part in core.split("."))
     pre = tuple(part for part in re.split(r"[.-]", prerelease) if part) if prerelease else ()
@@ -290,7 +405,9 @@ def _decode_patches(payload: Any) -> tuple[dict[str, Any], ...]:
     return tuple(patches)
 
 
-def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> ReleaseInfo:
+def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL,
+                     manifest_sha256: str = "", manifest_signature: str = "",
+                     manifest_key_id: str = "") -> ReleaseInfo:
     if not isinstance(payload, dict):
         raise UpdateError("latest.json 格式无效")
     schema = payload.get("schema_version", 1)
@@ -299,6 +416,11 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
     version = str(payload.get("version") or payload.get("tag_name") or "").strip()
     if not version:
         raise UpdateError("latest.json 缺少 version")
+    if not is_valid_semver(version):
+        raise UpdateError(f"latest.json 版本号不是严格 SemVer：{version}")
+    minimum = str(payload.get("minimum_supported_version") or "").strip()
+    if minimum and not is_valid_semver(minimum):
+        raise UpdateError(f"latest.json minimum_supported_version 格式异常：{minimum}")
     assets: list[dict[str, Any]] = []
     raw_assets = payload.get("assets") or []
     if not isinstance(raw_assets, list):
@@ -316,6 +438,7 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
             copied["sha256_url"] = item["sha256_url"]
         assets.append(copied)
     patches = _decode_patches(payload)
+    require_platform = bool(payload.get("requires_platform_metadata"))
     return ReleaseInfo(
         tag_name=version if version.lower().startswith("v") else f"v{version}",
         name=str(payload.get("name") or version),
@@ -325,28 +448,111 @@ def _decode_manifest(payload: Any, *, source_url: str = LATEST_MANIFEST_URL) -> 
         patches=patches,
         manifest_source="manifest",
         manifest_url=source_url,
+        minimum_supported_version=minimum,
+        manifest_sha256=manifest_sha256,
+        manifest_signature=manifest_signature,
+        manifest_key_id=manifest_key_id,
+        require_platform_fields=require_platform,
     )
 
 
-def _fetch_json(url: str, *, timeout: float, opener: Callable[..., Any]) -> Any:
-    """按 [直连, 镜像1, 镜像2...] 依次尝试；每个源内部重试 1 次，抵御网络瞬断。"""
+def _parse_manifest_signature(signature_bytes: bytes) -> tuple[str, str]:
+    """Return ``(key_id, signature_b64)`` from JSON/base64/raw .sig content."""
+    try:
+        text = signature_bytes.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        if len(signature_bytes) == 64:
+            return "", base64.b64encode(signature_bytes).decode("ascii")
+        raise UpdateError("latest.json.sig 不是有效的文本签名")
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        key_id = str(parsed.get("key_id") or parsed.get("keyId") or "").strip()
+        signature = str(parsed.get("signature") or parsed.get("sig") or "").strip()
+        if not signature:
+            raise UpdateError("latest.json.sig 缺少 signature 字段")
+        return key_id, signature
+    parts = text.split()
+    if len(parts) >= 2:
+        # 兼容 ``<key_id> <base64>`` 与 ``<base64> <key_id>`` 两种写法。
+        if re.fullmatch(r"[0-9a-fA-F]{8,64}", parts[0]):
+            return parts[0], parts[1]
+        if re.fullmatch(r"[0-9a-fA-F]{8,64}", parts[-1]):
+            return parts[-1], parts[0]
+    return "", text
+
+
+def verify_manifest_signature(manifest_bytes: bytes, signature_bytes: bytes) -> tuple[str, str]:
+    """用内置 Ed25519 公钥验证清单；返回 ``(key_id, manifest_sha256)``。"""
+    if not UPDATE_MANIFEST_PUBLIC_KEY:
+        raise UpdateError("客户端未内置更新签名公钥，拒绝未签名清单")
+    try:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    except ImportError as exc:  # pragma: no cover - requirements.txt 已固定依赖
+        raise UpdateError("缺少 cryptography，无法验证更新清单签名") from exc
+
+    key_id, signature_b64 = _parse_manifest_signature(signature_bytes)
+    if key_id and key_id.lower() != UPDATE_MANIFEST_KEY_ID.lower():
+        raise UpdateError(f"更新清单签名 key_id 不匹配：{key_id}")
+    try:
+        signature = base64.b64decode(signature_b64, validate=True)
+    except Exception as exc:  # noqa: BLE001 - binascii.Error 等统一转成 UpdateError
+        raise UpdateError("latest.json.sig 不是有效的 Base64 签名") from exc
+    try:
+        public_key = Ed25519PublicKey.from_public_bytes(base64.b64decode(UPDATE_MANIFEST_PUBLIC_KEY))
+    except Exception as exc:  # noqa: BLE001 - 公钥损坏必须 fail-closed
+        raise UpdateError("内置更新公钥格式无效") from exc
+    try:
+        public_key.verify(signature, manifest_bytes)
+    except InvalidSignature as exc:
+        raise UpdateError("更新清单签名验证失败，拒绝使用该 latest.json") from exc
+    return key_id or UPDATE_MANIFEST_KEY_ID, hashlib.sha256(manifest_bytes).hexdigest()
+
+
+def _fetch_bytes(url: str, *, timeout: float, opener: Callable[..., Any]) -> bytes:
+    """按 [直连, 镜像1, 镜像2...] 取字节流；镜像只是传输层。"""
     last_error: Exception | None = None
     for candidate in _github_url_candidates(url):
         for attempt in range(2):
-            request = Request(candidate, headers={"Accept": "application/json", "User-Agent": "yikou-light-food"})
+            request = Request(candidate, headers={"Accept": "application/octet-stream",
+                                                  "User-Agent": "yikou-light-food"})
             try:
                 with opener(request, timeout=timeout) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                    return response.read()
             except Exception as exc:
                 last_error = exc
                 if attempt == 0:
                     time.sleep(0.4)
+    if last_error is None:
+        raise UpdateError(f"无法获取更新元数据：{url}")
     if len(_github_url_candidates(url)) == 1:
-        # 没有镜像可回退时保持原始异常，与旧行为一致。
-        assert last_error is not None
         raise last_error
-    assert last_error is not None
     raise UpdateError(f"Unable to fetch update metadata: {last_error}") from last_error
+
+
+def _fetch_json(url: str, *, timeout: float, opener: Callable[..., Any]) -> Any:
+    """按 [直连, 镜像1, 镜像2...] 依次尝试；每个源内部重试 1 次，抵御网络瞬断。"""
+    return json.loads(_fetch_bytes(url, timeout=timeout, opener=opener).decode("utf-8"))
+
+
+def _fetch_verified_manifest(*, timeout: float, opener: Callable[..., Any]) -> ReleaseInfo:
+    manifest_bytes = _fetch_bytes(LATEST_MANIFEST_URL, timeout=timeout, opener=opener)
+    signature_bytes = _fetch_bytes(LATEST_MANIFEST_SIGNATURE_URL, timeout=timeout, opener=opener)
+    key_id, manifest_sha = verify_manifest_signature(manifest_bytes, signature_bytes)
+    try:
+        payload = json.loads(manifest_bytes.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise UpdateError("latest.json 不是有效 UTF-8 JSON") from exc
+    return _decode_manifest(
+        payload,
+        source_url=LATEST_MANIFEST_URL,
+        manifest_sha256=manifest_sha,
+        manifest_signature=base64.b64encode(signature_bytes).decode("ascii"),
+        manifest_key_id=key_id,
+    )
 
 
 def check_for_update(
@@ -355,21 +561,27 @@ def check_for_update(
     timeout: float = 5.0,
     opener: Callable[..., Any] | None = None,
 ) -> ReleaseInfo | None:
-    """Fetch the latest GitHub release and return it when it is newer."""
+    """获取并验证签名清单；只返回严格高于当前版本的更新。"""
     open_func = opener or urlopen
-    errors: list[str] = []
-    release: ReleaseInfo | None = None
+    if not is_valid_semver(current_version):
+        raise UpdateError(f"当前版本号不是严格 SemVer，拒绝更新：{current_version}")
     try:
-        release = _decode_manifest(_fetch_json(LATEST_MANIFEST_URL, timeout=timeout, opener=open_func))
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
-        errors.append(f"manifest: {exc}")
-    if release is None:
-        try:
-            release = _decode_release(_fetch_json(RELEASES_URL, timeout=timeout, opener=open_func))
-        except (HTTPError, URLError, TimeoutError, OSError, ValueError, UpdateError) as exc:
-            errors.append(f"api: {exc}")
-            raise UpdateError("Unable to check for updates: " + "; ".join(errors)) from exc
-    return release if compare_versions(release.version, current_version) > 0 else None
+        release = _fetch_verified_manifest(timeout=timeout, opener=open_func)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError, UnicodeError, UpdateError) as exc:
+        raise UpdateError(f"Unable to check for updates: 更新清单验证失败：{exc}") from exc
+
+    if release.minimum_supported_version and compare_versions(
+            current_version, release.minimum_supported_version) < 0:
+        raise UpdateError(
+            f"当前版本 {current_version} 低于最低支持版本 {release.minimum_supported_version}，"
+            "请前往 GitHub Release 手动下载完整安装包")
+    comparison = compare_versions(release.version, current_version)
+    if comparison < 0:
+        raise UpdateError(f"更新清单版本 {release.version} 低于当前版本 {current_version}，拒绝降级")
+    if comparison == 0:
+        # 同版本永不自动覆盖；即使发布方重新打包，也不做静默替换。
+        return None
+    return release
 
 
 def download_and_install(
@@ -416,6 +628,10 @@ def download_and_install(
     url = _asset_url(asset)
     if not safe_asset_name(asset_name) or asset_name.lower() != "yikou-light-food.exe" or not _trusted_url(url):
         raise UpdateError("Release does not contain a trusted Windows executable download")
+    if not _asset_matches_platform(
+            asset, "windows", _current_architecture("windows"),
+            require_declared=release.require_platform_fields):
+        raise UpdateError("更新包平台或架构与当前 Windows 版本不匹配")
     target = Path(current_executable or sys.executable).resolve()
     if target.suffix.lower() != ".exe":
         raise UpdateError("Automatic installation is only available from the packaged exe")
@@ -470,26 +686,12 @@ def download_and_install(
     checksum_asset = release.checksum_asset
     checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
     # latest.json 内嵌的官方哈希：GitHub 直连不可达（镜像存在的场景）时，
-    # 校验文件同样拉不到，此时回退到清单内嵌的同一 SHA-256。发布工作流会把
-    # 官方哈希同时写入校验文件与清单。镜像若被完全控制，此回退理论上可被
-    # 绕过；彻底方案是为 exe 做代码签名。
-    embedded_hash = _embedded_asset_sha256(release.executable_asset)
+    # 校验文件同样拉不到，此时回退到已通过 Ed25519 签名验证的清单内嵌哈希。
+    # 镜像只能提供字节流，不能改变受签名保护的 SHA-256。
     try:
-        if stage_callback:
-            stage_callback("校验安装包")
-        if _trusted_url(checksum_url):
-            try:
-                checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-                with (opener or urlopen)(checksum_request, timeout=timeout) as response:
-                    expected_hash = response.read().decode("ascii").strip().split()[0].lower()
-            except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
-                expected_hash = embedded_hash
-                if not expected_hash:
-                    raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
-        else:
-            expected_hash = embedded_hash
-            if not expected_hash:
-                raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+        expected_hash = _resolve_asset_hash(
+            release.executable_asset, checksum_url, opener=opener or urlopen,
+            timeout=timeout, stage_callback=stage_callback)
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid SHA-256")
         actual_hash = hashlib.sha256(temporary.read_bytes()).hexdigest()
@@ -502,12 +704,90 @@ def download_and_install(
         temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
 
+    _verify_windows_authenticode(temporary)
     # A running executable cannot replace itself on Windows.  Launch a copy
     # of the freshly downloaded version from the user's temporary directory;
     # that copy waits for this process to exit, atomically replaces the old
     # executable, and starts the installed copy.  This avoids PowerShell and
     # works with Chinese paths.
     return _schedule_windows_replacement(temporary, target, stage_callback)
+
+
+def _verify_windows_authenticode(path: Path) -> None:
+    """强制校验 Windows Authenticode 发布者；未配置发布者时 fail-closed。
+
+    源码/测试模式不会真正替换用户安装，允许跳过；打包版必须通过校验。
+    """
+    if not getattr(sys, "frozen", False) and os.environ.get("YIKOU_REQUIRE_CODE_SIGNING") != "1":
+        logger.warning("非打包模式跳过 Windows Authenticode 校验")
+        return
+    publisher = str(WINDOWS_AUTHENTICODE_PUBLISHER or "").strip()
+    if not publisher:
+        raise UpdateError(
+            "未配置 Windows Authenticode 发布者（YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER），"
+            "拒绝安装未验证发布者签名的更新")
+    if os.name != "nt":
+        raise UpdateError("当前平台无法执行 Windows Authenticode 校验")
+    escaped = str(path).replace("'", "''")
+    script = (
+        f"$sig = Get-AuthenticodeSignature -LiteralPath '{escaped}'; "
+        "if ($sig.Status -ne 'Valid') { Write-Output \"STATUS:$($sig.Status)\"; exit 1 }; "
+        "Write-Output $sig.SignerCertificate.Subject"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpdateError(f"Windows Authenticode 校验无法执行：{exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stdout or completed.stderr or "").strip()
+        raise UpdateError(f"Windows Authenticode 签名无效：{detail or 'Unknown'}")
+    subject = (completed.stdout or "").strip()
+    if publisher.casefold() not in subject.casefold():
+        raise UpdateError(f"Windows 发布者不匹配：期望 {publisher!r}，实际 {subject!r}")
+
+
+def _verify_macos_bundle(app_bundle: Path) -> None:
+    """校验 codesign、Team ID 与 notarization/Gatekeeper 评估。
+
+    源码/测试模式不会真正替换用户安装，允许跳过；打包版必须通过校验。
+    """
+    if not getattr(sys, "frozen", False) and os.environ.get("YIKOU_REQUIRE_CODE_SIGNING") != "1":
+        logger.warning("非打包模式跳过 macOS codesign 校验")
+        return
+    team_id = str(MACOS_TEAM_ID or "").strip()
+    if not team_id:
+        raise UpdateError(
+            "未配置 macOS Team ID（YIKOU_MACOS_TEAM_ID），拒绝安装未验证签名的更新")
+    if sys.platform != "darwin":
+        raise UpdateError("当前平台无法执行 macOS codesign 校验")
+    commands = [
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_bundle)],
+        ["/usr/sbin/spctl", "--assess", "--type", "execute", "--verbose=4", str(app_bundle)],
+    ]
+    for command in commands:
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=60, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise UpdateError(f"macOS 签名校验无法执行：{exc}") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise UpdateError(f"macOS 签名/公证校验失败：{detail or command[0]}")
+    try:
+        details = subprocess.run(
+            ["/usr/bin/codesign", "-dv", "--verbose=4", str(app_bundle)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpdateError(f"无法读取 macOS Team ID：{exc}") from exc
+    output = f"{details.stdout}\n{details.stderr}"
+    match = re.search(r"TeamIdentifier=([^\s]+)", output)
+    if not match or match.group(1) != team_id:
+        actual = match.group(1) if match else "未找到"
+        raise UpdateError(f"macOS Team ID 不匹配：期望 {team_id}，实际 {actual}")
 
 
 def _sha256_file(path: Path) -> str:
@@ -697,6 +977,7 @@ def _download_and_apply_patch(
         temporary.unlink(missing_ok=True)
         raise UpdateError(f"Unable to verify rebuilt file: {exc}") from exc
 
+    _verify_windows_authenticode(temporary)
     return _schedule_windows_replacement(temporary, target, stage_callback)
 
 
@@ -792,6 +1073,10 @@ def _download_and_install_macos(
     url = _asset_url(asset)
     if not safe_asset_name(asset_name) or not asset_name.lower().endswith(".zip") or not _trusted_url(url):
         raise UpdateError("Release does not contain a trusted macOS archive")
+    if not _asset_matches_platform(
+            asset, "macos", _current_architecture("macos"),
+            require_declared=release.require_platform_fields):
+        raise UpdateError("更新包平台或架构与当前 macOS 版本不匹配")
     executable = Path(sys.executable).resolve()
     if executable.parent.name != "MacOS" or executable.parent.parent.name != "Contents":
         raise UpdateError("无法确定当前应用包结构，无法自动更新")
@@ -825,23 +1110,10 @@ def _download_and_install_macos(
 
     checksum_asset = release.macos_checksum_asset
     checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
-    embedded_hash = _embedded_asset_sha256(release.macos_asset)
     try:
-        if stage_callback:
-            stage_callback("校验安装包")
-        if _trusted_url(checksum_url):
-            try:
-                checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-                with (opener or urlopen)(checksum_request, timeout=timeout) as response:
-                    expected_hash = response.read().decode("ascii").strip().split()[0].lower()
-            except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
-                expected_hash = embedded_hash
-                if not expected_hash:
-                    raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
-        else:
-            expected_hash = embedded_hash
-            if not expected_hash:
-                raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+        expected_hash = _resolve_asset_hash(
+            release.macos_asset, checksum_url, opener=opener or urlopen,
+            timeout=timeout, stage_callback=stage_callback)
         if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
             raise ValueError("invalid SHA-256")
         actual_hash = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -885,17 +1157,55 @@ def _download_and_install_macos(
     if new_app is None or not (new_app / "Contents" / "MacOS").is_dir():
         shutil.rmtree(workdir, ignore_errors=True)
         raise UpdateError("更新包中未找到有效的 .app 应用包")
+    _verify_macos_bundle(new_app)
 
     if stage_callback:
         stage_callback("准备重启")
     pid = os.getpid()
-    script = (
-        f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-        f"rm -rf {shlex.quote(str(app_bundle))}; "
-        f"ditto {shlex.quote(str(new_app))} {shlex.quote(str(app_bundle))}; "
-        f"open {shlex.quote(str(app_bundle))}; "
-        f"rm -rf {shlex.quote(str(workdir))}"
+    new_binary = new_app / "Contents" / "MacOS" / "yikou-light-food"
+    app_path = shlex.quote(str(app_bundle))
+    backup_path = shlex.quote(str(app_bundle) + ".bak")
+    health_enabled = (
+        getattr(sys, "frozen", False)
+        and os.environ.get("YIKOU_SKIP_UPDATE_HEALTH_CHECK") != "1"
     )
+    if health_enabled:
+        health_token, health_marker = begin_update_health_check(tempfile.gettempdir())
+        marker = shlex.quote(health_marker)
+        token = shlex.quote(health_token)
+        health_env = f"YIKOU_UPDATE_HEALTH_FILE={marker} YIKOU_UPDATE_HEALTH_TOKEN={token} "
+        script = (
+            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
+            f"rm -rf {backup_path}; "
+            f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
+            f"if ditto {shlex.quote(str(new_app))} {app_path}; then "
+            f"rm -f {marker}; "
+            f"{health_env}{shlex.quote(str(new_binary))} >/dev/null 2>&1 & new_pid=$!; "
+            f"ok=0; i=0; while [ $i -lt 60 ]; do "
+            f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
+            f"if ! kill -0 $new_pid 2>/dev/null; then break; fi; "
+            f"sleep 1; i=$((i+1)); done; rm -f {marker}; "
+            f"if [ $ok -eq 1 ]; then rm -rf {backup_path}; rm -rf {shlex.quote(str(workdir))}; exit 0; fi; "
+            f"kill $new_pid 2>/dev/null || true; rm -rf {app_path}; "
+            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; "
+            f"rm -rf {shlex.quote(str(workdir))}; exit 1; "
+            f"else rm -rf {app_path}; "
+            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
+            f"fi; rm -rf {shlex.quote(str(workdir))}"
+        )
+    else:
+        script = (
+            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
+            f"rm -rf {backup_path}; "
+            f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
+            f"if ditto {shlex.quote(str(new_app))} {app_path} && open {app_path}; then "
+            f"rm -rf {backup_path}; "
+            f"else rm -rf {app_path}; "
+            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
+            f"fi; rm -rf {shlex.quote(str(workdir))}"
+        )
     try:
         subprocess.Popen(
             ["/bin/sh", "-c", script],
@@ -933,6 +1243,10 @@ def _download_and_install_linux(
     url = _asset_url(asset)
     if not safe_asset_name(asset_name) or not asset_name.lower().endswith(".tar.gz") or not _trusted_url(url):
         raise UpdateError("Release does not contain a trusted Linux archive")
+    if not _asset_matches_platform(
+            asset, "linux", _current_architecture("linux"),
+            require_declared=release.require_platform_fields):
+        raise UpdateError("更新包平台或架构与当前 Linux 版本不匹配")
     target = Path(sys.executable).resolve()
     install_dir = target.parent
     if not install_dir.exists() or not os.access(install_dir, os.W_OK):
@@ -993,25 +1307,11 @@ def _download_and_install_linux(
 
         checksum_asset = release.linux_checksum_asset
         checksum_url = str((checksum_asset or {}).get("sha256_url") or _asset_url(checksum_asset))
-        # latest.json 内嵌的官方哈希：GitHub 直连不可达（镜像存在的场景）时，
-        # 校验文件同样拉不到，此时回退到清单内嵌的同一 SHA-256。
-        embedded_hash = _embedded_asset_sha256(release.linux_asset)
+        # latest.json 内嵌的官方哈希来自已签名清单，优先级高于独立 .sha256。
         try:
-            if stage_callback:
-                stage_callback("校验安装包")
-            if _trusted_url(checksum_url):
-                try:
-                    checksum_request = Request(checksum_url, headers={"User-Agent": "yikou-light-food"})
-                    with (opener or urlopen)(checksum_request, timeout=timeout) as response:
-                        expected_hash = response.read().decode("ascii").strip().split()[0].lower()
-                except (HTTPError, URLError, TimeoutError, OSError, UnicodeError, ValueError, IndexError) as exc:
-                    expected_hash = embedded_hash
-                    if not expected_hash:
-                        raise UpdateError(f"Unable to verify update checksum: {exc}") from exc
-            else:
-                expected_hash = embedded_hash
-                if not expected_hash:
-                    raise UpdateError("Release does not contain a trusted SHA-256 checksum")
+            expected_hash = _resolve_asset_hash(
+                release.linux_asset, checksum_url, opener=opener or urlopen,
+                timeout=timeout, stage_callback=stage_callback)
             if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
                 raise ValueError("invalid SHA-256")
             actual_hash = _sha256_file(archive)
@@ -1049,6 +1349,13 @@ def _extract_linux_binary(archive: Path, destination: Path) -> Path:
                 raise UpdateError("更新包包含非法路径条目")
             if member.issym() or member.islnk() or not (member.isreg() or member.isdir()):
                 raise UpdateError("更新包含有意外条目类型")
+            if member.isreg():
+                # 发布包只允许单个应用二进制；任何额外文件（尤其是可执行文件）
+                # 都可能是夹带物，直接拒绝而不是解压后再筛选。
+                if name != "yikou-light-food":
+                    raise UpdateError(f"更新包包含预期外文件：{name}")
+                if member.mode & 0o7000:
+                    raise UpdateError("更新包中的应用文件带有 setuid/setgid 位")
         try:
             tar.extractall(destination, members=members, filter="data")
         except TypeError:  # Python < 3.12 无过滤参数
@@ -1073,25 +1380,58 @@ def _schedule_linux_replacement(
     *,
     pid: int | None = None,
     launcher: Callable[..., Any] | None = None,
+    health_timeout: float = 60.0,
 ) -> Path:
     """Spawn a detached shell that swaps in the new binary after exit.
 
-    The shell waits for the current process (``pid``) to disappear, renames
-    the staged file over the installed executable (atomic, same filesystem)
-    and execs it.  Staging inside the install directory keeps the rename on
-    one filesystem; the temp workdir is removed either way.
+    The shell waits for the current process to exit, self-checks the staged
+    binary, replaces it, launches it and waits for the GUI startup marker.  If
+    the marker never appears, the previous binary is restored and relaunched.
     """
     if stage_callback:
         stage_callback("准备重启")
     popen = launcher or subprocess.Popen
     pid = os.getpid() if pid is None else pid
     installed = shlex.quote(str(target))
+    backup = shlex.quote(str(target) + ".bak")
     temp = f"{shlex.quote(str(workdir))} {shlex.quote(str(staging_dir))}"
-    script = (
-        f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-        f"if mv -f {shlex.quote(str(staged_binary))} {installed}; then "
-        f"rm -rf {temp} & exec {installed}; fi; rm -rf {temp}"
-    )
+    staged = shlex.quote(str(staged_binary))
+
+    if getattr(sys, "frozen", False) and os.environ.get("YIKOU_SKIP_UPDATE_HEALTH_CHECK") != "1":
+        health_token, health_marker = begin_update_health_check(tempfile.gettempdir())
+        marker = shlex.quote(health_marker)
+        token = shlex.quote(health_token)
+        health_env = f"YIKOU_UPDATE_HEALTH_FILE={marker} YIKOU_UPDATE_HEALTH_TOKEN={token} "
+        checks = max(1, int(health_timeout))
+        script = (
+            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            f"if {staged} --self-check >/dev/null 2>&1; then "
+            f"cp -f {installed} {backup} 2>/dev/null || true; "
+            f"if mv -f {staged} {installed}; then "
+            f"rm -f {marker}; "
+            f"{health_env}{installed} >/dev/null 2>&1 & new_pid=$!; "
+            f"ok=0; i=0; "
+            f"while [ $i -lt {checks} ]; do "
+            f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
+            f"if ! kill -0 $new_pid 2>/dev/null; then break; fi; "
+            f"sleep 1; i=$((i+1)); done; "
+            f"rm -f {marker}; "
+            f"if [ $ok -eq 1 ]; then rm -rf {temp}; exit 0; fi; "
+            f"kill $new_pid 2>/dev/null || true; "
+            f"cp -f {backup} {installed} 2>/dev/null || true; "
+            f"{installed} >/dev/null 2>&1 & rm -rf {temp}; exit 1; "
+            f"fi; fi; "
+            f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
+        )
+    else:
+        script = (
+            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            f"if {staged} --self-check >/dev/null 2>&1; then "
+            f"cp -f {installed} {backup} 2>/dev/null || true; "
+            f"if mv -f {staged} {installed}; then "
+            f"rm -rf {temp} & exec {installed}; fi; fi; "
+            f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
+        )
     try:
         popen(
             ["/bin/sh", "-c", script],
@@ -1106,24 +1446,58 @@ def _schedule_linux_replacement(
     return target
 
 
+def _run_startup_self_check(executable: Path) -> None:
+    """在替换旧版本前运行新产物的 --self-check；失败则中止更新。"""
+    if os.environ.get("YIKOU_SKIP_UPDATE_SELF_CHECK") == "1":
+        return
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        if executable.stat().st_size < 1_000_000:
+            return
+    except OSError:
+        return
+    try:
+        completed = subprocess.run(
+            [str(executable), "--self-check"],
+            capture_output=True, text=True, timeout=60, check=False,
+            cwd=str(executable.parent),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise UpdateError(f"新版本启动自检无法执行：{exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stdout or completed.stderr or "").strip()
+        raise UpdateError(f"新版本启动自检失败，保留当前版本：{detail or completed.returncode}")
+
+
 def apply_pending_update(
     source: str | os.PathLike[str],
     target: str | os.PathLike[str],
     *,
     timeout: float = 120.0,
     retry_interval: float = 0.5,
+    health_timeout: float = 60.0,
     launcher: Callable[..., Any] = subprocess.Popen,
 ) -> Path:
     """Replace ``target`` with a verified downloaded exe and restart it.
 
     This runs inside the temporary updater copy, not inside the installed
     executable.  Retrying ``os.replace`` is both a lock check and an atomic
-    replacement once the original GUI process has fully exited.
+    replacement once the original GUI process has fully exited.  In frozen
+    mode the new process must write a startup health marker, otherwise the
+    old executable is restored and relaunched.
     """
     source_path = Path(source).resolve()
     target_path = Path(target).resolve()
     if not source_path.is_file() or target_path.suffix.lower() != ".exe":
         raise UpdateError("Pending update files are invalid")
+    _run_startup_self_check(source_path)
+    backup_path = target_path.with_name(target_path.name + ".bak")
+    try:
+        if target_path.is_file():
+            shutil.copy2(target_path, backup_path)
+    except OSError as exc:
+        raise UpdateError(f"无法备份当前版本，拒绝替换：{exc}") from exc
     deadline = time.monotonic() + timeout
     last_error: OSError | None = None
     while time.monotonic() < deadline:
@@ -1136,17 +1510,62 @@ def apply_pending_update(
             time.sleep(retry_interval)
     if last_error is not None:
         raise UpdateError(f"Unable to replace the running executable: {last_error}") from last_error
+
+    health_enabled = (
+        getattr(sys, "frozen", False)
+        and os.environ.get("YIKOU_SKIP_UPDATE_HEALTH_CHECK") != "1"
+    )
+    health_token = ""
+    health_marker = ""
+    launch_env: dict[str, str] | None = None
+    if health_enabled:
+        health_token, health_marker = begin_update_health_check(tempfile.gettempdir())
+        launch_env = {
+            **os.environ,
+            "YIKOU_UPDATE_HEALTH_FILE": health_marker,
+            "YIKOU_UPDATE_HEALTH_TOKEN": health_token,
+        }
+    launch_kwargs: dict[str, Any] = {
+        "cwd": str(target_path.parent),
+        "close_fds": True,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if launch_env is not None:
+        launch_kwargs["env"] = launch_env
     try:
-        launcher(
-            [str(target_path)],
-            cwd=str(target_path.parent),
-            close_fds=True,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        launcher([str(target_path)], **launch_kwargs)
     except OSError as exc:
+        # 新版本连启动进程都拉不起来时，立即回滚到上一版，避免应用无法启动。
+        clear_update_health(health_marker)
+        try:
+            shutil.copy2(backup_path, target_path)
+        except OSError:
+            pass
         raise UpdateError(f"Update installed but the application could not restart: {exc}") from exc
+
+    if health_enabled:
+        healthy = wait_for_health(health_marker, health_token, timeout=health_timeout)
+        clear_update_health(health_marker)
+        if not healthy:
+            try:
+                shutil.copy2(backup_path, target_path)
+            except OSError as exc:
+                raise UpdateError(f"新版本启动健康检查失败，且无法恢复旧版本：{exc}") from exc
+            try:
+                launcher(
+                    [str(target_path)],
+                    cwd=str(target_path.parent),
+                    close_fds=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                raise UpdateError(f"新版本启动健康检查失败，旧版本也无法重新启动：{exc}") from exc
+            raise UpdateError("新版本启动健康检查失败，已回滚到上一版本")
+
     _schedule_helper_cleanup(Path(sys.executable).resolve())
     return target_path
 

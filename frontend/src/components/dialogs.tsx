@@ -24,7 +24,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Progress } from '@/components/ui/progress'
-import { useApp, useUpdateAvailable } from '@/hooks/useApp'
+import { useApp, useUpdateAvailable } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 
 const CHOICE_STYLES: Record<string, string> = {

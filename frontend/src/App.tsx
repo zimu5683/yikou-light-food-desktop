@@ -8,7 +8,7 @@ import { CaptchaDialog, DecisionDialog, UpdateAvailableDialog, UpdateProgressDia
 import { LogConsole } from '@/components/LogConsole'
 import { TaskPanel } from '@/components/TaskPanel'
 import { TitleBar } from '@/components/TitleBar'
-import { useApp } from '@/hooks/useApp'
+import { useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 
 const STACK_BREAKPOINT = 980

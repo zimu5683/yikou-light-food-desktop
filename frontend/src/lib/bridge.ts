@@ -20,6 +20,7 @@ export type StatusState =
   | 'running'
   | 'stopping'
   | 'success'
+  | 'partial'
   | 'stopped'
   | 'error'
   | 'updating'
@@ -41,6 +42,9 @@ export interface AppConfigState {
   sss_fixed_lat: number
   sss_fixed_area_code: string
   sss_fixed_address_detail: string
+  sss_dry_run: boolean
+  /** 平台支持客户端幂等字段时由配置指定，默认空 = 至少一次提交+对账确认。 */
+  sss_idempotency_field?: string
   api_mode: boolean
 }
 
@@ -48,6 +52,8 @@ export interface AppState {
   version: string
   status: StatusState
   frozen: boolean
+  /** Python 进程标识：用于识别重启后 sequence 归零，避免复用旧 cursor。 */
+  event_producer_id?: string
   config: AppConfigState
   passwords: { order: string; sss: string }
 }
@@ -80,12 +86,17 @@ export interface UpdateAvailable {
   can_auto_install: boolean
 }
 
-export type BridgeEvent =
+type BridgeEventBase =
   | { event: 'log'; payload: LogEntry }
   | { event: 'status'; payload: { state: StatusState } }
   | {
       event: 'task:done'
-      payload: { message: string; stopped: boolean; result: Record<string, number> }
+      payload: {
+        message: string
+        stopped: boolean
+        partial: boolean
+        result: Record<string, number | boolean | null>
+      }
     }
   | { event: 'task:error'; payload: { message: string } }
   | { event: 'task:browser_missing'; payload: { message: string } }
@@ -98,6 +109,39 @@ export type BridgeEvent =
   | { event: 'update:installed'; payload: { message: string } }
   | { event: 'decision'; payload: DecisionRequest }
   | { event: 'captcha'; payload: CaptchaRequest }
+  | {
+      event: 'events:dropped'
+      payload: {
+        dropped_count: number
+        critical_dropped_count?: number
+        first_sequence?: number
+        last_sequence?: number
+        total_dropped?: number
+        total_critical_dropped?: number
+        message: string
+      }
+    }
+
+export interface BridgeEventMeta {
+  event_id: string
+  sequence: number
+  created_at: number
+  droppable: boolean
+  /** Python 端合成的“事件被丢弃”告警，不对应真实 sequence。 */
+  synthetic?: boolean
+}
+
+export type BridgeEvent = BridgeEventBase & BridgeEventMeta
+
+export interface DrainEventsResult {
+  events: BridgeEvent[]
+  producer_id: string
+  latest_sequence: number
+  acked_sequence: number
+  dropped_count: number
+  critical_dropped_count?: number
+  first_available_sequence: number
+}
 
 // ---------- js_api 载荷 ----------
 
@@ -134,6 +178,7 @@ export interface SssConfigPayload {
   fixed_lat?: string | number
   fixed_area_code?: string
   fixed_address_detail?: string
+  dry_run?: boolean
   api_mode?: boolean
 }
 
@@ -150,11 +195,14 @@ export interface SssFormPayload {
   fixed_area_code: string
   fixed_address_detail: string
   remember: boolean
+  dry_run: boolean
   api_mode: boolean
 }
 
 export interface FieldErrors {
   ok: boolean
+  reason?: string
+  message?: string
   fields?: Record<string, { message: string }>
 }
 
@@ -176,7 +224,7 @@ interface PywebviewApi {
   install_update(): Promise<{ ok: boolean; reason?: string }>
   open_external(url: string): Promise<{ ok: boolean }>
   frontend_report(payload: Record<string, unknown> | string): Promise<{ ok: boolean }>
-  drain_events(): Promise<{ events: BridgeEvent[] }>
+  drain_events(lastSequence?: number, ackSequence?: number, producerId?: string): Promise<DrainEventsResult>
   begin_window_drag(x: number, y: number): Promise<{ ok: boolean; handled: boolean }>
   echo_test(message: string, payload?: Record<string, unknown>): Promise<{ echo: string; payload_keys: string[] | null }>
   window_action(action: 'minimize' | 'toggle_maximize' | 'close'): Promise<{ action?: string }>
@@ -202,6 +250,115 @@ const queued: BridgeEvent[] = []
 
 /** Python 端就绪前的事件先入队，握手后统一回放。 */
 let apiReady = false
+
+// ---------- cursor / 重放 / 去重 ----------
+//
+// Python 保留最近事件并按 sequence 返回；前端只在事件成功 dispatch 后推进
+// cursor，并持久化到 localStorage。页面刷新/短暂断开后可从断点重放；同一
+// event_id 不会重复应用。Python 进程重启会换 producer_id，此时 cursor 归零。
+const CURSOR_STORAGE_KEY = 'yikou.bridge.cursor.v1'
+const DEDUPE_LIMIT = 5000
+
+interface StoredCursor {
+  producerId: string
+  sequence: number
+  ackSequence: number
+}
+
+let eventProducerId = ''
+let eventCursor = 0
+let eventAckCursor = 0
+let droppedCountNotified = 0
+const seenEventIds = new Set<string>()
+const seenEventOrder: string[] = []
+
+function readStoredCursor(): void {
+  try {
+    const raw = window.localStorage.getItem(CURSOR_STORAGE_KEY)
+    if (!raw) return
+    const parsed = JSON.parse(raw) as Partial<StoredCursor>
+    if (typeof parsed.producerId === 'string') eventProducerId = parsed.producerId
+    if (typeof parsed.sequence === 'number') eventCursor = Math.max(0, parsed.sequence)
+    if (typeof parsed.ackSequence === 'number') eventAckCursor = Math.max(0, parsed.ackSequence)
+  } catch {
+    // localStorage 不可用（隐私模式/文件协议）时退化为本次页面内 cursor。
+  }
+}
+
+function persistCursor(): void {
+  try {
+    const value: StoredCursor = {
+      producerId: eventProducerId,
+      sequence: eventCursor,
+      ackSequence: eventAckCursor,
+    }
+    window.localStorage.setItem(CURSOR_STORAGE_KEY, JSON.stringify(value))
+  } catch {
+    // 忽略存储失败；下一次轮询仍按内存 cursor 继续。
+  }
+}
+
+function adoptProducer(producerId?: string): void {
+  if (!producerId || producerId === eventProducerId) return
+  // 新的 Python 进程：旧 sequence 无意义，必须从头消费保留窗口。
+  eventProducerId = producerId
+  eventCursor = 0
+  eventAckCursor = 0
+  droppedCountNotified = 0
+  seenEventIds.clear()
+  seenEventOrder.length = 0
+  persistCursor()
+}
+
+function rememberEventId(eventId: string): boolean {
+  if (seenEventIds.has(eventId)) return false
+  seenEventIds.add(eventId)
+  seenEventOrder.push(eventId)
+  if (seenEventOrder.length > DEDUPE_LIMIT) {
+    const oldest = seenEventOrder.shift()
+    if (oldest) seenEventIds.delete(oldest)
+  }
+  return true
+}
+
+readStoredCursor()
+
+/** 拉取并应用一批桥接事件；由 useApp 的定时轮询调用。 */
+export async function pullBridgeEvents(): Promise<void> {
+  if (!isApiReady()) return
+  const result = await api().drain_events(eventCursor, eventAckCursor, eventProducerId)
+  if (!result) return
+  adoptProducer(result.producer_id)
+
+  for (const event of result.events) {
+    if (event.sequence <= eventCursor && !event.synthetic) continue
+    if (seenEventIds.has(event.event_id)) {
+      // 之前已成功应用但 cursor 尚未推进（例如持久化前页面抖动）：补推进即可。
+      if (event.sequence > eventCursor) eventCursor = event.sequence
+      continue
+    }
+    try {
+      dispatch(event)
+    } catch (error) {
+      // 监听器异常时绝不能推进 cursor：保留该事件，下一次轮询重放。
+      console.error('bridge event listener failed; event will be replayed', error)
+      break
+    }
+    rememberEventId(event.event_id)
+    if (event.sequence > eventCursor) eventCursor = event.sequence
+  }
+
+  if (result.acked_sequence > eventAckCursor) eventAckCursor = result.acked_sequence
+  eventAckCursor = Math.max(eventAckCursor, eventCursor)
+  if (result.dropped_count > droppedCountNotified) {
+    droppedCountNotified = result.dropped_count
+  }
+  persistCursor()
+}
+
+export function bridgeCursor(): StoredCursor {
+  return { producerId: eventProducerId, sequence: eventCursor, ackSequence: eventAckCursor }
+}
 
 function dispatch(message: BridgeEvent): void {
   if (!apiReady) {
@@ -231,12 +388,19 @@ export function api(): PywebviewApi {
         // 文件对话框等会合法长阻塞的调用不设超时。
         const timeoutMs = prop === 'drain_events' ? 4000 : 0
         if (!timeoutMs) return promise
-        return Promise.race([
-          promise,
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('bridge timeout')), timeoutMs),
-          ),
-        ])
+        return new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('bridge timeout')), timeoutMs)
+          promise.then(
+            (value) => {
+              clearTimeout(timer)
+              resolve(value)
+            },
+            (error) => {
+              clearTimeout(timer)
+              reject(error)
+            },
+          )
+        })
       }
     },
   }) as PywebviewApi
@@ -273,6 +437,7 @@ export async function connectBridge(): Promise<ReadyResult> {
     return { state: mockState(), mocked: true }
   }
   const state = await api().bridge_ready()
+  adoptProducer(state.event_producer_id)
   apiReady = true
   for (const message of queued.splice(0)) dispatch(message)
   return { state, mocked: false }
@@ -300,6 +465,8 @@ function mockState(): AppState {
       sss_fixed_lat: 30.256632,
       sss_fixed_area_code: '330110',
       sss_fixed_address_detail: '浙江农林大学东湖校区',
+      sss_dry_run: true,
+      sss_idempotency_field: '',
       api_mode: true,
     },
     passwords: { order: '', sss: '' },

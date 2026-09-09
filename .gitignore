@@ -23,6 +23,8 @@ yikou-light-food-linux-*.tar.gz.sha256
 !.env.example
 config.json
 credentials.json
+*.pem
+*.key
 
 # User data / logs / browser cache
 *.xlsx
@@ -40,3 +42,14 @@ playwright-browsers/
 *.suo
 .DS_Store
 Thumbs.db
+
+# Diagnostic artifacts / business data (never commit)
+.zcode/
+*.jsonl
+localStorage.json
+*.har
+*.pcap
+latest.json
+latest.json.sig
+workspace-before-audit.patch
+*.bak

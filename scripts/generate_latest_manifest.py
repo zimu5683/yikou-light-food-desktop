@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -31,6 +30,20 @@ def release_payload(repository: str, tag: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _asset_platform(name: str) -> tuple[str, str]:
+    """Return (platform, architecture) for a release asset."""
+    lower = name.lower()
+    if lower.endswith(".exe") or ".exe." in lower:
+        return "windows", "x64"
+    if "macos" in lower:
+        # 当前 macOS 包是单一通用 zip；如需按架构拆分，在此扩展即可。
+        return "macos", "universal"
+    if "linux" in lower:
+        architecture = "arm64" if ("arm64" in lower or "aarch64" in lower) else "x64"
+        return "linux", architecture
+    return "", ""
+
+
 def main() -> int:
     repository = os.environ.get("GITHUB_REPOSITORY", "zimu5683/yikou-light-food-desktop")
     tag = os.environ.get("GITHUB_REF_NAME", "")
@@ -52,8 +65,8 @@ def main() -> int:
         raise RuntimeError("timed out waiting for all platform release assets")
 
     # 官方 SHA-256 同时内嵌进清单：GitHub 直连不可达、.sha256 校验文件拉不到
-    # 时，更新器可回退使用此处内嵌的同一官方哈希（镜像被完全控制时该回退
-    # 理论上可被绕过，彻底方案是为 exe 做代码签名）。
+    # 时，更新器可回退使用此处内嵌的同一官方哈希。清单本身由 Ed25519 签名，
+    # 镜像无法同时篡改清单与哈希。
     checksum_files = {
         "yikou-light-food.exe": Path("dist") / "yikou-light-food.exe.sha256",
         "yikou-light-food-macos.zip": Path("dist") / "yikou-light-food-macos.zip.sha256",
@@ -64,10 +77,13 @@ def main() -> int:
         name = str(item.get("name") or "")
         if name not in REQUIRED:
             continue
+        platform, architecture = _asset_platform(name)
         entry = {
             "name": name,
             "url": item.get("browser_download_url"),
             "size": item.get("size"),
+            "platform": platform,
+            "architecture": architecture,
             "sha256_url": next((other.get("browser_download_url") for other in payload.get("assets", [])
                                 if other.get("name") == f"{name}.sha256"), None),
         }
@@ -79,17 +95,23 @@ def main() -> int:
     patches = _load_patches(payload)
     manifest = {
         "schema_version": 1,
+        "requires_platform_metadata": True,
         "version": str(payload.get("tag_name") or tag),
         "url": str(payload.get("html_url") or ""),
         "body": str(payload.get("body") or ""),
         "assets": assets,
     }
+    minimum = os.environ.get("MINIMUM_SUPPORTED_VERSION", "").strip()
+    if minimum:
+        manifest["minimum_supported_version"] = minimum
     if patches:
         manifest["patches"] = patches
     with open("latest.json", "w", encoding="utf-8", newline="\n") as handle:
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
-    subprocess.run(["gh", "release", "upload", tag, "latest.json", "--repo", repository, "--clobber"], check=True)
+    # 清单不在此处上传：发布工作流必须先调用 sign_latest_manifest.py，
+    # 再把 latest.json + latest.json.sig 一起上传，避免出现无签名窗口。
+    print("latest.json generated; sign it before uploading")
     return 0
 
 

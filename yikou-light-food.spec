@@ -14,6 +14,11 @@ if not (frontend_dist / "index.html").is_file():
     )
 
 datas, binaries, hiddenimports = collect_all("playwright")
+# Ed25519 更新清单签名校验使用 cryptography；显式收集避免单文件包漏掉。
+hiddenimports += [
+    "cryptography.hazmat.primitives.asymmetric.ed25519",
+    "cryptography.hazmat.primitives.serialization",
+]
 # Include the complete Vite output. The HTML references sibling assets such as
 # the favicon and icon sprite even though its JS/CSS are inlined. Build the
 # regular two-item ``(source, destination)`` data tuples expected by Analysis.
@@ -22,6 +27,10 @@ datas += [
     for path in frontend_dist.rglob("*")
     if path.is_file()
 ]
+# 代码签名信任锚（发布者/Team ID）随包分发，不依赖用户环境变量。
+update_trust = project / "app" / "update_trust.json"
+if update_trust.is_file():
+    datas.append((str(update_trust), "app"))
 # The browser payload is machine-specific and is intentionally not bundled.
 datas = [item for item in datas if ".local-browsers" not in str(item[0])]
 binaries = [item for item in binaries if ".local-browsers" not in str(item[0])]

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import logging
 from pathlib import Path
 
+from . import __version__
 from .bridge import Bridge
 from .config import user_data_dir
+from .update_health import mark_startup_healthy
 
 WINDOW_TITLE = "一口轻食 - 订单处理"
 logger = logging.getLogger(__name__)
@@ -92,8 +95,16 @@ def run() -> None:
         raise RuntimeError("pywebview 窗口创建失败") from exc
     bridge.attach(window)
     window.events.closing += bridge.on_native_closing
+
+    def _on_gui_ready() -> None:
+        # 等待 GUI 事件循环真正跑起来后再写健康标记，避免“进程活着但窗口
+        # 没起来”被误判为更新成功。
+        time.sleep(0.5)
+        mark_startup_healthy(__version__)
+
     try:
         webview.start(
+            func=_on_gui_ready,
             debug=debug,
             # 关闭私有模式：让 localStorage / cookie 持久化，否则每次重启
             # 主题等本地设置都会回到默认浅色。

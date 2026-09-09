@@ -47,3 +47,23 @@ def test_frozen_frontend_target_is_file_uri(monkeypatch, tmp_path: Path) -> None
     assert debug is False
     assert urlparse(target).scheme == "file"
     assert Path(url2pathname(unquote(urlparse(target).path))) == frozen_index
+
+
+def test_main_self_check_imports_critical_modules(monkeypatch, capsys):
+    from app.main import main
+
+    monkeypatch.setattr("sys.argv", ["yikou-light-food", "--self-check"])
+    main()
+    assert "self-check OK" in capsys.readouterr().out
+
+
+def test_update_health_marker_roundtrip(tmp_path, monkeypatch):
+    from app.update_health import mark_startup_healthy, wait_for_health
+
+    marker = tmp_path / "health.json"
+    monkeypatch.setenv("YIKOU_UPDATE_HEALTH_FILE", str(marker))
+    monkeypatch.setenv("YIKOU_UPDATE_HEALTH_TOKEN", "token-123")
+    mark_startup_healthy("3.1.0")
+
+    assert wait_for_health(marker, "token-123", timeout=0.5)
+    assert not wait_for_health(marker, "wrong-token", timeout=0.01)

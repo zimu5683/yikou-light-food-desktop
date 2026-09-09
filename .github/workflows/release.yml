@@ -16,21 +16,21 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
 
       - name: Set up pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: pnpm
@@ -47,6 +47,11 @@ jobs:
           if ("v$version" -ne "${{ github.ref_name }}") {
             throw "Tag ${{ github.ref_name }} does not match app version v$version"
           }
+
+      - name: Write update trust config
+        env:
+          WINDOWS_AUTHENTICODE_PUBLISHER: ${{ vars.YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER }}
+        run: python scripts/write_update_trust.py
 
       - name: Build executable
         shell: pwsh
@@ -83,7 +88,7 @@ jobs:
           @("## $tag", "", "$changes") | Set-Content -Path release-notes.md -Encoding utf8
 
       - name: Upload executable artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: yikou-light-food-windows
           path: |
@@ -94,7 +99,7 @@ jobs:
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           name: "${{ github.ref_name }}"
           body_path: release-notes.md
@@ -104,13 +109,13 @@ jobs:
             dist/*.patch
           fail_on_unmatched_files: true
 
-      # The manifest job embeds the official SHA-256 into latest.json so the
-      # updater can still verify downloads when GitHub direct connections are
-      # unreachable and only the mirror prefixes respond.  patch-meta.json is
-      # optional: a first release has no previous tag to diff against.
+      # The manifest job embeds the official SHA-256 into latest.json; the
+      # client trusts that hash because latest.json itself is verified with a
+      # built-in Ed25519 key before use.  patch-meta.json is optional: a first
+      # release has no previous tag to diff against.
       - name: Upload checksum metadata for manifest
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: windows-release-meta
           path: |
@@ -121,14 +126,14 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: pnpm
@@ -141,6 +146,11 @@ jobs:
         run: |
           version="$(python3 -c 'from app import __version__; print(__version__)')"
           test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: Write update trust config
+        env:
+          MACOS_TEAM_ID: ${{ vars.YIKOU_MACOS_TEAM_ID }}
+        run: python3 scripts/write_update_trust.py
+
       - name: Build app
         run: bash scripts/build_macos.sh
       - name: Smoke-test application imports on macOS
@@ -161,7 +171,7 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent "dist/yikou-light-food.app" "yikou-light-food-macos.zip"
           shasum -a 256 "yikou-light-food-macos.zip" > "yikou-light-food-macos.zip.sha256"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: yikou-light-food-macos
           path: |
@@ -169,7 +179,7 @@ jobs:
             yikou-light-food-macos.zip.sha256
       - name: Publish macOS app to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             yikou-light-food-macos.zip
@@ -177,7 +187,7 @@ jobs:
           fail_on_unmatched_files: true
       - name: Upload checksum metadata for manifest
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: macos-release-meta
           path: yikou-light-food-macos.zip.sha256
@@ -192,16 +202,16 @@ jobs:
       # is compiled against it; setup-python interpreters cannot import it.
       PYTHON_BIN: python3
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install GTK/WebKitGTK bindings for pywebview
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq python3-gi python3-pip \
             gir1.2-gtk-3.0 gir1.2-webkit2-4.1 libwebkit2gtk-4.1-0
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "24"
           cache: pnpm
@@ -214,6 +224,12 @@ jobs:
         run: |
           version="$(python3 -c 'from app import __version__; print(__version__)')"
           test "v${version}" = "${GITHUB_REF_NAME}"
+      - name: Write update trust config
+        env:
+          WINDOWS_AUTHENTICODE_PUBLISHER: ${{ vars.YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER }}
+          MACOS_TEAM_ID: ${{ vars.YIKOU_MACOS_TEAM_ID }}
+        run: python3 scripts/write_update_trust.py
+
       - name: Build tarball
         run: bash scripts/build_linux.sh
       - name: Smoke-test application imports on Linux
@@ -243,7 +259,7 @@ jobs:
             exit 1
           fi
           echo "frozen GUI started successfully"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: yikou-light-food-linux
           path: |
@@ -262,7 +278,7 @@ jobs:
           python3 scripts/generate_patch.py linux
       - name: Publish Linux tarball to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             yikou-light-food-linux-x64.tar.gz
@@ -271,7 +287,7 @@ jobs:
       # 首个版本没有补丁，此处不做严格匹配。
       - name: Publish Linux patch to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*.patch
           fail_on_unmatched_files: false
@@ -288,7 +304,7 @@ jobs:
           fi
       - name: Upload checksum metadata for manifest
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: linux-release-meta
           path: linux-release-meta
@@ -304,26 +320,42 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: "3.11"
       - name: Download Windows checksum metadata
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: windows-release-meta
           path: dist
       - name: Download macOS checksum metadata
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: macos-release-meta
           path: dist
       - name: Download Linux checksum metadata
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: linux-release-meta
           path: dist
+      - name: Install signing dependency
+        run: python -m pip install "cryptography>=42,<52"
+
       - name: Generate latest.json manifest
         env:
           GH_TOKEN: ${{ github.token }}
+          MINIMUM_SUPPORTED_VERSION: ${{ vars.MINIMUM_SUPPORTED_VERSION }}
         run: python scripts/generate_latest_manifest.py
+
+      - name: Sign latest.json manifest
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: python scripts/sign_latest_manifest.py
+
+      - name: Publish signed manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" latest.json latest.json.sig \
+            --repo "${GITHUB_REPOSITORY}" --clobber

@@ -21,7 +21,7 @@ import {
 } from '@/components/ui/dialog'
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
-import { useApp, type FieldErrors, type TaskMode } from '@/hooks/useApp'
+import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
 import { api, isApiReady, type OrderFormPayload, type SssFormPayload } from '@/lib/bridge'
 import { cn } from '@/lib/utils'
 
@@ -30,7 +30,8 @@ function modeError(fields: FieldErrors | null, key: string): string | undefined 
 }
 
 export function TaskPanel() {
-  const { mode, setMode, workerAlive } = useApp()
+  const { mode, setMode, workerAlive, config } = useApp()
+  const formKey = config ? 'ready' : 'loading'
   return (
     <section className="flex min-h-0 flex-1 flex-col border-border lg:border-r">
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-5 pb-3 pt-4">
@@ -51,10 +52,10 @@ export function TaskPanel() {
         {/* 两个表单常驻渲染（仅切换可见性）：卸载会清空各字段的 useState，
             导致切页签后已输入内容丢失并被旧 config 重新填充。 */}
         <div className={cn(mode === 'order' ? 'block' : 'hidden')}>
-          <OrderForm />
+          <OrderForm key={formKey} />
         </div>
         <div className={cn(mode === 'sss' ? 'block' : 'hidden')}>
-          <SssForm />
+          <SssForm key={formKey} />
         </div>
       </div>
       {workerAlive && (
@@ -98,30 +99,16 @@ function ModeTab({
 
 function OrderForm() {
   const { config, passwords, startOrder, workerAlive } = useApp()
-  const [url, setUrl] = useState('')
-  const [phone, setPhone] = useState('')
-  const [password, setPassword] = useState('')
-  const [excel, setExcel] = useState('')
-  const [date, setDate] = useState('')
-  const [count, setCount] = useState<number | null>(null)
+  const [url, setUrl] = useState(config?.target_url ?? '')
+  const [phone, setPhone] = useState(config?.phone_number ?? '')
+  const [password, setPassword] = useState(passwords.order ?? '')
+  const [excel, setExcel] = useState(config?.excel_path ?? '')
+  const [date, setDate] = useState(config?.order_date ?? '')
+  const [count, setCount] = useState<number | null>(config?.order_count ?? null)
   const [remember, setRemember] = useState(true)
-  const [apiMode, setApiMode] = useState(true)
+  const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
-  const [loaded, setLoaded] = useState(false)
-
-  useEffect(() => {
-    if (config && !loaded) {
-      setUrl(config.target_url)
-      setPhone(config.phone_number)
-      setExcel(config.excel_path)
-      setDate(config.order_date)
-      setCount(config.order_count ?? null)
-      setApiMode(config.api_mode)
-      setPassword(passwords.order)
-      setLoaded(true)
-    }
-  }, [config, passwords.order, loaded])
 
   // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
   const scheduleSave = useDebouncedSave(() => {
@@ -130,14 +117,14 @@ function OrderForm() {
       .save_order_config({ url, phone, excel, date, count, api_mode: apiMode })
       .catch(() => {})
   })
-  const prevLoaded = useRef(false)
+  const firstSave = useRef(true)
   useEffect(() => {
-    if (!loaded || !prevLoaded.current) {
-      prevLoaded.current = loaded
+    if (firstSave.current) {
+      firstSave.current = false
       return
     }
     scheduleSave()
-  }, [url, phone, excel, date, count, apiMode, loaded, scheduleSave])
+  }, [url, phone, excel, date, count, apiMode, scheduleSave])
 
   const excelError = modeError(fields, 'excel')
   const excelOk = !excelError && excel && !fields ? '文件已准备' : undefined
@@ -250,40 +237,23 @@ function OrderForm() {
 
 function SssForm() {
   const { config, passwords, startSss, workerAlive } = useApp()
-  const [url, setUrl] = useState('')
-  const [account, setAccount] = useState('')
-  const [password, setPassword] = useState('')
-  const [excel, setExcel] = useState('')
-  const [productName, setProductName] = useState('轻食')
-  const [commonAddress, setCommonAddress] = useState('')
-  const [useFixedAddress, setUseFixedAddress] = useState(true)
-  const [fixedLnt, setFixedLnt] = useState('119.728224')
-  const [fixedLat, setFixedLat] = useState('30.256632')
-  const [fixedAreaCode, setFixedAreaCode] = useState('330110')
-  const [fixedAddressDetail, setFixedAddressDetail] = useState('浙江农林大学东湖校区')
+  const [url, setUrl] = useState(config?.sss_url ?? '')
+  const [account, setAccount] = useState(config?.sss_account ?? '')
+  const [password, setPassword] = useState(passwords.sss ?? '')
+  const [excel, setExcel] = useState(config?.sss_excel_path ?? '')
+  const [productName, setProductName] = useState(config?.sss_product_name ?? '轻食')
+  // 固定地址配置当前不在界面中编辑，直接由 config 派生，避免未使用 setter。
+  const commonAddress = config?.sss_common_address ?? ''
+  const useFixedAddress = config?.sss_use_fixed_address ?? true
+  const fixedLnt = String(config?.sss_fixed_lnt ?? '119.728224')
+  const fixedLat = String(config?.sss_fixed_lat ?? '30.256632')
+  const fixedAreaCode = config?.sss_fixed_area_code ?? '330110'
+  const fixedAddressDetail = config?.sss_fixed_address_detail ?? '浙江农林大学东湖校区'
   const [remember, setRemember] = useState(true)
-  const [apiMode, setApiMode] = useState(true)
+  const [dryRun, setDryRun] = useState(config?.sss_dry_run ?? true)
+  const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
-  const [loaded, setLoaded] = useState(false)
-
-  useEffect(() => {
-    if (config && !loaded) {
-      setUrl(config.sss_url)
-      setAccount(config.sss_account)
-      setExcel(config.sss_excel_path)
-      setProductName(config.sss_product_name)
-      setCommonAddress(config.sss_common_address)
-      setUseFixedAddress(config.sss_use_fixed_address)
-      setFixedLnt(String(config.sss_fixed_lnt))
-      setFixedLat(String(config.sss_fixed_lat))
-      setFixedAreaCode(config.sss_fixed_area_code)
-      setFixedAddressDetail(config.sss_fixed_address_detail)
-      setPassword(passwords.sss)
-      setApiMode(config.api_mode)
-      setLoaded(true)
-    }
-  }, [config, passwords.sss, loaded])
 
   // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
   const scheduleSave = useDebouncedSave(() => {
@@ -300,21 +270,22 @@ function SssForm() {
         fixed_lat: fixedLat,
         fixed_area_code: fixedAreaCode,
         fixed_address_detail: fixedAddressDetail,
+        dry_run: dryRun,
         api_mode: apiMode,
       })
       .catch(() => {})
   })
-  const prevLoaded = useRef(false)
+  const firstSave = useRef(true)
   useEffect(() => {
-    if (!loaded || !prevLoaded.current) {
-      prevLoaded.current = loaded
+    if (firstSave.current) {
+      firstSave.current = false
       return
     }
     scheduleSave()
   }, [
     url, account, excel, productName, commonAddress, useFixedAddress,
-    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, apiMode,
-    loaded, scheduleSave,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, apiMode,
+    scheduleSave,
   ])
 
   const excelError = modeError(fields, 'excel')
@@ -338,6 +309,7 @@ function SssForm() {
         fixed_area_code: fixedAreaCode,
         fixed_address_detail: fixedAddressDetail,
         remember,
+        dry_run: dryRun,
         api_mode: apiMode,
       }
       const errors = await startSss(payload)
@@ -412,6 +384,11 @@ function SssForm() {
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
         <Switch checked={remember} onCheckedChange={setRemember} aria-label="保存到系统凭据管理器" />
         <span>保存到系统凭据管理器</span>
+      </div>
+
+      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+        <Switch checked={dryRun} onCheckedChange={setDryRun} aria-label="干跑：只预览报文，不创建订单" />
+        <span>干跑：只预览报文，不创建订单</span>
       </div>
 
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
@@ -606,7 +583,9 @@ function ConfirmClearPassword({
 function useDebouncedSave(save: () => void, delay = 500): () => void {
   const timer = useRef<number | undefined>(undefined)
   const saveRef = useRef(save)
-  saveRef.current = save
+  useEffect(() => {
+    saveRef.current = save
+  }, [save])
   const cancel = useCallback(() => {
     if (timer.current !== undefined) {
       clearTimeout(timer.current)

@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ArrowDownToLine, Copy, Eraser } from 'lucide-react'
 import { Input } from '@/components/ui/input'
-import { statusLabel, useApp } from '@/hooks/useApp'
+import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
 
 const LEVEL_CLASS: Record<string, string> = {

@@ -6,7 +6,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { Minus, Moon, Square, Sun, X } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { useApp } from '@/hooks/useApp'
+import { useApp } from '@/hooks/appContext'
 import { api, isApiReady } from '@/lib/bridge'
 import { applyTheme, initialTheme, type Theme } from '@/lib/theme'
 

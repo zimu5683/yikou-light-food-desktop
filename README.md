@@ -95,6 +95,7 @@ Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Releas
 - 订单 Excel 格式：`午餐`、`晚餐`两个工作表，第 1 行表头、第 2 行占位，从第 3 行开始为 A=姓名、B=门牌号、C=电话、D=送达时间（D 列暂不使用，送达时间由程序按规则计算：午餐 11:00 / 晚餐 17:00，当天 16 点后顺延次日）。
 - **登录需手动完成**：闪时送登录有图形验证码。纯接口模式下程序会在应用内弹出验证码小窗，输入后自动完成登录并逐单下单，不再弹出浏览器；浏览器备用模式下仍是在浏览器中手动输入验证码。
 - 闪时送平台的定位器独立保存在用户配置目录的 `sss_locators.json`，改版失败时同样会保存截图/HTML/网址到 `logs/`，修改该文件即可适配。
+- 下单默认采用 **at-least-once + 对账确认**：平台抓包报文未发现客户端幂等字段，因此不会向未知 schema 强塞字段。程序在下单前后查询站内订单、校验完整订单指纹和批次时间窗口，网络异常或超时不会自动重发 POST；如果平台后续确认支持幂等字段，可在配置中设置 `sss_idempotency_field` 启用稳定 `client_request_id`。
 - 闪时送密码使用独立凭据名 `yikou-light-food-sss`，与管理后台账号密码互不覆盖。
 
 - 候选字段：`css`（CSS 选择器）、`role` + `name`/`name_re`（ARIA 角色）、`placeholder`（输入框占位文字）、`text`（文字，子串匹配）、`text_re`（文字正则）、`has_text`/`has_text_re`（对结果按内含文字过滤）、`index`（取第 N 个匹配）
@@ -111,4 +112,18 @@ git push origin main --tags
 
 推送 `vX.Y.Z` 标签会触发 Windows、macOS 和 Linux 工作流，分别发布 `yikou-light-food.exe`、`yikou-light-food-macos.zip`、`yikou-light-food-linux-x64.tar.gz` 及其 SHA-256 校验文件。工作流会验证标签与应用内版本一致。应用启动时会在后台检查 GitHub Release；Windows 与 Linux 打包版可校验、下载并自动安装，macOS 用户收到提示后从 Release 页面下载新版安装包，源码运行模式也只提示前往 Release 页面。Linux 自动更新会把新版 tar.gz 解压到程序目录下的 `.yikou-light-food.update-<pid>/` 暂存目录，待本进程退出后由后台脚本原子替换可执行文件并重启，安装目录不可写时回退为提示手动下载。
 
-更新包下载后会用官方 SHA-256 校验，校验文件优先从 GitHub 直接拉取；GitHub 直连不可达时改用 `latest.json` 内嵌的同一官方哈希（发布工作流会同时写入两处）。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁（Linux 补丁以「解压后的裸二进制」为基线，正是用户本地持有的文件）：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。注意：若所使用的下载镜像被完全控制，内嵌回退在理论上可被绕过，彻底方案是为 exe 做代码签名。
+更新真实性不再依赖 SHA-256 或镜像：发布工作流用 Ed25519 私钥对 `latest.json` 生成 `latest.json.sig`，客户端只使用内置公钥（`app/updater.py` 中的 `UPDATE_MANIFEST_PUBLIC_KEY`）验证通过的清单。SHA-256 仅用于完整性校验；镜像只负责传输字节流，不能成为信任根。更新器严格拒绝降级、同版本覆盖、非 SemVer 版本、平台/架构不匹配和超过大小限制的资源。
+
+发布仓库需要配置 GitHub Actions Secret `UPDATE_SIGNING_KEY`（Ed25519 PKCS#8 PEM 私钥内容）；可用 `python scripts/generate_update_signing_key.py` 生成并妥善备份，再执行：
+
+```bash
+gh secret set UPDATE_SIGNING_KEY < ~/.config/yikou-light-food/update-signing-key.pem
+```
+
+未配置时 `publish-manifest` 任务会失败，不会发布未签名清单。Windows/macOS 打包版还会分别校验 Authenticode 发布者与 codesign/Team ID/公证；这些公开信任锚在发布时由仓库变量 `YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER` / `YIKOU_MACOS_TEAM_ID` 写入随包分发的 `app/update_trust.json`，最终用户无需设置环境变量。未配置时对应平台 fail-closed。新清单通过 `requires_platform_metadata` 强制每个平台资源声明 `platform`/`architecture`，不再允许“缺少字段就放行”。Linux 更新包只允许单个 `yikou-light-food` 文件，拒绝夹带额外文件或 setuid 位。替换前会运行新产物的 `--self-check`；替换后新 GUI 必须写入启动健康标记，超时未写入会自动恢复上一版并重启。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。
+
+提交前建议额外运行一次工作区卫生检查（含未跟踪文件）：
+
+```bash
+python scripts/check_workspace_hygiene.py --working-tree
+```

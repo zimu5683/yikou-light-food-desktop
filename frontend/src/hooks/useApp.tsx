@@ -7,9 +7,7 @@
  * - 表单动作、任务动作、文件对话框、窗口控制
  */
 import {
-  createContext,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useRef,
@@ -22,10 +20,10 @@ import {
   connectBridge,
   isApiReady,
   onBridgeEvent,
+  pullBridgeEvents,
   type AppState,
   type CaptchaRequest,
   type DecisionRequest,
-  type LogEntry,
   type OrderFormPayload,
   type SssFormPayload,
   type StatusState,
@@ -33,71 +31,14 @@ import {
   type UpdateAvailable,
 } from '@/lib/bridge'
 
-export type TaskMode = 'order' | 'sss'
-
-export interface LogRow extends LogEntry {
-  id: number
-}
-
-export interface UpdateProgress {
-  stage: string
-  downloaded: number
-  total: number | null
-}
-
-export type FieldErrors = Record<string, { message: string } | undefined>
-
-interface AppStateBundle {
-  ready: boolean
-  mocked: boolean
-  version: string
-  status: StatusState
-  frozen: boolean
-  config: AppState['config'] | null
-  passwords: { order: string; sss: string }
-  logs: LogRow[]
-  decision: DecisionRequest | null
-  captcha: CaptchaRequest | null
-  updateProgress: UpdateProgress | null
-  workerAlive: boolean
-  mode: TaskMode
-  setMode: (mode: TaskMode) => void
-  startOrder: (payload: OrderFormPayload) => Promise<FieldErrors | null>
-  startSss: (payload: SssFormPayload) => Promise<FieldErrors | null>
-  stopTask: () => Promise<void>
-  chooseExcel: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
-  newTemplate: (mode: 'order' | 'sss') => Promise<{ path: string; error: string }>
-  checkBrowser: () => void
-  clearPassword: (mode: 'order' | 'sss') => Promise<void>
-  checkUpdates: (manual: boolean) => void
-  installUpdate: () => Promise<boolean>
-  openExternal: (url: string) => void
-  requestClose: () => void
-  setSplitRatio: (ratio: number) => void
-  clearLogs: () => void
-  resolveDecision: (id: string, choice: string) => void
-  resolveCaptcha: (id: string, code: string) => void
-}
-
-const AppContext = createContext<AppStateBundle | null>(null)
-const UpdateAvailableContext = createContext<{
-  available: UpdateAvailable | null
-  setAvailable: (v: UpdateAvailable | null) => void
-} | null>(null)
-
-const STATUS_LABELS: Record<StatusState, string> = {
-  ready: '就绪',
-  running: '处理中',
-  stopping: '正在停止',
-  success: '处理完成',
-  stopped: '已停止',
-  error: '处理失败',
-  updating: '检查更新',
-}
-
-export function statusLabel(state: StatusState): string {
-  return STATUS_LABELS[state] ?? state
-}
+import {
+  AppContext,
+  UpdateAvailableContext,
+  type AppStateBundle,
+  type LogRow,
+  type TaskMode,
+  type UpdateProgress,
+} from './appContext'
 
 export function AppProvider({ children }: { children: ReactNode }) {
   const [ready, setReady] = useState(false)
@@ -159,12 +100,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
           appendLog(event.payload)
           break
         }
+        case 'events:dropped': {
+          const critical = (event.payload.critical_dropped_count ?? 0) > 0
+          appendLog({
+            ts: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+            level: critical ? 'ERROR' : 'WARN',
+            msg: event.payload.message,
+          })
+          if (critical) toast.error(event.payload.message, { duration: 10000 })
+          break
+        }
         case 'status':
           setStatus(event.payload.state)
           break
         case 'task:done':
           if (event.payload.stopped) {
             toast.info('任务已停止')
+          } else if (event.payload.partial) {
+            toast.error(event.payload.message, { duration: 8000 })
           } else {
             toast.success(event.payload.message)
           }
@@ -231,9 +184,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     let timer: number | undefined
     const poll = async () => {
       try {
-        const result = await api().drain_events()
-        if (stopped) return
-        for (const event of result.events) applyEvent(event)
+        // pullBridgeEvents 内部维护 last_sequence/ACK 与 event_id 去重：
+        // 只有成功 dispatch 后才推进 cursor，断线/刷新后可从断点重放。
+        await pullBridgeEvents()
       } catch {
         /* 超时或窗口关闭：下一轮继续 */
       } finally {
@@ -250,12 +203,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // ---- 动作 ----
   const startOrder = useCallback(async (payload: OrderFormPayload) => {
     const result = await api().start_order(payload)
-    return result.ok ? null : (result.fields ?? {})
+    if (result.ok) return null
+    if (result.reason === 'busy') {
+      toast.error(result.message ?? '已有任务正在运行，请先停止')
+      return {}
+    }
+    return result.fields ?? {}
   }, [])
 
   const startSss = useCallback(async (payload: SssFormPayload) => {
     const result = await api().start_sss(payload)
-    return result.ok ? null : (result.fields ?? {})
+    if (result.ok) return null
+    if (result.reason === 'busy') {
+      toast.error(result.message ?? '已有任务正在运行，请先停止')
+      return {}
+    }
+    return result.fields ?? {}
   }, [])
 
   const stopTask = useCallback(async () => {
@@ -367,16 +330,4 @@ export function AppProvider({ children }: { children: ReactNode }) {
       </UpdateAvailableContext.Provider>
     </AppContext.Provider>
   )
-}
-
-export function useUpdateAvailable() {
-  const ctx = useContext(UpdateAvailableContext)
-  if (!ctx) throw new Error('useUpdateAvailable must be used within AppProvider')
-  return ctx
-}
-
-export function useApp(): AppStateBundle {
-  const ctx = useContext(AppContext)
-  if (!ctx) throw new Error('useApp must be used within AppProvider')
-  return ctx
 }

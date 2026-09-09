@@ -105,6 +105,22 @@ def test_config_persists_order_count(tmp_path):
     assert AppConfig.load(path).order_count is None
 
 
+def test_sss_transport_defaults_persist(tmp_path):
+    path = tmp_path / "config.json"
+    config = AppConfig()
+    assert config.sss_dry_run is True
+    assert config.sss_max_workers == 4
+    assert config.sss_read_timeout_s == 20.0
+    assert config.sss_unit_price == 1.9
+    assert config.sss_idempotency_field == ""
+    config.save(path)
+    loaded = AppConfig.load(path)
+    assert loaded.sss_dry_run is True
+    assert loaded.sss_max_workers == 4
+    assert loaded.sss_read_timeout_s == 20.0
+    assert loaded.sss_unit_price == 1.9
+
+
 def test_bridge_save_order_config_preserves_sss_side(tmp_path):
     """就地保存订单侧配置时，闪时送侧既有字段不被重置成默认。"""
     from app.bridge import Bridge
@@ -159,6 +175,70 @@ def test_bridge_save_sss_config_preserves_order_side(tmp_path):
     assert loaded.target_url == "https://order.example.com"
 
 
+def test_bridge_reports_stopped_sss_task_as_reconciled(tmp_path, monkeypatch):
+    import app.bridge as bridge_mod
+
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
+    captured = {}
+    monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
+        "processed": 3, "created": 2, "stopped": True, "reconciled": True,
+    })
+    monkeypatch.setattr(bridge, "_finish_task",
+                        lambda message, result: captured.update(message=message, result=result))
+    bridge._run_sss(bridge._config, "ignored")
+    assert captured["message"] == "闪时送任务已停止：已完成站内对账，已确认 2/3 单"
+
+
+def test_bridge_reports_partial_sss_task_without_success_state(tmp_path, monkeypatch):
+    import app.bridge as bridge_mod
+
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
+    monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
+        "processed": 3, "created": 2, "stopped": False,
+        "partial": True, "reconciled": True,
+    })
+    bridge._run_sss(bridge._config, "ignored")
+
+    events = bridge.drain_events()["events"]
+    done = next(event for event in events if event["event"] == "task:done")
+    assert bridge.status == "partial"
+    assert done["payload"]["partial"] is True
+    assert done["payload"]["message"] == "闪时送任务部分完成：已确认 2/3 单，1 单未完成"
+
+
+def test_bridge_start_sss_preserves_store_cache_written_by_worker(tmp_path, monkeypatch):
+    from app.bridge import Bridge
+
+    path = tmp_path / "config.json"
+    workbook = tmp_path / "闪时送.xlsx"
+    workbook.touch()
+    bridge = Bridge(config_path=str(path))
+    # 模拟 worker 使用配置快照查询到门店后，通过 callback 回写常驻配置。
+    bridge._remember_sss_store_cache("一口轻食", 211053)
+    monkeypatch.setattr(bridge, "_launch", lambda *args: None)
+
+    result = bridge.start_sss({
+        "url": "https://sss.example.com/takeout",
+        "account": "18758187837",
+        "password": "secret",
+        "excel": str(workbook),
+        "product_name": "轻食",
+        "common_address": "",
+        "use_fixed_address": True,
+        "fixed_lnt": "119.728224",
+        "fixed_lat": "30.256632",
+        "fixed_area_code": "330110",
+        "fixed_address_detail": "浙江农林大学东湖校区",
+        "remember": False,
+        "dry_run": True,
+        "api_mode": True,
+    })
+    assert result["ok"] is True
+    loaded = AppConfig.load(path)
+    assert loaded.sss_store_id == 211053
+    assert loaded.sss_store_name_cached == "一口轻食"
+
+
 def test_xlsm_workbook_is_loaded_with_vba_preserved(tmp_path):
     from app.automation import _load_order_workbook
 
@@ -186,3 +266,52 @@ def test_malformed_config_is_backed_up_before_reset(tmp_path):
     assert config.excel_path is None
     assert not target.exists()
     assert target.with_name("config.json.bak").read_text(encoding="utf-8") == "{broken"
+
+
+def test_config_save_merges_untouched_fields_after_concurrent_write(tmp_path):
+    """两个实例并发保存时，未修改字段应保留磁盘上的新值。"""
+    from app.config import AppConfig
+
+    path = tmp_path / "config.json"
+    AppConfig(order_date="2026-09-01").save(path)
+    first = AppConfig.load(path)
+    second = AppConfig.load(path)
+
+    first.order_date = "2026-09-02"
+    second.sss_account = "second-writer"
+    second.save()
+    first.save()
+
+    loaded = AppConfig.load(path)
+    assert loaded.order_date == "2026-09-02"
+    assert loaded.sss_account == "second-writer"
+
+
+def test_config_save_uses_atomic_backup(tmp_path):
+    from app.config import AppConfig
+
+    path = tmp_path / "config.json"
+    AppConfig(order_date="2026-09-01").save(path)
+    AppConfig(order_date="2026-09-02").save(path)
+
+    assert AppConfig.load(path).order_date == "2026-09-02"
+    assert path.with_name("config.json.bak").is_file()
+    # 保存目录里不残留临时文件。
+    assert not list(tmp_path.glob(".config.json.*.tmp"))
+
+
+def test_bridge_reports_reconciliation_failure_as_uncertain(tmp_path, monkeypatch):
+    import app.bridge as bridge_mod
+
+    bridge = bridge_mod.Bridge(config_path=str(tmp_path / "config.json"))
+    monkeypatch.setattr(bridge_mod, "run_sss_job", lambda *args, **kwargs: {
+        "processed": 2, "created": 0, "stopped": False,
+        "partial": False, "reconciled": False, "uncertain": True,
+    })
+    bridge._run_sss(bridge._config, "ignored")
+
+    events = bridge.drain_events()["events"]
+    done = next(event for event in events if event["event"] == "task:done")
+    assert "站内对账失败" in done["payload"]["message"]
+    assert "请勿手动重复提交" in done["payload"]["message"]
+    assert bridge.status == "partial"

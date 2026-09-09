@@ -55,6 +55,20 @@ def main() -> None:
         from . import __version__
         print(f"yikou-light-food {__version__}")
         return
+    if "--self-check" in sys.argv:
+        # 更新替换前由 updater 调用：只验证打包产物能导入关键模块，不启动 GUI。
+        import app.automation  # noqa: F401
+        import app.bridge  # noqa: F401
+        import app.excel_templates  # noqa: F401
+        import app.sss  # noqa: F401
+        import app.updater  # noqa: F401
+        import app.webview_app  # noqa: F401
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (  # noqa: F401
+            Ed25519PublicKey,
+        )
+        from . import __version__
+        print(f"self-check OK {__version__}")
+        return
     _enable_high_dpi_awareness()
     from .webview_app import run as webview_run
     webview_run()
