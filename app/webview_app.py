@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 import sys
-import time
 import logging
 from pathlib import Path
 
@@ -97,9 +96,7 @@ def run() -> None:
     window.events.closing += bridge.on_native_closing
 
     def _on_gui_ready() -> None:
-        # 等待 GUI 事件循环真正跑起来后再写健康标记，避免“进程活着但窗口
-        # 没起来”被误判为更新成功。
-        time.sleep(0.5)
+        # GUI 事件循环启动后立即写健康标记，避免更新脚本等待过久误判超时。
         mark_startup_healthy(__version__)
 
     try:

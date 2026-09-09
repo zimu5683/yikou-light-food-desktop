@@ -80,6 +80,25 @@ def _load_update_trust() -> tuple[str, str, bool]:
 # 发布者签名主体/Team ID 打包时写入；未配置时默认 fail-closed。
 # 个人自用构建可显式设置 allow_unsigned_update=true：仍强制校验签名清单与 SHA-256。
 WINDOWS_AUTHENTICODE_PUBLISHER, MACOS_TEAM_ID, ALLOW_UNSIGNED_UPDATE = _load_update_trust()
+
+
+def update_log_path() -> Path:
+    """Path of the human-readable update log (best effort, no secrets)."""
+    try:
+        from .config import user_data_dir
+        return user_data_dir() / "update.log"
+    except Exception:  # pragma: no cover - config should always import
+        return Path(tempfile.gettempdir()) / "yikou-light-food-update.log"
+
+
+def _log_update(message: str) -> None:
+    try:
+        path = update_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+    except OSError:
+        pass
 # GitHub 直连在国内经常不可达，检查更新与下载都依次尝试：直连 → 国内加速镜像。
 # 前缀只到镜像域名，候选 = 前缀 + 完整 GitHub URL（ghproxy 类服务要求保持原路径）。
 GITHUB_MIRROR_PREFIXES = (
@@ -1196,42 +1215,51 @@ def _download_and_install_macos(
         getattr(sys, "frozen", False)
         and os.environ.get("YIKOU_SKIP_UPDATE_HEALTH_CHECK") != "1"
     )
+    logfile = shlex.quote(str(update_log_path()))
+    log_fn = ("log() { printf '%s %s\\n' \"$(date '+%Y-%m-%d %H:%M:%S')\" \"$1\" >> "
+              + logfile + "; }; ")
     if health_enabled:
         health_token, health_marker = begin_update_health_check(tempfile.gettempdir())
         marker = shlex.quote(health_marker)
         token = shlex.quote(health_token)
         health_env = f"YIKOU_UPDATE_HEALTH_FILE={marker} YIKOU_UPDATE_HEALTH_TOKEN={token} "
         script = (
-            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-            f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
-            f"rm -rf {backup_path}; "
-            f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
-            f"if ditto {shlex.quote(str(new_app))} {app_path}; then "
-            f"rm -f {marker}; "
-            f"{health_env}{shlex.quote(str(new_binary))} >/dev/null 2>&1 & new_pid=$!; "
-            f"ok=0; i=0; while [ $i -lt 60 ]; do "
-            f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
-            f"if ! kill -0 $new_pid 2>/dev/null; then break; fi; "
-            f"sleep 1; i=$((i+1)); done; rm -f {marker}; "
-            f"if [ $ok -eq 1 ]; then rm -rf {backup_path}; rm -rf {shlex.quote(str(workdir))}; exit 0; fi; "
-            f"kill $new_pid 2>/dev/null || true; rm -rf {app_path}; "
-            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; "
-            f"rm -rf {shlex.quote(str(workdir))}; exit 1; "
-            f"else rm -rf {app_path}; "
-            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
-            f"fi; rm -rf {shlex.quote(str(workdir))}"
+            log_fn
+            + f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            + "log 'old process exited; starting macOS replacement'; "
+            + f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
+            + "log 'self-check ok'; "
+            + f"rm -rf {backup_path}; "
+            + f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
+            + f"if ditto {shlex.quote(str(new_app))} {app_path}; then "
+            + "log 'app bundle replaced; launching new version'; "
+            + f"rm -f {marker}; "
+            + f"{health_env}{shlex.quote(str(new_binary))} >/dev/null 2>&1 & new_pid=$!; "
+            + f"log \"new pid $new_pid; waiting health marker {health_marker}\"; "
+            + "ok=0; i=0; while [ $i -lt 180 ]; do "
+            + f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
+            + f"sleep 1; i=$((i+1)); done; rm -f {marker}; "
+            + f"if [ $ok -eq 1 ]; then log 'health marker ok'; rm -rf {backup_path}; rm -rf {shlex.quote(str(workdir))}; exit 0; fi; "
+            + "log 'health marker timeout; rolling back to previous version'; "
+            + f"kill $new_pid 2>/dev/null || true; rm -rf {app_path}; "
+            + f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; log 'old version relaunched'; fi; "
+            + f"rm -rf {shlex.quote(str(workdir))}; exit 1; "
+            + f"else log 'ditto replacement failed; rolling back'; rm -rf {app_path}; "
+            + f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
+            + f"fi; rm -rf {shlex.quote(str(workdir))}"
         )
     else:
         script = (
-            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-            f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
-            f"rm -rf {backup_path}; "
-            f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
-            f"if ditto {shlex.quote(str(new_app))} {app_path} && open {app_path}; then "
-            f"rm -rf {backup_path}; "
-            f"else rm -rf {app_path}; "
-            f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
-            f"fi; rm -rf {shlex.quote(str(workdir))}"
+            log_fn
+            + f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            + f"if {shlex.quote(str(new_binary))} --self-check >/dev/null 2>&1; then "
+            + f"rm -rf {backup_path}; "
+            + f"if [ -e {app_path} ]; then mv {app_path} {backup_path}; fi; "
+            + f"if ditto {shlex.quote(str(new_app))} {app_path} && open {app_path}; then "
+            + f"rm -rf {backup_path}; "
+            + f"else rm -rf {app_path}; "
+            + f"if [ -e {backup_path} ]; then mv {backup_path} {app_path}; open {app_path}; fi; fi; "
+            + f"fi; rm -rf {shlex.quote(str(workdir))}"
         )
     try:
         subprocess.Popen(
@@ -1407,7 +1435,7 @@ def _schedule_linux_replacement(
     *,
     pid: int | None = None,
     launcher: Callable[..., Any] | None = None,
-    health_timeout: float = 60.0,
+    health_timeout: float = 180.0,
 ) -> Path:
     """Spawn a detached shell that swaps in the new binary after exit.
 
@@ -1423,6 +1451,9 @@ def _schedule_linux_replacement(
     backup = shlex.quote(str(target) + ".bak")
     temp = f"{shlex.quote(str(workdir))} {shlex.quote(str(staging_dir))}"
     staged = shlex.quote(str(staged_binary))
+    logfile = shlex.quote(str(update_log_path()))
+    log_fn = ("log() { printf '%s %s\\n' \"$(date '+%Y-%m-%d %H:%M:%S')\" \"$1\" >> "
+              + logfile + "; }; ")
 
     if getattr(sys, "frozen", False) and os.environ.get("YIKOU_SKIP_UPDATE_HEALTH_CHECK") != "1":
         health_token, health_marker = begin_update_health_check(tempfile.gettempdir())
@@ -1431,33 +1462,41 @@ def _schedule_linux_replacement(
         health_env = f"YIKOU_UPDATE_HEALTH_FILE={marker} YIKOU_UPDATE_HEALTH_TOKEN={token} "
         checks = max(1, int(health_timeout))
         script = (
-            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-            f"if {staged} --self-check >/dev/null 2>&1; then "
-            f"cp -f {installed} {backup} 2>/dev/null || true; "
-            f"if mv -f {staged} {installed}; then "
-            f"rm -f {marker}; "
-            f"{health_env}{installed} >/dev/null 2>&1 & new_pid=$!; "
-            f"ok=0; i=0; "
-            f"while [ $i -lt {checks} ]; do "
-            f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
-            f"if ! kill -0 $new_pid 2>/dev/null; then break; fi; "
-            f"sleep 1; i=$((i+1)); done; "
-            f"rm -f {marker}; "
-            f"if [ $ok -eq 1 ]; then rm -rf {temp}; exit 0; fi; "
-            f"kill $new_pid 2>/dev/null || true; "
-            f"cp -f {backup} {installed} 2>/dev/null || true; "
-            f"{installed} >/dev/null 2>&1 & rm -rf {temp}; exit 1; "
-            f"fi; fi; "
-            f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
+            log_fn
+            + f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            + "log 'old process exited; starting replacement'; "
+            + f"if {staged} --self-check >/dev/null 2>&1; then "
+            + "log 'self-check ok'; "
+            + f"cp -f {installed} {backup} 2>/dev/null || true; "
+            + f"if mv -f {staged} {installed}; then "
+            + "log 'binary replaced; launching new version'; "
+            + f"rm -f {marker}; "
+            + f"{health_env}{installed} >/dev/null 2>&1 & new_pid=$!; "
+            + f"log \"new pid $new_pid; waiting health marker {health_marker}\"; "
+            + "ok=0; i=0; "
+            + f"while [ $i -lt {checks} ]; do "
+            + f"if grep -F {token} {marker} >/dev/null 2>&1; then ok=1; break; fi; "
+            + "sleep 1; i=$((i+1)); done; "
+            + f"rm -f {marker}; "
+            + f"if [ $ok -eq 1 ]; then log 'health marker ok'; rm -rf {temp}; exit 0; fi; "
+            + "log 'health marker timeout; rolling back to previous version'; "
+            + "kill $new_pid 2>/dev/null || true; "
+            + f"cp -f {backup} {installed} 2>/dev/null || true; "
+            + f"{installed} >/dev/null 2>&1 & log 'old version relaunched'; rm -rf {temp}; exit 1; "
+            + "fi; "
+            + "log 'mv replacement failed'; fi; "
+            + "log 'replacement aborted; keeping old version'; "
+            + f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
         )
     else:
         script = (
-            f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
-            f"if {staged} --self-check >/dev/null 2>&1; then "
-            f"cp -f {installed} {backup} 2>/dev/null || true; "
-            f"if mv -f {staged} {installed}; then "
-            f"rm -rf {temp} & exec {installed}; fi; fi; "
-            f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
+            log_fn
+            + f"while kill -0 {pid} 2>/dev/null; do sleep 0.3; done; "
+            + f"if {staged} --self-check >/dev/null 2>&1; then "
+            + f"cp -f {installed} {backup} 2>/dev/null || true; "
+            + f"if mv -f {staged} {installed}; then "
+            + f"rm -rf {temp} & exec {installed}; fi; fi; "
+            + f"cp -f {backup} {installed} 2>/dev/null || true; rm -rf {temp}"
         )
     try:
         popen(
@@ -1475,6 +1514,7 @@ def _schedule_linux_replacement(
 
 def _run_startup_self_check(executable: Path) -> None:
     """在替换旧版本前运行新产物的 --self-check；失败则中止更新。"""
+    _log_update(f"self-check start: {executable}")
     if os.environ.get("YIKOU_SKIP_UPDATE_SELF_CHECK") == "1":
         return
     if not getattr(sys, "frozen", False):
@@ -1494,7 +1534,9 @@ def _run_startup_self_check(executable: Path) -> None:
         raise UpdateError(f"新版本启动自检无法执行：{exc}") from exc
     if completed.returncode != 0:
         detail = (completed.stdout or completed.stderr or "").strip()
+        _log_update(f"self-check failed: {detail or completed.returncode}")
         raise UpdateError(f"新版本启动自检失败，保留当前版本：{detail or completed.returncode}")
+    _log_update("self-check ok")
 
 
 def apply_pending_update(
@@ -1503,7 +1545,7 @@ def apply_pending_update(
     *,
     timeout: float = 120.0,
     retry_interval: float = 0.5,
-    health_timeout: float = 60.0,
+    health_timeout: float = 180.0,
     launcher: Callable[..., Any] = subprocess.Popen,
 ) -> Path:
     """Replace ``target`` with a verified downloaded exe and restart it.
@@ -1518,6 +1560,7 @@ def apply_pending_update(
     target_path = Path(target).resolve()
     if not source_path.is_file() or target_path.suffix.lower() != ".exe":
         raise UpdateError("Pending update files are invalid")
+    _log_update(f"apply pending update: {source_path} -> {target_path}")
     _run_startup_self_check(source_path)
     backup_path = target_path.with_name(target_path.name + ".bak")
     try:
@@ -1573,9 +1616,11 @@ def apply_pending_update(
         raise UpdateError(f"Update installed but the application could not restart: {exc}") from exc
 
     if health_enabled:
+        _log_update(f"waiting startup health marker: {health_marker}")
         healthy = wait_for_health(health_marker, health_token, timeout=health_timeout)
         clear_update_health(health_marker)
         if not healthy:
+            _log_update("startup health marker missing; rolling back")
             try:
                 shutil.copy2(backup_path, target_path)
             except OSError as exc:
@@ -1592,6 +1637,7 @@ def apply_pending_update(
             except OSError as exc:
                 raise UpdateError(f"新版本启动健康检查失败，旧版本也无法重新启动：{exc}") from exc
             raise UpdateError("新版本启动健康检查失败，已回滚到上一版本")
+        _log_update("startup health ok")
 
     _schedule_helper_cleanup(Path(sys.executable).resolve())
     return target_path

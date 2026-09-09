@@ -120,7 +120,7 @@ git push origin main --tags
 gh secret set UPDATE_SIGNING_KEY < ~/.config/yikou-light-food/update-signing-key.pem
 ```
 
-未配置时 `publish-manifest` 任务会失败，不会发布未签名清单。Windows/macOS 打包版还会分别校验 Authenticode 发布者与 codesign/Team ID/公证；这些公开信任锚在发布时由仓库变量 `YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER` / `YIKOU_MACOS_TEAM_ID` 写入随包分发的 `app/update_trust.json`。本项目当前为个人自用，`app/update_trust.json` 中显式设置 `"allow_unsigned_update": true`：没有 Authenticode/Team ID 时跳过 OS 发布者签名校验，但 **Ed25519 清单签名、SHA-256、版本/平台/架构校验仍然强制**。如果未来要公开发布，配置真实证书并把该开关改为 `false` 即可恢复 fail-closed。新清单通过 `requires_platform_metadata` 强制每个平台资源声明 `platform`/`architecture`，不再允许“缺少字段就放行”。Linux 更新包只允许单个 `yikou-light-food` 文件，拒绝夹带额外文件或 setuid 位。替换前会运行新产物的 `--self-check`；替换后新 GUI 必须写入启动健康标记，超时未写入会自动恢复上一版并重启。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。
+未配置时 `publish-manifest` 任务会失败，不会发布未签名清单。Windows/macOS 打包版还会分别校验 Authenticode 发布者与 codesign/Team ID/公证；这些公开信任锚在发布时由仓库变量 `YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER` / `YIKOU_MACOS_TEAM_ID` 写入随包分发的 `app/update_trust.json`。本项目当前为个人自用，`app/update_trust.json` 中显式设置 `"allow_unsigned_update": true`：没有 Authenticode/Team ID 时跳过 OS 发布者签名校验，但 **Ed25519 清单签名、SHA-256、版本/平台/架构校验仍然强制**。如果未来要公开发布，配置真实证书并把该开关改为 `false` 即可恢复 fail-closed。新清单通过 `requires_platform_metadata` 强制每个平台资源声明 `platform`/`architecture`，不再允许“缺少字段就放行”。Linux 更新包只允许单个 `yikou-light-food` 文件，拒绝夹带额外文件或 setuid 位。替换前会运行新产物的 `--self-check`；替换后新 GUI 必须写入启动健康标记，超时未写入会自动恢复上一版并重启。更新过程会写入用户目录的 `update.log`，便于排查“已下载但仍是旧版本”一类问题。Windows 与 Linux 有上一版可对照时，发布工作流会生成 bsdiff 差分补丁：更新器按本地文件的 SHA-256 匹配基线，命中则只下载补丁还原出新版，未命中自动回退全量下载。
 
 提交前建议额外运行一次工作区卫生检查（含未跟踪文件）：
 
