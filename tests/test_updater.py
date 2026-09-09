@@ -5,6 +5,7 @@ import json
 import os
 import shlex
 import shutil
+import sys
 import tarfile
 import urllib.error
 from pathlib import Path
@@ -17,9 +18,9 @@ from app import updater
 from app.updater import ReleaseInfo, UpdateError, apply_pending_update, check_for_update, compare_versions, download_and_install
 
 _linux_only = pytest.mark.skipif(
-    os.name != "posix",
-    reason="Linux 更新流程测试会把全局 os.name 补丁成 posix，"
-           "在 Windows 上会产生跨平台路径残留并击穿 pytest，仅在有真实 posix 语义的系统运行",
+    not sys.platform.startswith("linux"),
+    reason="仅 Linux 更新流程测试；macOS/Windows 的 os.name 也是 posix/nt，"
+           "不能用 os.name 区分平台",
 )
 
 
@@ -182,6 +183,8 @@ def test_pending_update_atomically_replaces_and_restarts(tmp_path, monkeypatch):
 
 def test_source_mode_cannot_replace_python_executable(monkeypatch):
     release = ReleaseInfo("v1.4.0", "v1.4.0", "", "", ())
+    monkeypatch.setattr("app.updater._is_macos_platform", lambda: False)
+    monkeypatch.setattr("app.updater._is_linux_platform", lambda: False)
     monkeypatch.setattr("app.updater._is_windows_platform", lambda: True)
     monkeypatch.delattr("app.updater.sys.frozen", raising=False)
     with pytest.raises(UpdateError, match="源码运行模式"):
