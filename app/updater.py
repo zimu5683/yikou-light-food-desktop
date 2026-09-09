@@ -218,6 +218,18 @@ def _embedded_asset_sha256(asset: dict[str, Any] | None) -> str:
     return value if re.fullmatch(r"[0-9a-f]{64}", value) else ""
 
 
+def _is_windows_platform() -> bool:
+    return os.name == "nt"
+
+
+def _is_macos_platform() -> bool:
+    return sys.platform == "darwin"
+
+
+def _is_linux_platform() -> bool:
+    return sys.platform.startswith("linux")
+
+
 def _current_architecture(platform_name: str) -> str:
     if platform_name == "windows":
         return "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").lower() == "arm64" else "x64"
@@ -601,7 +613,7 @@ def download_and_install(
     PyInstaller onefile binary inside a tar.gz; a detached shell waits for
     this process to exit, renames the staged file over it and execs it.
     """
-    if sys.platform == "darwin":
+    if _is_macos_platform():
         return _download_and_install_macos(
             release,
             timeout=timeout,
@@ -609,7 +621,7 @@ def download_and_install(
             progress_callback=progress_callback,
             stage_callback=stage_callback,
         )
-    if sys.platform.startswith("linux"):
+    if _is_linux_platform():
         return _download_and_install_linux(
             release,
             timeout=timeout,
@@ -617,7 +629,7 @@ def download_and_install(
             progress_callback=progress_callback,
             stage_callback=stage_callback,
         )
-    if os.name != "nt":
+    if not _is_windows_platform():
         raise UpdateError("Automatic installation is currently supported on Windows and macOS only")
     if current_executable is None and not getattr(sys, "frozen", False):
         # In source mode sys.executable is python.exe.  Replacing it would
@@ -726,7 +738,7 @@ def _verify_windows_authenticode(path: Path) -> None:
         raise UpdateError(
             "未配置 Windows Authenticode 发布者（YIKOU_WINDOWS_AUTHENTICODE_PUBLISHER），"
             "拒绝安装未验证发布者签名的更新")
-    if os.name != "nt":
+    if not _is_windows_platform():
         raise UpdateError("当前平台无法执行 Windows Authenticode 校验")
     escaped = str(path).replace("'", "''")
     script = (
@@ -761,7 +773,7 @@ def _verify_macos_bundle(app_bundle: Path) -> None:
     if not team_id:
         raise UpdateError(
             "未配置 macOS Team ID（YIKOU_MACOS_TEAM_ID），拒绝安装未验证签名的更新")
-    if sys.platform != "darwin":
+    if not _is_macos_platform():
         raise UpdateError("当前平台无法执行 macOS codesign 校验")
     commands = [
         ["/usr/bin/codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app_bundle)],

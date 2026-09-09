@@ -182,7 +182,7 @@ def test_pending_update_atomically_replaces_and_restarts(tmp_path, monkeypatch):
 
 def test_source_mode_cannot_replace_python_executable(monkeypatch):
     release = ReleaseInfo("v1.4.0", "v1.4.0", "", "", ())
-    monkeypatch.setattr("app.updater.os.name", "nt")
+    monkeypatch.setattr("app.updater._is_windows_platform", lambda: True)
     monkeypatch.delattr("app.updater.sys.frozen", raising=False)
     with pytest.raises(UpdateError, match="源码运行模式"):
         download_and_install(release)
@@ -228,8 +228,7 @@ def test_release_linux_assets_are_selected():
 def test_linux_source_mode_cannot_auto_install(monkeypatch):
     # 源码运行模式下 sys.executable 是 python 解释器，替换它会损坏 Python 安装；
     # 此时仅提示前往 Release 页面手动下载。
-    monkeypatch.setattr("app.updater.sys.platform", "linux")
-    monkeypatch.setattr("app.updater.os.name", "posix")
+    monkeypatch.setattr("app.updater._is_linux_platform", lambda: True)
     monkeypatch.delattr("app.updater.sys.frozen", raising=False)
     release = ReleaseInfo(
         "v2.1.0", "v2.1.0", "", "",
@@ -267,8 +266,7 @@ def _linux_install_env(tmp_path, monkeypatch) -> tuple[Path, Path]:
     install_dir.mkdir()
     target = install_dir / "yikou-light-food"
     target.write_bytes(b"old binary")
-    monkeypatch.setattr("app.updater.sys.platform", "linux")
-    monkeypatch.setattr("app.updater.os.name", "posix")
+    monkeypatch.setattr("app.updater._is_linux_platform", lambda: True)
     monkeypatch.setattr("app.updater.sys.frozen", True, raising=False)
     monkeypatch.setattr("app.updater.sys.executable", str(target))
     return install_dir, target
@@ -618,7 +616,7 @@ def test_check_for_update_rejects_current_below_minimum(monkeypatch):
 
 def test_windows_authenticode_requires_configured_publisher(monkeypatch):
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(updater.os, "name", "nt")
+    monkeypatch.setattr(updater, "_is_windows_platform", lambda: True)
     monkeypatch.setattr(updater, "WINDOWS_AUTHENTICODE_PUBLISHER", "")
     with pytest.raises(UpdateError, match="未配置 Windows Authenticode 发布者"):
         updater._verify_windows_authenticode(Path("app.exe"))
@@ -631,7 +629,7 @@ def test_windows_authenticode_accepts_matching_publisher(monkeypatch):
         stderr = ""
 
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(updater.os, "name", "nt")
+    monkeypatch.setattr(updater, "_is_windows_platform", lambda: True)
     monkeypatch.setattr(updater, "WINDOWS_AUTHENTICODE_PUBLISHER", "CN=Acme Software")
     monkeypatch.setattr(updater.subprocess, "run", lambda *a, **k: Completed())
 
@@ -646,7 +644,7 @@ def test_macos_codesign_requires_matching_team_id(monkeypatch):
             self.stderr = err
 
     monkeypatch.setattr(updater.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(updater.sys, "platform", "darwin")
+    monkeypatch.setattr(updater, "_is_macos_platform", lambda: True)
     monkeypatch.setattr(updater, "MACOS_TEAM_ID", "TEAMID123")
 
     def fake_run(command, **kwargs):
