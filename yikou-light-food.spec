@@ -51,8 +51,8 @@ if _kdocs_name and _kdocs_src.is_file():
 else:
     # 不中断构建（例如开发者未拉取二进制时仍可打包），但要让问题显式可见。
     print(
-        f"[spec] 警告：未找到 vendor/kdocs-cli/{_kdocs_name or '<unknown platform>'}，"
-        "云文档同步在打包版里会提示缺少组件。"
+        f"[spec] WARNING: vendor/kdocs-cli/{_kdocs_name or '<unknown platform>'} not found; "
+        "WPS cloud sync will report a missing component in the packaged app."
     )
 # 内置浏览器不打进单文件 exe：它由 scripts/fetch_browser.py 抓到
 # vendor/browser/，再由各平台构建脚本放在可执行文件同级（macOS 放在

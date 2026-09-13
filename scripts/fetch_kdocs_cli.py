@@ -27,6 +27,14 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+# Windows 控制台默认 cp1252；构建脚本会输出中文进度，先统一改成 UTF-8，
+# 避免 UnicodeEncodeError 让构建在真正开始前就失败。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 ROOT = Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor" / "kdocs-cli"
 VERSION = "2.5.29"

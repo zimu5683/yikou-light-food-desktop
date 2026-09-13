@@ -31,4 +31,4 @@ mkdir -p "$APP/Contents/Resources"
 cp -a "$ROOT/vendor/browser" "$APP/Contents/Resources/browser"
 
 du -sh "$APP" | awk '{print "App bundle size: " $1}'
-echo "Build complete: $APP（含内置 Chromium）"
+echo "Build complete: ${APP}（含内置 Chromium）"
