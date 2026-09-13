@@ -82,6 +82,25 @@ def test_order_log_address_unchanged_has_no_arrow():
     assert "大西" in line
 
 
+def test_order_address_normalization_uses_latest_point_names():
+    from app.automation import _format_order_summary, _prepare_order_address
+
+    cases = [
+        ("浙江省杭州市临安区浙江农林大学(东湖校区) 小西门", "小"),
+        ("浙江省杭州市临安区浙江农林大学(东湖校区) B6", "b6"),
+    ]
+    for raw, point in cases:
+        order = OrderInfo(
+            order_no="W9",
+            name="测试用户",
+            delivery_address=raw,
+            lunch=[MealInfo(total_meals=1, meal_type="午餐")],
+        )
+        _prepare_order_address(order, {})
+        assert order.address == point
+        assert f"{raw} → {point}｜" in _format_order_summary(order)
+
+
 def test_new_config_has_no_implicit_current_directory_workbook():
     assert AppConfig().excel_path is None
 

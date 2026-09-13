@@ -572,6 +572,89 @@ def test_update_without_checksum_source_is_rejected(tmp_path):
     assert not target.with_name(f".app.update-{os.getpid()}.tmp").exists()
 
 
+def _build_linux_archive_with_browser(tmp_path: Path) -> tuple[bytes, str]:
+    """构造带内置 browser/ 目录的 Linux 发行包（与构建脚本产出一致）。"""
+    source = tmp_path / "yikou-light-food"
+    source.write_bytes(b"#!/bin/sh\necho new\n")
+    source.chmod(0o755)
+    browser = tmp_path / "browser" / "chromium-1234" / "chrome-linux64"
+    browser.mkdir(parents=True)
+    (browser / "chrome").write_bytes(b"\x7fELF-chromium")
+    (tmp_path / "browser" / "browser.json").write_text('{"playwright": "1.62.0"}', encoding="utf-8")
+    archive_path = tmp_path / "archive-with-browser.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as tar:
+        tar.add(source, arcname="yikou-light-food")
+        tar.add(tmp_path / "browser", arcname="browser")
+    data = archive_path.read_bytes()
+    return data, hashlib.sha256(data).hexdigest()
+
+
+@_linux_only
+def test_linux_accepts_bundled_browser_in_archive(tmp_path, monkeypatch):
+    """发行包现在带 browser/，更新器必须接受它，而不是判为夹带文件。"""
+    archive_bytes, archive_sha = _build_linux_archive_with_browser(tmp_path)
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: None)
+
+    result = download_and_install(_linux_release(archive_sha))
+
+    assert result == target.resolve()
+    # 原安装缺少内置浏览器时应随更新补齐。
+    installed = install_dir / "browser" / "chromium-1234" / "chrome-linux64" / "chrome"
+    assert installed.is_file()
+    assert (install_dir / "browser" / "browser.json").is_file()
+    shutil.rmtree(install_dir / f".yikou-light-food.update-{os.getpid()}")
+
+
+@_linux_only
+def test_linux_keeps_existing_browser_directory(tmp_path, monkeypatch):
+    """已有 browser/ 时保持原样：更新期间当前进程可能正在使用它。"""
+    archive_bytes, archive_sha = _build_linux_archive_with_browser(tmp_path)
+    install_dir, target = _linux_install_env(tmp_path, monkeypatch)
+    existing = install_dir / "browser" / "chromium-9999"
+    existing.mkdir(parents=True)
+    (existing / "marker").write_text("local", encoding="utf-8")
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+    monkeypatch.setattr("app.updater.subprocess.Popen", lambda args, **kwargs: None)
+
+    download_and_install(_linux_release(archive_sha))
+
+    assert (existing / "marker").read_text(encoding="utf-8") == "local"
+    assert not (install_dir / "browser" / "chromium-1234").exists()
+    shutil.rmtree(install_dir / f".yikou-light-food.update-{os.getpid()}")
+
+
+@_linux_only
+def test_linux_rejects_executable_outside_browser_directory(tmp_path, monkeypatch):
+    """browser/ 之外仍然只允许应用二进制。"""
+    archive = tmp_path / "nested-evil.tar.gz"
+    with tarfile.open(archive, "w:gz") as tar:
+        binary = tmp_path / "yikou-light-food"
+        binary.write_bytes(b"\x7fELF-payload")
+        tar.add(binary, arcname="yikou-light-food")
+        evil = tmp_path / "browser-evil.sh"
+        evil.write_bytes(b"#!/bin/sh\n")
+        tar.add(evil, arcname="browserevil/x.sh")
+    archive_bytes = archive.read_bytes()
+    install_dir, _target = _linux_install_env(tmp_path, monkeypatch)
+    monkeypatch.setattr("app.updater._stream_download",
+                        lambda url, destination, **kwargs: destination.write_bytes(archive_bytes))
+    monkeypatch.setattr("app.updater.tempfile.mkdtemp", lambda prefix: str(tmp_path / "work"))
+    (tmp_path / "work").mkdir()
+
+    with pytest.raises(UpdateError, match="预期外文件"):
+        download_and_install(_linux_release(hashlib.sha256(archive_bytes).hexdigest()))
+
+    assert not list(install_dir.glob(".yikou-light-food.update-*"))
+
+
 @_linux_only
 def test_linux_rejects_extra_file_in_archive(tmp_path, monkeypatch):
     evil_archive = tmp_path / "extra.tar.gz"

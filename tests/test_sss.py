@@ -381,7 +381,12 @@ def test_dry_run_skips_network(tmp_path):
     result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
                              captcha_callback=lambda img: (_ for _ in ()).throw(
                                  AssertionError("干跑不应索取验证码")))
-    assert result == {"processed": 1, "created": 1}
+    assert result["status"] == "dry_run"
+    assert result["processed"] == 1
+    assert result["created"] == 0
+    assert result["previewed"] == 1
+    assert result["submitted"] == 0
+    assert result["reconciled"] is False
     assert any("干跑" in msg for msg in logs)
 
 
@@ -540,11 +545,10 @@ def test_api_submitter_uses_forked_worker_session_and_closes_it():
 def test_reconcile_normalizes_door_and_keeps_lunch_dinner_separate():
     lunch = _task("lunch", door="b1", delivery="2026-09-10 11:00:00")
     dinner = _task("dinner", door="B1", delivery="2026-09-10 17:00:00")
-    lunch_start, _ = sss._delivery_day_bounds("2026-09-10 11:00:00")
 
     def fetch(path):
-        records = [_station_record(lunch)] if f"startTime={lunch_start}" in path else []
-        return {"success": True, "result": {"records": records, "total": len(records)}}
+        assert "startTime" not in path and "statusList" not in path
+        return {"success": True, "result": {"records": [_station_record(lunch)], "total": 1}}
 
     result = sss._reconcile_tasks([lunch, dinner], fetch)
     assert result.confirmed == {"lunch"}
@@ -569,8 +573,147 @@ def test_list_pending_orders_paginates():
     assert result.confirmed == {"t1"}
     assert len(calls) == 2
     assert all("sortType=1" in path and "sort=1" in path for path in calls)
-    assert all("statusList=0" in path and "statusList=1" in path and "statusList=2" in path
-               for path in calls)
+    assert all("startTime" not in path and "endTime" not in path
+               and "statusList" not in path for path in calls)
+
+
+def test_build_list_prefilter_uses_epoch_ms_window_with_margin():
+    task = _task(delivery="2026-09-11 11:00:00")
+    prefilter = sss._build_list_prefilter([task])
+
+    # 服务端 time 型参数只接受 epoch 毫秒；字符串会被 Spring 拒绝。
+    assert set(prefilter) == {"startTime", "endTime"}
+    assert isinstance(prefilter["startTime"], int) and isinstance(prefilter["endTime"], int)
+    start = dt.datetime.fromtimestamp(prefilter["startTime"] / 1000)
+    end = dt.datetime.fromtimestamp(prefilter["endTime"] / 1000)
+    # 目标日 09-11，前后各放宽 1 天 → 09-10 00:00:00 ~ 09-12 23:59:59
+    assert start.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-10 00:00:00"
+    assert end.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-12 23:59:59"
+    # 刻意不带 status：同一批订单派发后会由 2 变成 3，硬编码会把这批单筛没。
+    assert "status" not in prefilter and "statusList" not in prefilter
+
+
+def test_build_list_prefilter_is_empty_without_parseable_days():
+    assert sss._build_list_prefilter([]) == {}
+    assert sss._build_list_prefilter([{"fingerprint": None}]) == {}
+
+
+def test_list_pending_orders_sends_prefilter_and_keeps_local_day_filter():
+    task = _task(delivery="2026-09-11 11:00:00")
+    # 站内返回了一条「窗口内、但不是目标日」的记录：预筛只做粗筛，
+    # 真正的判定必须仍由本地过滤负责，不能被算成匹配。
+    other_day = _task("other", name="李四", phone="13900000002",
+                      delivery="2026-09-10 11:00:00")
+
+    def fetch(path):
+        assert "startTime=" in path and "endTime=" in path
+        return {"success": True, "result": {"records": [_station_record(task),
+                                                        _station_record(other_day)],
+                                            "total": 2}}
+
+    records = sss._list_pending_orders(
+        fetch, [task], prefilter=sss._build_list_prefilter([task]))
+    assert [record["receiveName"] for record in records] == ["张三"]
+
+
+def test_reconcile_tasks_forwards_prefilter():
+    task = _task()
+    seen = []
+
+    def fetch(path):
+        seen.append(path)
+        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+
+    result = sss._reconcile_tasks([task], fetch, prefilter={"startTime": 1, "endTime": 2})
+    assert result.confirmed == {"t1"}
+    assert "startTime=1" in seen[0] and "endTime=2" in seen[0]
+
+
+def test_safe_reconcile_falls_back_to_full_scan_when_prefilter_misses(monkeypatch):
+    """预筛窗口漏单时必须用全量扫描复核，绝不能据此误判缺失。"""
+    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append("window" if "startTime=" in path else "full")
+        if "startTime=" in path:
+            return {"success": True, "result": {"records": [], "total": 0}}
+        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+
+    logs = []
+    result = sss._safe_reconcile([task], fetch, logs.append, "测试对账", zero_retry_delay=0)
+    assert result is not None and result.confirmed == {"t1"} and not result.missing
+    # 预筛空 → 立即重查一次（区分“刚写入不可见”）→ 仍空 → 全量复核
+    assert calls == ["window", "window", "full"]
+    assert "全量复核确认为 1/1 单" in "\n".join(logs)
+
+
+def test_safe_reconcile_zero_window_retry_recovers_without_full_scan(monkeypatch):
+    """预筛窗口 0 条但重查即命中时，只多花一次重查，不应退化成全量扫描。"""
+    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append("window" if "startTime=" in path else "full")
+        if "startTime=" not in path:
+            raise AssertionError("重查命中后不应再做全量扫描")
+        if calls.count("window") == 1:
+            return {"success": True, "result": {"records": [], "total": 0}}
+        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+
+    logs = []
+    result = sss._safe_reconcile([task], fetch, logs.append, "测试对账", zero_retry_delay=0)
+    assert result is not None and result.confirmed == {"t1"} and not result.missing
+    assert calls == ["window", "window"]
+    assert "重查一次" in "\n".join(logs)
+
+
+def test_safe_reconcile_skips_full_scan_when_prefilter_matches(monkeypatch):
+    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+
+    result = sss._safe_reconcile([task], fetch, None, "测试对账")
+    assert result is not None and not result.missing
+    assert len(calls) == 1
+    assert "startTime=" in calls[0]
+
+
+def test_safe_reconcile_uses_full_scan_when_prefilter_request_fails(monkeypatch):
+    """预筛请求报错时仍然降级全量扫描，而不是直接判对账失败。"""
+    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", True)
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        if "startTime=" in path:
+            raise RuntimeError("预筛参数被拒绝")
+        return {"success": True, "result": {"records": [_station_record(task)], "total": 1}}
+
+    result = sss._safe_reconcile([task], fetch, None, "测试对账")
+    assert result is not None and result.confirmed == {"t1"}
+    assert len(calls) == 2
+
+
+def test_safe_reconcile_without_prefilter_never_scans_twice(monkeypatch):
+    monkeypatch.setattr(sss, "_SSS_SERVER_PREFILTER", False)
+    task = _task()
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        return {"success": True, "result": {"records": [], "total": 0}}
+
+    result = sss._safe_reconcile([task], fetch, None, "测试对账")
+    assert result is not None and result.missing
+    assert all("startTime" not in path for path in calls)
 
 
 def test_reconcile_fails_closed_when_list_record_cannot_build_fingerprint():
@@ -745,6 +888,86 @@ def _full_station_record(task, **overrides):
     return record
 
 
+def _summary_station_record(task, **overrides):
+    """订单列表接口 2026-09 实测的概要结构：字段名 recipient*、电话为数组、
+    地址拍平成一整串，且不含 storeId/goodsDetail/坐标。"""
+    payload = task["payload"]
+    address = payload["receiveAddress"]
+    record = {
+        "id": 201489339,
+        "pickUpNumber": "86",
+        "recipientName": payload["receiveName"],
+        "recipientPhone": [payload["receivePhone"]],
+        "recipientAddress": (address["addressDetail"] + address["doorNum"]),
+        "expectedDeliveryTime": payload["expectedDeliveryTime"],
+        "orderTime": 1788991733000,
+        "sendTime": 1788991737000,
+        "status": 2,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_summary_record_parses_recipient_fields_and_array_phone():
+    task = _full_task()
+    fp = sss._order_record_fingerprint(_summary_station_record(task))
+    assert fp.receive_name == "张三"
+    assert fp.receive_phone == "13800000001"
+    assert fp.address_detail == "浙江农林大学东湖校区a101"
+    assert fp.expected_delivery_time == task["payload"]["expectedDeliveryTime"]
+
+
+def test_reconcile_matches_summary_schema_record():
+    task = _full_task()
+    result = sss._reconcile_tasks(
+        [task], lambda path: {"success": True,
+                              "result": {"records": [_summary_station_record(task)], "total": 1}})
+    assert result.confirmed == {"full"}
+    assert result.missing == []
+    assert result.duplicate_count == 0
+
+
+def test_reconcile_matches_summary_address_with_prefix_variation():
+    """站内地址整串带省市区前缀时，应能兼容同一订单而不是误判为其他订单。"""
+    task = _full_task(door="A101", address_detail="浙江农林大学东湖校区")
+    record = _summary_station_record(
+        task, recipientAddress="浙江省杭州市临安区浙江农林大学东湖校区A101")
+    result = sss._reconcile_tasks(
+        [task], lambda path: {"success": True, "result": {"records": [record], "total": 1}})
+    assert result.confirmed == {"full"}
+    assert result.missing == []
+
+
+def test_reconcile_ignores_same_person_other_door_without_raising():
+    """同人同时间的旧订单若门牌不同，应视为其他订单忽略，不得 fail-closed 整批。"""
+    task = _full_task(door="A101")
+    other = _summary_station_record(task, recipientAddress="浙江农林大学东湖校区学3")
+    result = sss._reconcile_tasks(
+        [task], lambda path: {"success": True, "result": {"records": [other], "total": 1}})
+    assert result.confirmed == set()
+    assert [item["identifier"] for item in result.missing] == ["full"]
+
+
+def test_reconcile_ignores_unrelated_summary_records_without_raising():
+    """概要结构里别人的订单不能触发 fail-closed（此前会因缺字段整批报错）。"""
+    task = _full_task()
+    unrelated = _summary_station_record(
+        task, recipientName="程", recipientPhone=["18545726939"],
+        recipientAddress="浙江农林大学东湖校区学3")
+    result = sss._reconcile_tasks(
+        [task], lambda path: {"success": True, "result": {"records": [unrelated], "total": 1}})
+    assert result.confirmed == set()
+    assert result.missing == [task]
+
+
+def test_reconcile_fails_closed_when_summary_record_lacks_core_fields():
+    task = _full_task()
+    broken = _summary_station_record(task, recipientName="", recipientPhone=[])
+    with pytest.raises(LookupError, match="无法安全对账"):
+        sss._reconcile_tasks(
+            [task], lambda path: {"success": True, "result": {"records": [broken], "total": 1}})
+
+
 def test_payload_fingerprint_contains_all_context_fields():
     task = _full_task()
     fp = sss._payload_fingerprint(task["payload"], account=task["account"])
@@ -818,6 +1041,7 @@ def test_reconcile_delay_polls_without_duplicate_post(monkeypatch):
             raise AssertionError("对账延迟不应停止任务")
 
     monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
     final, reconciled = sss._run_reconciled_submission(
         [task], factory, fetch, Stop(), None, None, max_workers=1)
     assert reconciled is True
@@ -986,3 +1210,341 @@ def test_with_auth_relogin_retries_once_after_token_expired():
     result = sss._with_auth_relogin(operation, lambda: calls.append("relogin"), None, "读取余额")
     assert result == "ok"
     assert calls == ["operation", "relogin", "operation"]
+
+
+def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
+    """预检：真实登录 + 读门店/余额/订单列表对账，但绝不发送任何下单 POST。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "A101", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    task = _full_task()
+    # 送达时间由 run_sss_job 按当前时钟计算（16 点后顺延次日），站内记录必须
+    # 使用同一时间才可能对上，测试里动态取一次避免跨天导致的假失败。
+    task["payload"]["expectedDeliveryTime"] = sss.compute_delivery_time(False)
+    task["fingerprint"] = sss._payload_fingerprint(task["payload"], account=task["account"])
+    expected_record = _full_station_record(task)
+    posts = []
+    gets = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            assert code == "1234"
+
+        def get_json(self, path):
+            gets.append(path)
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            if "one-touch-send/list" in path:
+                return {"success": True,
+                        "result": {"records": [expected_record], "total": 1}}
+            raise AssertionError(f"未预期的 GET：{path}")
+
+        def post_json(self, path, body=None):
+            posts.append((path, body))
+            raise AssertionError("预检模式绝不能发送下单 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
+        sss_fixed_area_code="330110",
+        sss_fixed_address_detail="浙江农林大学东湖校区",
+        sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert result["status"] == "preflight_ok"
+    assert result["submitted"] == 0
+    assert result["created"] == 1
+    assert result["stopped"] is False
+    assert posts == []
+    list_paths = [path for path in gets if "one-touch-send/list" in path]
+    assert list_paths
+    # 预筛只带 epoch 毫秒时间窗；无效的 statusList 一律不发。
+    assert all("startTime=" in path and "endTime=" in path for path in list_paths)
+    assert all("statusList" not in path for path in gets)
+
+
+def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
+    """站内一条订单都没有时，预检应正常完成（preflight_ok）而不是报不确定。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "A101", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            if "one-touch-send/list" in path:
+                return {"success": True, "result": {"records": [], "total": 0}}
+            raise AssertionError(f"未预期的 GET：{path}")
+
+        def post_json(self, path, body=None):
+            raise AssertionError("预检模式绝不能发送下单 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
+        sss_fixed_area_code="330110",
+        sss_fixed_address_detail="浙江农林大学东湖校区",
+        sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert result["status"] == "preflight_ok"
+    assert result["submitted"] == 0
+    assert result["created"] == 0
+    assert result["reconciled"] is True
+    assert result["uncertain"] is False
+
+
+def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
+    """预检遇到对账失败必须返回 uncertain 并停止，且仍然不发 POST。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "B1", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    posts = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            if "one-touch-send/list" in path:
+                return {"success": True, "code": 200,
+                        "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+            raise AssertionError(f"未预期的 GET：{path}")
+
+        def post_json(self, path, body=None):
+            posts.append((path, body))
+            raise AssertionError("预检模式绝不能发送下单 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
+        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert result["status"] == "preflight_uncertain"
+    assert result["stopped"] is True
+    assert result["reconciled"] is False
+    assert result["uncertain"] is True
+    assert posts == []
+    assert any("缺少 records/list" in msg for msg in logs)
+
+
+def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
+    """余额未知或不足时必须在任何 POST 之前停止整批。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "B1", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    posts = []
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                # 可用余额 0.5 < 预计 1.9
+                return {"success": True,
+                        "result": {"totalAmount": 0.5, "freezeAmount": 0.0}}
+            raise AssertionError(f"余额不足时不应继续查询：{path}")
+
+        def post_json(self, path, body=None):
+            posts.append((path, body))
+            raise AssertionError("余额不足绝不能发送下单 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=False, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
+        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert result["status"] == "insufficient_balance"
+    assert result["stopped"] is True
+    assert result["submitted"] == 0
+    assert posts == []
+    assert any("余额不足" in msg for msg in logs)
+
+
+def test_list_records_rejects_shell_without_records():
+    """服务端对不支持的过滤参数返回无 records 空壳，必须 fail-closed 且报错点名结构。"""
+    import pytest
+
+    shell = {"success": True, "code": 200,
+             "result": {"total": 0, "size": 10, "current": 1, "pages": 0}}
+    with pytest.raises(LookupError, match="缺少 records/list"):
+        sss._list_records(shell)
+
+
+def test_local_filter_keeps_only_wanted_delivery_day():
+    task = _task(delivery="2026-09-10 11:00:00")
+    same_day = _station_record(task)
+    other_day = dict(_station_record(task))
+    other_day["expectedDeliveryTime"] = "2026-09-11 11:00:00"
+
+    def fetch(path):
+        assert "startTime" not in path and "statusList" not in path
+        return {"success": True,
+                "result": {"records": [same_day, other_day], "total": 2}}
+
+    result = sss._reconcile_tasks([task], fetch)
+    assert result.confirmed == {"t1"}
+    assert result.duplicate_count == 0

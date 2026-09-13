@@ -1,6 +1,7 @@
 # PyInstaller build specification for the desktop application.
 # Build with: python -m PyInstaller --clean --noconfirm yikou-light-food.spec
 from pathlib import Path
+import platform
 import sys
 
 from PyInstaller.utils.hooks import collect_all
@@ -31,7 +32,32 @@ datas += [
 update_trust = project / "app" / "update_trust.json"
 if update_trust.is_file():
     datas.append((str(update_trust), "app"))
-# The browser payload is machine-specific and is intentionally not bundled.
+# WPS 云文档同步依赖金山官方 CLI（kdocs-cli）。它不是 Python 包，只能随包分发；
+# 运行时会先在解包目录（sys._MEIPASS）里找，其次找程序同目录，最后找 PATH。
+# 组件与官方校验和见 vendor/kdocs-cli/README.md。
+KDOCS_PLATFORM_KEYS = {
+    ("win32", "AMD64"): "kdocs-cli.exe",
+    ("win32", "ARM64"): "kdocs-cli.exe",
+    ("darwin", "x86_64"): "kdocs-cli",
+    ("darwin", "arm64"): "kdocs-cli",
+    ("linux", "x86_64"): "kdocs-cli",
+    ("linux", "aarch64"): "kdocs-cli",
+}
+_kdocs_name = KDOCS_PLATFORM_KEYS.get((sys.platform, platform.machine()))
+_kdocs_src = project / "vendor" / "kdocs-cli" / (_kdocs_name or "")
+if _kdocs_name and _kdocs_src.is_file():
+    # 放进包根目录：运行时 find_cli 会优先命中 sys._MEIPASS。
+    binaries.append((str(_kdocs_src), "."))
+else:
+    # 不中断构建（例如开发者未拉取二进制时仍可打包），但要让问题显式可见。
+    print(
+        f"[spec] 警告：未找到 vendor/kdocs-cli/{_kdocs_name or '<unknown platform>'}，"
+        "云文档同步在打包版里会提示缺少组件。"
+    )
+# 内置浏览器不打进单文件 exe：它由 scripts/fetch_browser.py 抓到
+# vendor/browser/，再由各平台构建脚本放在可执行文件同级（macOS 放在
+# .app/Contents/Resources/browser）。单文件 exe 每次启动都会把包内数据
+# 解压到临时目录，塞进 300MB+ 的 Chromium 会让启动慢到不可用。
 datas = [item for item in datas if ".local-browsers" not in str(item[0])]
 binaries = [item for item in binaries if ".local-browsers" not in str(item[0])]
 
@@ -52,9 +78,9 @@ analysis = Analysis(
 )
 # Playwright's own PyInstaller hook re-collects the bundled browser payload
 # (playwright/driver/package/.local-browsers) regardless of the filter above,
-# so strip it after analysis too.  Only the Node driver is kept; the browser
-# binary is resolved at runtime from a system Edge/Chrome or the Playwright
-# Chromium cache, never from inside the executable.
+# so strip it after analysis too.  Only the Node driver is kept; Chromium is
+# resolved at runtime from the browser/ directory shipped next to the
+# executable, never from inside the executable.
 for _toc in ("datas", "binaries"):
     setattr(analysis, _toc, [
         entry for entry in getattr(analysis, _toc)

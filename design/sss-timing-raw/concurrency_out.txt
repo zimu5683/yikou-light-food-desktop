@@ -1,0 +1,13 @@
+[probe] 验证码已写入 /tmp/sss_captcha_live.png
+登录成功
+
+## POST 并发度压测（非法报文，不会建单）
+- 并发  4 ×  8 次: 单次中位 0.24s max 0.36s | 总墙钟 0.60s 吞吐 13.42/s | 响应码 {'500:操作失败，java.lang.NullPointerException': 8}
+- 并发  8 × 16 次: 单次中位 0.21s max 0.28s | 总墙钟 0.46s 吞吐 34.49/s | 响应码 {'500:操作失败，java.lang.NullPointerException': 16}
+- 并发 16 × 32 次: 单次中位 0.27s max 0.31s | 总墙钟 0.55s 吞吐 57.96/s | 响应码 {'500:操作失败，java.lang.NullPointerException': 32}
+- 并发 32 × 64 次: 单次中位 0.24s max 0.30s | 总墙钟 0.58s 吞吐 109.71/s | 响应码 {'500:操作失败，java.lang.NullPointerException': 64}
+
+## 列表接口并发压测（只读）
+- 并发 1 × 2: 单次中位 2.57s 总墙钟 5.13s | 结果 {('ok', 100)}
+- 并发 4 × 8: 单次中位 2.18s 总墙钟 4.83s | 结果 {('ok', 100)}
+- 并发 8 × 16: 单次中位 2.35s 总墙钟 5.00s | 结果 {('ok', 100)}

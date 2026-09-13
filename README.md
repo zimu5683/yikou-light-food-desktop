@@ -4,9 +4,10 @@
 
 此项目是本人自用，代码功能不完善，还有许多需要改进的地方，项目公开，大家也可以以我项目为基础开发出更完整功能的项目。
 
-程序包含两个任务模式：
+程序包含三个任务模式：
 
 - **订单处理**：登录管理后台，读取最新订单并写入排单 Excel；
+- **云文档同步**：把本地排单表的内容增量写入 WPS 云端的排单表（见下文）；
 - **闪时送下单**：从独立的《闪时送.xlsx》读取订单（午餐/晚餐两表），在闪时送平台逐单创建预约单。
 
 默认使用**纯接口模式**：不启动浏览器，直接调用平台 HTTP 接口完成登录、读单和下单。
@@ -18,9 +19,11 @@
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-python -m playwright install chromium
+python scripts/fetch_browser.py    # 抓取并精简内置 Chromium 到 vendor/browser/
 python run.py
 ```
+
+`fetch_browser.py` 只做一次即可；它优先复用本机 Playwright 缓存，缺失时才下载。开发态会依次在仓库根 `browser/` 和 `vendor/browser/` 中查找内置 Chromium，也可以用环境变量 `YIKOU_BROWSER_DIR` 指向别处。
 
 也可以在 Visual Studio 中打开仓库目录，将 `run.py` 设为启动文件并使用 Python 调试器。
 
@@ -30,7 +33,18 @@ python run.py
 .\scripts\build_windows.ps1
 ```
 
-生成的程序位于 `dist/yikou-light-food.exe`。首次运行可点击“安装 / 检查浏览器”，或执行 `yikou-light-food.exe --install-browser`。需要联网下载 Playwright Chromium；若系统存在 Edge 或 Chrome，运行时会优先使用系统浏览器。浏览器文件安装在当前用户的 Playwright 缓存目录中，不会写入程序目录。
+构建产物有两份：`dist/yikou-light-food.exe`（单文件可执行程序）和 `dist/yikou-light-food-windows-x64.zip`（**首次安装请分发这个**）。zip 内是 exe 与内置 Chromium 目录：
+
+```
+yikou-light-food.exe
+browser/
+  browser.json
+  chromium-<revision>/chrome-win64/chrome.exe
+```
+
+解压后**必须保持 `browser/` 与 exe 同级**，自动化会固定调用这份内置 Chromium，不再探测系统 Edge/Chrome，也不会在运行时下载浏览器。可执行 `yikou-light-food.exe --check-browser` 做自检，它会打印内置 Chromium 的路径与版本。
+
+增量更新只替换 exe，`browser/` 目录保持不动，因此日常小版本升级仍然只下载差分补丁。
 
 ## macOS 构建
 
@@ -60,9 +74,11 @@ chmod +x yikou-light-food
 ./yikou-light-food
 ```
 
+解压后当前目录下会同时得到可执行文件与内置的 `browser/` 目录，两者必须放在一起。自检命令：`./yikou-light-food --check-browser`。
+
 Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Release，发现新版本后可以直接下载、校验并自动替换重启（需程序所在目录可写，失败时仍会引导前往 Release 页面手动下载）。
 
-浏览器方面建议安装系统版 Microsoft Edge（`microsoft-edge-stable`）或 Google Chrome（`google-chrome-stable`），程序会自动识别；也可点击“安装 / 检查浏览器”下载 Playwright Chromium（需要系统已具备常见运行库，缺失时可参照 Playwright 文档安装依赖）。
+浏览器方面无需在系统里安装 Edge/Chrome：发行包已经内置 Chromium，自动化固定使用它。若内置 Chromium 因缺少系统运行库而无法启动，可参照 Playwright 文档安装 Chromium 的依赖项。
 
 开发者也可以在 Linux 上从源码构建：
 
@@ -71,6 +87,61 @@ Linux 打包版同样支持自动更新：启动时会后台检查 GitHub Releas
 ```
 
 产物为仓库根目录的 `yikou-light-food-linux-<架构>.tar.gz` 及其 SHA-256 校验文件。推送版本标签后，GitHub Actions 会构建并自动附加到对应的 GitHub Release 下载页面。
+
+## 云文档同步（WPS 云端排单表）
+
+「云文档同步」页签把本地《排单.xlsx》的内容**增量写入**协作者维护的 WPS 云端排单表，
+不需要整表覆盖，因此云端的公式、自定义排序、字体和列宽都不会被破坏。
+
+### 它做什么
+
+对本地排单表的每个子表（东湖/衣锦/医学院 × 中餐/晚餐）：
+
+1. 在云端表里按内容定位**目标日期列**（只比对「月.日」，忽略星期文字）；
+2. 按【名字 + 电话】找到客户所在行；
+3. 旧客户：把**目标日期格写 1**，**总餐次写成与本地「餐次」一致**；
+4. 新客户：追加到表尾，填名字/地址/电话 + 总餐次 + 目标日期格；
+5. 可选：在备注列右侧第 2 列写协作者的**通讯记号**（周日 1、周一 2 … 周六 7）。
+
+**总餐次写的是绝对值而不是累加值**，所以同一天重复上传不会翻倍——
+云端已经是目标状态时，程序一个格子都不会写。
+
+### 目标日期怎么算
+
+网站 21:00 截止、程序通常在晚上运行，因此：
+
+| 运行时刻 | 写入云端哪一列 |
+|---|---|
+| 20:00 ~ 次日 10:00 | **运行日 + 1 天** |
+| 其它时刻 | 运行日 |
+
+窗口起止小时可在配置里调整（`wps_target_hour_start` / `wps_target_hour_end`）。
+
+### 首次使用
+
+1. 「云文档同步」页签 → **去授权**，在浏览器里用你的 WPS 账号确认一次；
+   token 由 CLI 存进系统密钥链，约一年内无需重复授权；
+2. 保持**测试模式**（默认开启），点「预览」确认要改的内容；
+3. 确认无误后点「确认上传」，去云端核对结果；
+4. 核对通过后关闭测试模式，正式启用。
+
+**测试模式**下每张正式表都会被替换为对应的测试副本（`vendor` 之外，云端名称以「测试-」开头），
+所以测试期间绝不会碰正式排单表；测试模式也不写协作者通讯记号。
+
+### 安全边界
+
+- 上传前必须先「预览」，确认按钮在预览成功前不可点；
+- 找不到目标日期列 → 不写、不建列，只提示（通常是协作者还没加当天的列）；
+- 写入后逐格回读校验，校验不通过则报告并不更新本地账本；
+- 本地账本在用户配置目录的 `wps_sync_state.json`，只用于留痕与状态展示；
+- 任何失败都只写日志，**不会影响本地排单任务**。
+
+### 组件来源
+
+云文档读写依赖金山官方 CLI `kdocs-cli`（无 PyPI 包，只能随包分发）。
+构建脚本会调用 `scripts/fetch_kdocs_cli.py` 按平台下载并用官方 `checksums.txt`
+校验 sha256；运行时按「打包内置 → 仓库 vendor → 程序同目录 → PATH」顺序查找，
+也可以在页签里手动指定路径。详情见 `vendor/kdocs-cli/README.md`。
 
 ## 数据与安全
 

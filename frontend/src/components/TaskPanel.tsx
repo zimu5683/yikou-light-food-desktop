@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { MoreHorizontal } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { CloudForm } from '@/components/CloudForm'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -44,6 +45,9 @@ export function TaskPanel() {
           <ModeTab active={mode === 'order'} onClick={() => setMode('order')}>
             订单处理
           </ModeTab>
+          <ModeTab active={mode === 'cloud'} onClick={() => setMode('cloud')}>
+            云文档同步
+          </ModeTab>
           <ModeTab active={mode === 'sss'} onClick={() => setMode('sss')}>
             闪时送下单
           </ModeTab>
@@ -53,6 +57,9 @@ export function TaskPanel() {
             导致切页签后已输入内容丢失并被旧 config 重新填充。 */}
         <div className={cn(mode === 'order' ? 'block' : 'hidden')}>
           <OrderForm key={formKey} />
+        </div>
+        <div className={cn(mode === 'cloud' ? 'block' : 'hidden')}>
+          <CloudForm key={formKey} />
         </div>
         <div className={cn(mode === 'sss' ? 'block' : 'hidden')}>
           <SssForm key={formKey} />
@@ -251,6 +258,7 @@ function SssForm() {
   const fixedAddressDetail = config?.sss_fixed_address_detail ?? '浙江农林大学东湖校区'
   const [remember, setRemember] = useState(true)
   const [dryRun, setDryRun] = useState(config?.sss_dry_run ?? true)
+  const [preflight, setPreflight] = useState(config?.sss_preflight ?? false)
   const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
@@ -271,6 +279,7 @@ function SssForm() {
         fixed_area_code: fixedAreaCode,
         fixed_address_detail: fixedAddressDetail,
         dry_run: dryRun,
+        preflight,
         api_mode: apiMode,
       })
       .catch(() => {})
@@ -284,7 +293,7 @@ function SssForm() {
     scheduleSave()
   }, [
     url, account, excel, productName, commonAddress, useFixedAddress,
-    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, apiMode,
+    fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight, apiMode,
     scheduleSave,
   ])
 
@@ -310,6 +319,7 @@ function SssForm() {
         fixed_address_detail: fixedAddressDetail,
         remember,
         dry_run: dryRun,
+        preflight,
         api_mode: apiMode,
       }
       const errors = await startSss(payload)
@@ -389,6 +399,15 @@ function SssForm() {
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
         <Switch checked={dryRun} onCheckedChange={setDryRun} aria-label="干跑：只预览报文，不创建订单" />
         <span>干跑：只预览报文，不创建订单</span>
+      </div>
+
+      <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
+        <Switch
+          checked={preflight}
+          onCheckedChange={setPreflight}
+          aria-label="预检：登录并检查，不创建订单"
+        />
+        <span>预检：登录并检查余额/订单，不创建订单</span>
       </div>
 
       <div className="mb-4 mt-1 flex items-center gap-2 text-[12.5px] text-muted-foreground">
@@ -487,7 +506,7 @@ function ToolsMenu({ mode }: { mode: TaskMode }) {
       <ConfirmClearPassword
         open={confirmClear}
         onOpenChange={setConfirmClear}
-        onConfirm={() => clearPassword(mode)}
+        onConfirm={() => clearPassword(mode === 'sss' ? 'sss' : 'order')}
       />
     </>
   )

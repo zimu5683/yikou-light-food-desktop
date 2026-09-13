@@ -7,7 +7,7 @@ import shutil
 import sys
 import tempfile
 import threading
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -16,6 +16,86 @@ APP_NAME = "yikou-light-food"
 MIN_SPLIT_RATIO = 0.30
 MAX_SPLIT_RATIO = 0.55
 _CONFIG_SAVE_LOCK = threading.RLock()
+
+# 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
+# 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
+# 允许修改：协作者重建当月表后 file_id 会变，可在界面上更新。
+DEFAULT_WPS_PRODUCTION_TABLES: Dict[str, Dict[str, str]] = {
+    "东湖中餐": {"file_id": "fr2FrpFVMrM8poHaSHFK1xAsmSSBMspye"},
+    "衣锦中餐": {"file_id": "amqzgcXVMrMWopCdyxkJrxnqzcQ8UbaJG"},
+    "医学院中餐": {"file_id": "qvuPzdurK1MyKwL2weiZ1xF8RzdijFdaJ"},
+    "东湖晚餐": {"file_id": "noJa93Xq9xM62hfVqj6UrxEmgLjAHmqka"},
+    "衣锦晚餐": {"file_id": "mAc5hDw1q1MV33kW8JE7xxnnW1KEdYc1V"},
+    "医学院晚餐": {"file_id": "PpnGwh9ERxMRByaRp2EHrxUgCDjP4kZpA"},
+}
+
+# 当前生效的默认目标是正式云表。测试时必须显式配置本轮新建的副本。
+DEFAULT_WPS_TABLES: Dict[str, Dict[str, str]] = {
+    sheet: dict(conf) for sheet, conf in DEFAULT_WPS_PRODUCTION_TABLES.items()
+}
+
+
+def default_wps_production_tables() -> Dict[str, Dict[str, str]]:
+    """正式排单表的 file_id（当前暂停使用，仅作切回备份）。"""
+    return {sheet: dict(conf) for sheet, conf in DEFAULT_WPS_PRODUCTION_TABLES.items()}
+
+
+def default_wps_test_tables() -> Dict[str, str]:
+    """测试副本映射；默认为空，避免回退到过期副本。"""
+    return {}
+
+
+def normalize_wps_test_tables(value: Any) -> Dict[str, str]:
+    """规整显式测试表映射，不从正式表或历史副本继承。"""
+    result = default_wps_test_tables()
+    if isinstance(value, dict):
+        for sheet, file_id in value.items():
+            if isinstance(sheet, str) and sheet.strip() and str(file_id or "").strip():
+                result[sheet.strip()] = str(file_id).strip()
+    return result
+
+
+def normalize_wps_production_tables(value: Any) -> Dict[str, Dict[str, str]]:
+    """规整"正式表备份"映射：以 DEFAULT_WPS_PRODUCTION_TABLES 为底。
+
+    必须用独立的底表 —— 否则会被"当前生效表（测试副本）"覆盖，
+    备份就失去意义（曾经踩过这个坑）。
+    """
+    return normalize_wps_tables(value, base=default_wps_production_tables())
+
+
+def default_wps_tables() -> Dict[str, Dict[str, str]]:
+    """返回默认表映射的副本（避免多个实例共享同一 dict）。"""
+    return {sheet: dict(conf) for sheet, conf in DEFAULT_WPS_TABLES.items()}
+
+
+def normalize_wps_tables(value: Any,
+                         base: Optional[Dict[str, Dict[str, str]]] = None
+                         ) -> Dict[str, Dict[str, str]]:
+    """把用户/磁盘上的表映射规整成 {子表名: {"file_id": str, "drive_id": str}}。
+
+    规则：以 ``base``（默认=当前生效表）为底，用传入值覆盖 file_id（非空才覆盖），
+    保证旧配置升级后仍能拿到新增子表的默认值；无法解析的输入直接退回默认值。
+    """
+    result = {k: dict(v) for k, v in (base or default_wps_tables()).items()}
+    if not isinstance(value, dict):
+        return result
+    for sheet, conf in value.items():
+        if not isinstance(sheet, str) or not sheet.strip():
+            continue
+        entry = result.setdefault(sheet.strip(), {"file_id": ""})
+        if isinstance(conf, str):
+            if conf.strip():
+                entry["file_id"] = conf.strip()
+        elif isinstance(conf, dict):
+            fid = str(conf.get("file_id") or "").strip()
+            if fid:
+                entry["file_id"] = fid
+            drive = str(conf.get("drive_id") or "").strip()
+            if drive:
+                entry["drive_id"] = drive
+    # 去掉没有 file_id 的条目（未配置的表不参与同步）
+    return {sheet: conf for sheet, conf in result.items() if conf.get("file_id")}
 
 
 def clamp_split_ratio(value: object) -> float:
@@ -45,6 +125,8 @@ class AppConfig:
     target_url: str = "https://m.icall.me/admin/#/login"
     phone_number: str = ""
     excel_path: Path | None = None
+    # 已弃用：自动化固定使用随包分发的内置 Chromium，不再按此选择系统
+    # 浏览器。字段保留只为兼容既有 config.json，不会影响运行行为。
     browser_mode: str = "auto"  # auto, msedge, chromium
     headless: bool = False
     # 默认使用纯接口模式（不启动浏览器）；False 时退回 Playwright 浏览器模式。
@@ -76,6 +158,8 @@ class AppConfig:
     sss_fixed_address_detail: str = "浙江农林大学东湖校区"
     # 干跑模式：只组装并打印下单报文，不真实提交（用于验证流程）。
     sss_dry_run: bool = True
+    # 预检模式：登录并检查门店、地址、余额、订单列表，但不提交订单。
+    sss_preflight: bool = False
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
@@ -88,6 +172,25 @@ class AppConfig:
     # 可选：平台若支持客户端幂等字段，填字段名（如 clientRequestId）后启用稳定 UUID。
     # 默认空 = 抓包确认的平台 schema 没有该字段，采用至少一次提交+对账确认。
     sss_idempotency_field: str = ""
+    # ---- WPS 云文档同步（见 design/WPS-CLOUD-SYNC-PLAN.md）----
+    # 把本地排单表的内容增量写入云端排单表；单元格级写入，不整表覆盖。
+    wps_enabled: bool = False
+    # 测试模式必须显式配置本轮新建副本；不会自动使用正式表或历史副本。
+    wps_test_mode: bool = True
+    wps_test_file_id: str = "anUpCyxwE1MZcZc7KKpS1x625UG5Qwtg3"
+    wps_test_drive_id: str = "757726038"
+    wps_test_tables: Dict[str, Any] = field(default_factory=default_wps_test_tables)
+    # 正式排单表 ID 备份（当前暂停使用，切换回去时用得到）。
+    wps_production_tables: Dict[str, Any] = field(default_factory=default_wps_production_tables)
+    wps_drive_id: str = "757726038"
+    # 留空 = 自动查找内置 / 系统 PATH 里的 kdocs-cli。
+    wps_cli_path: str = ""
+    wps_tables: Dict[str, Any] = field(default_factory=default_wps_tables)
+    # 目标日期顺延窗口：[start, 24) ∪ [0, end) 内运行则写入"运行日 + 1 天"。
+    wps_target_hour_start: int = 20
+    wps_target_hour_end: int = 10
+    # 是否写协作者通讯记号（备注列右侧第 2 列的周几数字）；测试模式下一律不写。
+    wps_marker_enabled: bool = True
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -110,12 +213,25 @@ class AppConfig:
                  sss_fixed_area_code: str = "330110",
                  sss_fixed_address_detail: str = "浙江农林大学东湖校区",
                  sss_dry_run: bool = True,
+                 sss_preflight: bool = False,
                  sss_store_id: int | None = None,
                  sss_store_name_cached: str = "",
                  sss_max_workers: int = 4,
                  sss_read_timeout_s: float = 20.0,
                  sss_unit_price: float = 1.9,
                  sss_idempotency_field: str = "",
+                 wps_enabled: bool = False,
+                 wps_test_mode: bool = True,
+                 wps_test_file_id: str = "anUpCyxwE1MZcZc7KKpS1x625UG5Qwtg3",
+                 wps_test_drive_id: str = "757726038",
+                 wps_test_tables: Optional[Dict[str, Any]] = None,
+                 wps_production_tables: Optional[Dict[str, Any]] = None,
+                 wps_drive_id: str = "757726038",
+                 wps_cli_path: str = "",
+                 wps_tables: Optional[Dict[str, Any]] = None,
+                 wps_target_hour_start: int = 20,
+                 wps_target_hour_end: int = 10,
+                 wps_marker_enabled: bool = True,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -150,6 +266,7 @@ class AppConfig:
         self.sss_fixed_area_code = sss_fixed_area_code or "330110"
         self.sss_fixed_address_detail = sss_fixed_address_detail or "浙江农林大学东湖校区"
         self.sss_dry_run = bool(sss_dry_run)
+        self.sss_preflight = bool(sss_preflight)
         self.sss_store_id = int(sss_store_id) if sss_store_id not in (None, "") else None
         self.sss_store_name_cached = str(sss_store_name_cached or "")
         try:
@@ -167,6 +284,27 @@ class AppConfig:
         except (TypeError, ValueError):
             self.sss_unit_price = 1.9
         self.sss_idempotency_field = str(sss_idempotency_field or "").strip()
+        # ---- WPS 云文档同步 ----
+        self.wps_enabled = bool(wps_enabled)
+        self.wps_test_mode = bool(wps_test_mode)
+        self.wps_test_file_id = str(wps_test_file_id or "").strip()
+        self.wps_test_drive_id = str(wps_test_drive_id or "").strip()
+        self.wps_test_tables = normalize_wps_test_tables(wps_test_tables)
+        self.wps_production_tables = normalize_wps_production_tables(wps_production_tables)
+        self.wps_drive_id = str(wps_drive_id or "").strip()
+        self.wps_cli_path = str(wps_cli_path or "").strip()
+        self.wps_tables = normalize_wps_tables(wps_tables)
+        try:
+            start = int(wps_target_hour_start)
+        except (TypeError, ValueError):
+            start = 20
+        try:
+            end = int(wps_target_hour_end)
+        except (TypeError, ValueError):
+            end = 10
+        self.wps_target_hour_start = max(0, min(23, start))
+        self.wps_target_hour_end = max(0, min(23, end))
+        self.wps_marker_enabled = bool(wps_marker_enabled)
         self.config_path = config_path
         # Snapshot used by ``save`` to distinguish "this instance never touched
         # the field" from "another thread/process wrote a newer value".

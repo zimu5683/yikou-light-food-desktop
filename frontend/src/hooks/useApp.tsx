@@ -125,10 +125,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         case 'task:error':
           toast.error(event.payload.message, { duration: 8000 })
           break
-        case 'task:browser_missing':
-          toast.error('未检测到可用浏览器', { duration: 8000 })
-          api().open_external('https://www.microsoft.com/edge/download').catch(() => {})
-          break
         case 'update:available':
           setAvailableState(event.payload)
           break

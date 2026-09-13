@@ -3,7 +3,6 @@
  * - 决策弹窗（decision 事件）：订单定位失败/下单失败 retry-skip-stop、
  *   Excel 占用 retry-cancel、关闭保护 stop_and_close-keep-cancel
  * - 更新流程：发现新版本（确认安装/打开 Release）、下载进度（不可关闭）
- * - 浏览器缺失：引导打开 Edge/Chrome 下载页
  */
 import { useState } from 'react'
 import {

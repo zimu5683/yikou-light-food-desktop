@@ -55,18 +55,29 @@ def get_address_base_sheet_name(delivery_address: Any) -> Optional[str]:
     return None
 
 
+def _canonical_donghu_address_segment(segment: Any) -> str:
+    """Apply the latest point naming: 小西→小, B*→b*. legacy compat."""
+    text = str(segment or "")
+    if text == "小西":
+        return "小"
+    match = re.fullmatch(r"B(\d+)", text, re.I)
+    if match:
+        return f"b{match.group(1)}"
+    return text
+
+
 def get_donghu_address_segment(delivery_address: Any) -> str:
     value = str(delivery_address or "")
     match = re.search(r"大西.*?([A-Za-z]+\d+|\d+[A-Za-z]+)", value, re.I)
     if match:
-        return match.group(1)
+        return _canonical_donghu_address_segment(match.group(1))
     match = re.search(r"小西.*?([A-Za-z]+\d+|\d+[A-Za-z]+)", value, re.I)
     if match:
-        return match.group(1)
+        return _canonical_donghu_address_segment(match.group(1))
     if "大西" in value:
         return "大西"
     if "小西" in value:
-        return "小西"
+        return "小"
     return value
 
 
@@ -189,7 +200,7 @@ _ADDRESS_HEADER_ROWS = 2  # 第 1 行标题、第 2 行表头，数据自第 3 �
 def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
     """Return a comparable key for one address cell value.
 
-    东湖：大西 → 小西 → A/B/C/D（按数字升序）→ 其他；
+    东湖：大西 → 小/小西 → A/B/C/D（按数字升序）→ 其他；
     衣锦：校门口 → 外卖柜 → 其他；
     医学院：医N号（按数字升序）→ 其他。
     """
@@ -199,7 +210,7 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
     if campus == "东湖":
         if value == "大西":
             return (0, 0, 0)
-        if value == "小西":
+        if value in {"小", "小西"}:
             return (1, 0, 0)
         match = re.fullmatch(r"([A-Da-d])\s*(\d{1,3})", value)
         if match:

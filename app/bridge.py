@@ -13,7 +13,6 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - status             {state}                   ready/running/stopping/success/partial/stopped/error/updating
 - task:done          {message, stopped, partial}
 - task:error         {message}
-- task:browser_missing {message}
 - update:available   {tag, current, body, can_auto_install}
 - update:latest      {manual}
 - update:error       {message}
@@ -28,6 +27,7 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 from __future__ import annotations
 
 import copy
+import datetime as _dt
 import os
 import secrets
 import sys
@@ -41,13 +41,23 @@ from pathlib import Path as _Path
 from typing import Any
 
 from . import __version__
-from .automation import BrowserNotFoundError, ensure_browser, parse_target_date, run_job
+from .automation import (
+    BrowserNotFoundError,
+    browser_description,
+    browser_version_warning,
+    ensure_browser,
+    parse_target_date,
+    run_job,
+)
 from .config import AppConfig, clamp_split_ratio
 from .credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
 from .excel_templates import write_order_template, write_sss_template
 from .sss import run_sss_job
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
+from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
+                        build_plan, format_plan, read_local_orders,
+                        summarize_plan, target_date_for)
 
 logger = logging.getLogger(__name__)
 
@@ -323,8 +333,20 @@ class Bridge:
                 "sss_fixed_area_code": config.sss_fixed_area_code,
                 "sss_fixed_address_detail": config.sss_fixed_address_detail,
                 "sss_dry_run": config.sss_dry_run,
+                "sss_preflight": config.sss_preflight,
                 "sss_idempotency_field": config.sss_idempotency_field,
                 "api_mode": config.api_mode,
+                "wps_enabled": config.wps_enabled,
+                "wps_test_mode": config.wps_test_mode,
+                "wps_test_file_id": config.wps_test_file_id,
+                "wps_test_drive_id": config.wps_test_drive_id,
+                "wps_test_tables": dict(config.wps_test_tables),
+                "wps_drive_id": config.wps_drive_id,
+                "wps_cli_path": config.wps_cli_path,
+                "wps_tables": dict(config.wps_tables),
+                "wps_target_hour_start": config.wps_target_hour_start,
+                "wps_target_hour_end": config.wps_target_hour_end,
+                "wps_marker_enabled": config.wps_marker_enabled,
             },
             # 与旧 GUI 启动行为一致：按账号从系统凭据管理器读回密码。
             "passwords": {
@@ -436,6 +458,7 @@ class Bridge:
             "fixed_address_detail": fixed_address_detail,
             # dry_run：只组装并打印下单报文，不真实提交（联调/验收用）。
             "dry_run": bool(payload.get("dry_run", self._config.sss_dry_run)),
+            "preflight": bool(payload.get("preflight", self._config.sss_preflight)),
             "api_mode": bool(payload.get("api_mode", True)),
         })
         self._merge_sss_store_cache_from_disk()
@@ -489,7 +512,7 @@ class Bridge:
             self._finish_task(f"处理完成：已处理 {result.get('processed', '?')} 项，"
                               f"找到 {result.get('found', '?')} 项", result)
         except BrowserNotFoundError as exc:
-            self._task_browser_missing(str(exc))
+            self._task_error(str(exc))
         except Exception as exc:
             self._task_error(str(exc))
 
@@ -499,7 +522,21 @@ class Bridge:
                                  password=password, decision_callback=self._sss_decision,
                                  captcha_callback=self._sss_captcha,
                                  store_cache_callback=self._remember_sss_store_cache)
-            if result.get("stopped"):
+            status = result.get("status")
+            if status == "dry_run":
+                message = (f"闪时送干跑完成：已组装 {result.get('previewed', 0)} 单，"
+                           "未创建真实订单")
+            elif status == "insufficient_balance":
+                message = (f"闪时送已安全停止：余额不足，本批未提交，"
+                           f"预计 {result.get('estimate', '?')} 元")
+            elif status == "balance_unknown":
+                message = "闪时送已安全停止：余额未知，本批未提交"
+            elif status == "preflight_ok":
+                message = (f"闪时送预检完成：已有站内匹配 {result.get('created', 0)} 单，"
+                           "未提交新订单")
+            elif status in {"preflight_uncertain", "duplicate_detected"}:
+                message = "闪时送预检停止：未提交新订单，请先处理日志中的风险"
+            elif result.get("stopped"):
                 reconciliation = "已完成站内对账" if result.get("reconciled") else "站内对账失败"
                 message = (f"闪时送任务已停止：{reconciliation}，"
                            f"已确认 {result.get('created', '?')}/{result.get('processed', '?')} 单"
@@ -519,7 +556,7 @@ class Bridge:
                            f"处理 {result.get('processed', '?')} 项")
             self._finish_task(message, result)
         except BrowserNotFoundError as exc:
-            self._task_browser_missing(str(exc))
+            self._task_error(str(exc))
         except Exception as exc:
             self._task_error(str(exc))
 
@@ -562,13 +599,6 @@ class Bridge:
         self._worker = None
         self._set_status("error")
         self._emit_event("task:error", {"message": message})
-
-    def _task_browser_missing(self, message: str) -> None:
-        self._cancel_pending_interactions("浏览器缺失")
-        self.log(message, "ERROR")
-        self._worker = None
-        self._set_status("error")
-        self._emit_event("task:browser_missing", {"message": message})
 
     def stop_task(self) -> dict[str, Any]:
         if not self._worker or not self._worker.is_alive():
@@ -734,13 +764,384 @@ class Bridge:
 
     def _check_browser_worker(self) -> None:
         try:
-            path = ensure_browser("auto")
-            self.log(f"浏览器可用：{path}", "OK")
+            path = ensure_browser()
+            self.log(f"内置浏览器可用：{browser_description()}（{path}）", "OK")
+            if warning := browser_version_warning():
+                self.log(warning, "WARN")
             self._set_status("ready")
         except Exception as exc:
             self._worker = None
             self._set_status("error")
             self._emit_event("task:error", {"message": str(exc)})
+
+    # ------------------------------------------------------------------
+    # WPS 云文档同步
+    # ------------------------------------------------------------------
+
+    def _wps_cli(self) -> KdocsCli:
+        return KdocsCli(self._config.wps_cli_path or None)
+
+    def _wps_effective_tables(self) -> dict[str, dict[str, str]]:
+        """返回实际写入目标，并拒绝过期或越权目标。"""
+        production = {s: c.get("file_id", "") for s, c in
+                      self._config.wps_production_tables.items()}
+        legacy_test_ids = {
+            "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG",
+            "qFBgqf13GxM7vPUbTSJmxxsrgopD4DnpA",
+            "p9P2p2NFfxMZjLXGZ1fyxxrFTBf9s81Kn",
+            "RBLtXB8x3rMcQhCp6zp11xGBN7Wey2xCD",
+            "afnJ5h5Di1M3U9VwX3rvxx9jpTn8EUw9o",
+            "rxYTF8Juk9MBbhkbfjE9Bx1dQ3vGeZ3zr",
+        }
+        if self._config.wps_test_mode:
+            test = {s: str(fid).strip() for s, fid in
+                    self._config.wps_test_tables.items() if str(fid).strip()}
+            if not test:
+                raise WpsCloudError("测试模式未配置新的测试副本，拒绝写入；请先从正式表创建副本")
+            stale = {fid for fid in test.values() if fid in production}
+            if stale:
+                raise WpsCloudError("测试副本配置包含正式表 ID，拒绝写入")
+            if set(test.values()) & legacy_test_ids:
+                raise WpsCloudError("测试副本配置包含已过期试验田 ID，拒绝写入")
+            return {s: {"file_id": fid} for s, fid in test.items()}
+        active = {s: dict(c) for s, c in self._config.wps_tables.items()}
+        active_ids = {c.get("file_id", "") for c in active.values()}
+        if active_ids - set(production.values()):
+            raise WpsCloudError("正式模式目标包含非正式表 ID，拒绝写入")
+        return active
+
+    def save_wps_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """保存云文档同步的配置（沿用 AppConfig 的原子保存）。"""
+        cfg = self._config
+        if "enabled" in payload:
+            cfg.wps_enabled = bool(payload.get("enabled"))
+        if "test_mode" in payload:
+            cfg.wps_test_mode = bool(payload.get("test_mode"))
+        if "cli_path" in payload:
+            cfg.wps_cli_path = str(payload.get("cli_path") or "").strip()
+        if "drive_id" in payload:
+            cfg.wps_drive_id = str(payload.get("drive_id") or "").strip()
+        if "test_file_id" in payload:
+            cfg.wps_test_file_id = str(payload.get("test_file_id") or "").strip()
+        if "test_drive_id" in payload:
+            cfg.wps_test_drive_id = str(payload.get("test_drive_id") or "").strip()
+        if "test_tables" in payload:
+            from .config import normalize_wps_test_tables
+            cfg.wps_test_tables = normalize_wps_test_tables(payload.get("test_tables"))
+        if "marker_enabled" in payload:
+            cfg.wps_marker_enabled = bool(payload.get("marker_enabled"))
+        if "tables" in payload:
+            from .config import normalize_wps_tables
+            cfg.wps_tables = normalize_wps_tables(payload.get("tables"))
+        try:
+            cfg.save()
+        except OSError:
+            return {"ok": False, "reason": "write_failed"}
+        return {"ok": True}
+
+    def restore_wps_production_tables(self) -> dict[str, Any]:
+        """把写入目标切回正式排单表（配置里的备份 ID）。"""
+        backup = self._config.wps_production_tables or {}
+        if not backup:
+            return {"ok": False, "reason": "没有保存正式表备份"}
+        from .config import normalize_wps_tables
+        self._config.wps_tables = normalize_wps_tables(backup, base=backup)
+        try:
+            self._config.save()
+        except OSError:
+            return {"ok": False, "reason": "写入配置失败"}
+        self.log("[云同步] 写入目标已切回正式排单表", "WARN")
+        return {"ok": True, "tables": {k: v.get("file_id", "")
+                                       for k, v in self._config.wps_tables.items()}}
+
+    def wps_status(self) -> dict[str, Any]:
+        """返回云同步的当前状态（不联网、不写任何东西）。"""
+        cfg = self._config
+        status: dict[str, Any] = {
+            "ok": True,
+            "enabled": bool(cfg.wps_enabled),
+            "test_mode": bool(cfg.wps_test_mode),
+            "cli_path": "",
+            "cli_found": False,
+            "authenticated": False,
+            "target_date": "",
+            "weekday_number": 0,
+            "excel_path": str(cfg.excel_path) if cfg.excel_path else "",
+            "tables": [],
+            "marker_enabled": bool(cfg.wps_marker_enabled),
+        }
+        try:
+            cli = self._wps_cli()
+            status["cli_path"] = cli.path
+            status["cli_found"] = True
+            status["authenticated"] = cli.authenticated()
+        except WpsCloudError as exc:
+            status["reason"] = str(exc)
+
+        target = target_date_for(start_hour=cfg.wps_target_hour_start,
+                                 end_hour=cfg.wps_target_hour_end)
+        from .wps_cloud import weekday_number
+        status["target_date"] = target.isoformat()
+        # 通讯记号写的是**运行日**的周几（实测目标表：周四晚跑记 5、周五晚跑记 6）
+        status["weekday_number"] = weekday_number(_dt.date.today())
+
+        ledger = SyncLedger()
+        try:
+            effective = self._wps_effective_tables()
+        except WpsCloudError as exc:
+            status["reason"] = str(exc)
+            effective = {}
+        for sheet, conf in cfg.wps_tables.items():
+            file_id = effective.get(sheet, {}).get("file_id", "")
+            entry = {
+                "sheet": sheet,
+                "file_id": conf.get("file_id", ""),
+                "effective_file_id": file_id,
+                "last_sync": "",
+                "last_people": 0,
+            }
+            summary = ledger.batch_summary(target.isoformat(), file_id)
+            if summary:
+                entry["last_sync"] = summary["synced_at"]
+                entry["last_people"] = summary["people"]
+            status["tables"].append(entry)
+        for entry, conf in zip(status["tables"], cfg.wps_tables.values()):
+            entry["file_id"] = conf.get("file_id", "")
+        status["test_file_id"] = cfg.wps_test_file_id
+        status["test_tables"] = dict(cfg.wps_test_tables)
+        production_ids = {v.get("file_id", "") for v in (cfg.wps_production_tables or {}).values()}
+        # 用**实际生效**的目标判断，而不是 cfg.wps_tables ——
+        # 测试模式下生效目标是 cfg.wps_test_tables（副本）；拿 wps_tables
+        # （可能是正式表 ID）去比，会把"正在写副本"误报成"正在写正式表"。
+        try:
+            effective_ids = {c.get("file_id", "")
+                             for c in self._wps_effective_tables().values()}
+        except WpsCloudError:
+            effective_ids = {c.get("file_id", "") for c in cfg.wps_tables.values()}
+        status["writing_test_copies"] = bool(effective_ids) and not (effective_ids & production_ids)
+        status["effective_targets"] = sorted(fid for fid in effective_ids if fid)
+        status["production_tables"] = {k: v.get("file_id", "")
+                                       for k, v in (cfg.wps_production_tables or {}).items()}
+        status["state_path"] = str(ledger.path)
+        return status
+
+    def wps_preview(self) -> dict[str, Any]:
+        """只读云端，生成"会改谁、加几餐"的预览（不写云端、不动账本）。"""
+        cfg = self._config
+        if not cfg.excel_path:
+            return {"ok": False, "reason": "请先在「订单处理」里选择排单表"}
+        try:
+            tables = self._wps_effective_tables()
+        except WpsCloudError as exc:
+            return {"ok": False, "reason": str(exc)}
+        if not tables:
+            return {"ok": False, "reason": "测试模式未配置测试文件 id"}
+        target = target_date_for(start_hour=cfg.wps_target_hour_start,
+                                 end_hour=cfg.wps_target_hour_end)
+        try:
+            cli = self._wps_cli()
+            if not cli.authenticated():
+                return {"ok": False, "reason": "尚未授权云文档，请先点击「去授权」"}
+            local = read_local_orders(cfg.excel_path, log=self.log)
+            plans = build_plan(cli, local_orders=local, tables=tables, target=target,
+                               ledger=SyncLedger(),
+                               marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
+                               run_date=_dt.date.today(),
+                               log=self.log)
+        except WpsCloudError as exc:
+            return {"ok": False, "reason": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+        text = format_plan(plans)
+        for plan in plans:
+            for warning in plan.warnings:
+                self.log(f"[云同步预览] {plan.sheet}：{warning}", "WARN")
+        return {"ok": True, "target_date": target.isoformat(), "text": text,
+                "summary": summarize_plan(plans),
+                "test_mode": bool(cfg.wps_test_mode)}
+
+    def wps_upload(self) -> dict[str, Any]:
+        """真正写云端。同步执行（写入量很小），完成后返回结果。"""
+        cfg = self._config
+        if not cfg.excel_path:
+            return {"ok": False, "reason": "请先在「订单处理」里选择排单表"}
+        try:
+            tables = self._wps_effective_tables()
+        except WpsCloudError as exc:
+            return {"ok": False, "reason": str(exc)}
+        if not tables:
+            return {"ok": False, "reason": "测试模式未配置测试文件 id"}
+        target = target_date_for(start_hour=cfg.wps_target_hour_start,
+                                 end_hour=cfg.wps_target_hour_end)
+        self._set_status("updating")
+        try:
+            cli = self._wps_cli()
+            if not cli.authenticated():
+                self._set_status("ready")
+                return {"ok": False, "reason": "尚未授权云文档，请先点击「去授权」"}
+            local = read_local_orders(cfg.excel_path, log=self.log)
+            if not any(local.values()):
+                self._set_status("ready")
+                return {"ok": False, "reason": "本地排单表里没有可同步的订单"}
+            ledger = SyncLedger()
+            plans = build_plan(cli, local_orders=local, tables=tables, target=target,
+                               ledger=ledger,
+                               marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
+                               run_date=_dt.date.today(),
+                               log=self.log)
+            self.log(f"[云同步] 目标日期 {target.isoformat()}，"
+                     f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}")
+            if not any(p.target_col for p in plans):
+                self.log("[云同步] 所有表都没有找到目标日期列，未写入任何内容", "WARN")
+            result = apply_plan(cli, plans, ledger=ledger,
+                                marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
+                                log=self.log)
+            summary = summarize_plan(plans)
+            for plan in plans:
+                for warning in plan.warnings:
+                    self.log(f"[云同步] {plan.sheet}：{warning}", "WARN")
+            # 逐表列出成功/失败，避免"完成 N 人"掩盖部分失败。
+            for item in result["sheets"]:
+                status = item.get("status")
+                if status == "ok":
+                    detail = item.get("reason") or f"{item.get('people', 0)} 人"
+                    self.log(f"[云同步] ✔ {item['sheet']}：{detail}", "OK")
+                elif status == "verify_failed":
+                    self.log(f"[云同步] ✘ {item['sheet']}：写入后回读校验未通过"
+                             f"（{'; '.join(item.get('problems', [])[:3])}）", "ERROR")
+                elif status == "failed":
+                    self.log(f"[云同步] ✘ {item['sheet']}：{item.get('reason', '写入失败')}", "ERROR")
+                elif status == "skipped":
+                    # 协作者还没加当天的列属于正常状态，用 INFO 而非 WARN。
+                    self.log(f"[云同步] — {item['sheet']}：{item.get('reason', '跳过')}")
+            level = "OK" if result["failed"] == 0 else "ERROR"
+            self.log(f"[云同步] 完成：更新 {summary['to_update']} 人、新增 {summary['to_append']} 人、"
+                     f"已完成 {summary['unchanged']} 人"
+                     + (f"、注意 {summary['warned']} 项" if summary["warned"] else "")
+                     + f"；成功 {result['written']} 张表，失败 {result['failed']} 张", level)
+            self._set_status("ready")
+            failed = [item["sheet"] for item in result["sheets"]
+                      if item.get("status") in ("failed", "verify_failed")]
+            return {"ok": result["failed"] == 0, "target_date": target.isoformat(),
+                    "summary": summary, "result": result,
+                    "text": format_plan(plans),
+                    "failed_sheets": failed,
+                    "reason": (f"以下表写入失败：{'、'.join(failed)}，详见日志" if failed else None),
+                    "test_mode": bool(cfg.wps_test_mode)}
+        except WpsCloudError as exc:
+            self._set_status("ready")
+            self.log(f"[云同步] 失败：{exc}", "ERROR")
+            return {"ok": False, "reason": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            self._set_status("ready")
+            self.log(f"[云同步] 异常：{type(exc).__name__}: {exc}", "ERROR")
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+    def wps_check_copies(self) -> dict[str, Any]:
+        """核对"当前写入目标"与正式表是否结构一致（只读）。
+
+        测试副本是**静态快照**：只要协作者/用户在 WPS 里改了正式表，
+        副本就会过时，测试结果就不能代表线上真实情况。这个检查用来提前发现。
+        """
+        cfg = self._config
+        active = self._wps_effective_tables()
+        production = cfg.wps_production_tables or {}
+        results: list[dict[str, Any]] = []
+        try:
+            cli = self._wps_cli()
+
+            def people(file_id: str) -> dict[tuple[str, str], int]:
+                """{（姓名, 电话）: 行号} —— 按人比对，而不是按行序。
+
+                行序会因删行/重排变化，但"谁在里面"才是重点，因此用姓名+电话做键；
+                顺序差异不算问题。
+                """
+                grid = cli.read_grid(file_id, 1, 2, 300, 0, 2)
+                rows: dict[int, dict[int, str]] = {}
+                for (r, c), v in grid.items():
+                    rows.setdefault(r, {})[c] = str(v).strip()
+                return {(row.get(0, ""), row.get(2, "")): r + 1
+                        for r, row in rows.items() if r >= 2 and row.get(0)}
+
+            for sheet, conf in active.items():
+                file_id = conf.get("file_id", "")
+                prod_id = (production.get(sheet) or {}).get("file_id", "")
+                item: dict[str, Any] = {"sheet": sheet, "file_id": file_id,
+                                        "production_id": prod_id}
+                try:
+                    active_people = people(file_id)
+                except WpsCloudError as exc:
+                    item.update(status="unreadable", reason=str(exc)[:120])
+                    results.append(item)
+                    continue
+                item["rows"] = len(active_people)
+                if not prod_id or prod_id == file_id:
+                    # 写入目标就是正式表本身（未使用副本），无需比对。
+                    item.update(status="same_as_production")
+                    results.append(item)
+                    continue
+                try:
+                    prod_people = people(prod_id)
+                except WpsCloudError as exc:
+                    item.update(status="production_unreadable", reason=str(exc)[:120])
+                    results.append(item)
+                    continue
+                item["production_rows"] = len(prod_people)
+                if set(active_people) == set(prod_people):
+                    item.update(status="aligned")
+                else:
+                    prod_names = {k[0] for k in prod_people}
+                    active_names = {k[0] for k in active_people}
+                    missing = sorted(prod_names - active_names)
+                    extra = sorted(active_names - prod_names)
+                    if not missing and not extra:
+                        # 姓名一致、只是电话不同
+                        item.update(status="drifted", phone_mismatch=True)
+                    else:
+                        item.update(status="drifted", missing=missing[:10],
+                                    extra=extra[:10])
+                results.append(item)
+        except WpsCloudError as exc:
+            return {"ok": False, "reason": str(exc)}
+
+        drifted = [r["sheet"] for r in results if r["status"] == "drifted"]
+        for item in results:
+            if item["status"] == "drifted":
+                self.log(f"[云同步] 副本已过时：{item['sheet']}"
+                         f"（正式 {item.get('production_rows')} 人 / 副本 {item.get('rows')} 人）",
+                         "WARN")
+        if drifted:
+            self.log(f"[云同步] 建议重新同步副本：{'、'.join(drifted)}", "WARN")
+        return {"ok": True, "drifted": drifted, "tables": results,
+                "all_aligned": not drifted}
+
+    def wps_authorize(self) -> dict[str, Any]:
+        """启动 kdocs-cli 授权流程（在后台等用户在浏览器里确认）。"""
+        try:
+            cli = self._wps_cli()
+        except WpsCloudError as exc:
+            return {"ok": False, "reason": str(exc)}
+        threading.Thread(target=self._wps_authorize_worker, args=(cli,), daemon=True).start()
+        return {"ok": True, "hint": "已启动授权，请按日志里的提示在浏览器中确认"}
+
+    def _wps_authorize_worker(self, cli: KdocsCli) -> None:
+        import subprocess
+        try:
+            proc = subprocess.run(cli.login_argv(), capture_output=True, text=True,
+                                  timeout=330)
+            out = (proc.stdout or "") + (proc.stderr or "")
+            for line in out.splitlines():
+                if line.strip():
+                    self.log(f"[云文档授权] {line.strip()}")
+            if cli.authenticated():
+                self.log("[云文档授权] 授权成功", "OK")
+            else:
+                self.log("[云文档授权] 未检测到有效授权，请重试", "WARN")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[云文档授权] 失败：{type(exc).__name__}: {exc}", "ERROR")
+        finally:
+            self._emit_event("wps:status", self.wps_status())
 
     def clear_password(self, mode: str = "order") -> dict[str, Any]:
         if mode == "sss":
@@ -1020,4 +1421,5 @@ def _apply_sss_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
         cfg.sss_fixed_area_code = str(p.get("fixed_area_code", cfg.sss_fixed_area_code) or "").strip()
         cfg.sss_fixed_address_detail = str(p.get("fixed_address_detail", cfg.sss_fixed_address_detail) or "").strip()
     cfg.sss_dry_run = bool(p.get("dry_run", cfg.sss_dry_run))
+    cfg.sss_preflight = bool(p.get("preflight", cfg.sss_preflight))
     cfg.api_mode = bool(p.get("api_mode", cfg.api_mode))

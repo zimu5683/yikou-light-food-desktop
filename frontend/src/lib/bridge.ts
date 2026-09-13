@@ -43,9 +43,91 @@ export interface AppConfigState {
   sss_fixed_area_code: string
   sss_fixed_address_detail: string
   sss_dry_run: boolean
+  sss_preflight: boolean
   /** 平台支持客户端幂等字段时由配置指定，默认空 = 至少一次提交+对账确认。 */
   sss_idempotency_field?: string
   api_mode: boolean
+  /** WPS 云文档同步：把本地排单表增量写入云端排单表。 */
+  wps_enabled: boolean
+  wps_test_mode: boolean
+  wps_test_file_id: string
+  wps_test_drive_id: string
+  wps_drive_id: string
+  wps_cli_path: string
+  wps_tables: Record<string, { file_id: string; drive_id?: string }>
+  wps_test_tables: Record<string, string>
+  wps_target_hour_start: number
+  wps_target_hour_end: number
+  wps_marker_enabled: boolean
+}
+
+/** 云文档同步状态（bridge.wps_status 返回）。 */
+export interface WpsTableState {
+  sheet: string
+  file_id: string
+  effective_file_id: string
+  last_sync: string
+  last_people: number
+}
+
+export interface WpsStatus {
+  ok: boolean
+  reason?: string
+  enabled: boolean
+  test_mode: boolean
+  cli_path: string
+  cli_found: boolean
+  authenticated: boolean
+  target_date: string
+  weekday_number: number
+  excel_path: string
+  marker_enabled: boolean
+  test_file_id?: string
+  /** 测试模式下每张正式表对应的测试副本。 */
+  test_tables?: Record<string, string>
+  /** 当前写入目标是否全部是测试副本（不与正式表重合）。 */
+  writing_test_copies?: boolean
+  /** 正式排单表 ID 备份（暂停使用，可用于切回）。 */
+  production_tables?: Record<string, string>
+  state_path?: string
+  tables: WpsTableState[]
+}
+
+export interface WpsPlanSummary {
+  to_update: number
+  to_append: number
+  unchanged: number
+  warned: number
+}
+
+export interface WpsCopyCheckItem {
+  sheet: string
+  file_id: string
+  production_id: string
+  status: 'aligned' | 'drifted' | 'same_as_production' | 'unreadable' | 'production_unreadable'
+  rows?: number
+  production_rows?: number
+  missing?: string[]
+  extra?: string[]
+  reason?: string
+}
+
+export interface WpsCopyCheck {
+  ok: boolean
+  reason?: string
+  drifted?: string[]
+  all_aligned?: boolean
+  tables?: WpsCopyCheckItem[]
+}
+
+export interface WpsResult {
+  ok: boolean
+  reason?: string
+  target_date?: string
+  text?: string
+  summary?: WpsPlanSummary
+  test_mode?: boolean
+  result?: { written: number; failed: number; sheets: Array<{ sheet: string; status: string; reason?: string }> }
 }
 
 export interface AppState {
@@ -99,7 +181,6 @@ type BridgeEventBase =
       }
     }
   | { event: 'task:error'; payload: { message: string } }
-  | { event: 'task:browser_missing'; payload: { message: string } }
   | { event: 'update:available'; payload: UpdateAvailable }
   | { event: 'update:latest'; payload: { manual: boolean; current: string } }
   | { event: 'update:error'; payload: { message: string } }
@@ -179,6 +260,7 @@ export interface SssConfigPayload {
   fixed_area_code?: string
   fixed_address_detail?: string
   dry_run?: boolean
+  preflight?: boolean
   api_mode?: boolean
 }
 
@@ -196,6 +278,7 @@ export interface SssFormPayload {
   fixed_address_detail: string
   remember: boolean
   dry_run: boolean
+  preflight: boolean
   api_mode: boolean
 }
 
@@ -204,6 +287,19 @@ export interface FieldErrors {
   reason?: string
   message?: string
   fields?: Record<string, { message: string }>
+}
+
+/** 云文档同步配置（只包含这个页签会改的字段）。 */
+export interface WpsConfigPayload {
+  enabled: boolean
+  test_mode: boolean
+  cli_path: string
+  drive_id: string
+  test_file_id: string
+  test_drive_id: string
+  marker_enabled: boolean
+  tables: Record<string, { file_id: string; drive_id?: string }>
+  test_tables: Record<string, string>
 }
 
 // ---------- window 声明 ----------
@@ -219,6 +315,12 @@ interface PywebviewApi {
   choose_excel(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   new_template(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   check_browser(): Promise<{ ok: boolean }>
+  wps_status(): Promise<WpsStatus>
+  wps_preview(): Promise<WpsResult>
+  wps_upload(): Promise<WpsResult>
+  wps_authorize(): Promise<{ ok: boolean; reason?: string; hint?: string }>
+  wps_check_copies(): Promise<WpsCopyCheck>
+  save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
   clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>
   check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string }>
   install_update(): Promise<{ ok: boolean; reason?: string }>
@@ -466,8 +568,20 @@ function mockState(): AppState {
       sss_fixed_area_code: '330110',
       sss_fixed_address_detail: '浙江农林大学东湖校区',
       sss_dry_run: true,
+      sss_preflight: false,
       sss_idempotency_field: '',
       api_mode: true,
+      wps_enabled: false,
+      wps_test_mode: true,
+      wps_test_file_id: '',
+      wps_test_drive_id: '',
+      wps_drive_id: '',
+      wps_cli_path: '',
+      wps_tables: {},
+      wps_test_tables: {},
+      wps_target_hour_start: 20,
+      wps_target_hour_end: 10,
+      wps_marker_enabled: true,
     },
     passwords: { order: '', sss: '' },
   }

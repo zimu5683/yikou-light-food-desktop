@@ -16,7 +16,7 @@ import {
   type UpdateAvailable,
 } from '@/lib/bridge'
 
-export type TaskMode = 'order' | 'sss'
+export type TaskMode = 'order' | 'cloud' | 'sss'
 
 export interface LogRow extends LogEntry {
   id: number

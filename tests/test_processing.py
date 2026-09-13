@@ -42,9 +42,10 @@ def test_address_base_sheet_maps_keywords_and_nonglin_road():
 
 def test_donghu_segment_extracts_room_from_landmarks():
     assert get_donghu_address_segment("东湖大西12栋A101") == "A101"
-    assert get_donghu_address_segment("小西3幢B202") == "B202"
+    assert get_donghu_address_segment("小西3幢B202") == "b202"
     assert get_donghu_address_segment("东湖大西活动室") == "大西"
-    assert get_donghu_address_segment("东湖小西") == "小西"
+    assert get_donghu_address_segment("东湖小西") == "小"
+    assert get_donghu_address_segment("小西门") == "小"
     assert get_donghu_address_segment("其他地址") == "其他地址"
 
 
@@ -576,9 +577,9 @@ def test_sort_donghu_sub_sheet_order():
 
     wb = Workbook()
     ws = wb.active
-    _build_sheet(ws, ["D2", "B5", "大西", "小西", "A1", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他", "C9"], "东湖中餐")
+    _build_sheet(ws, ["D2", "b6", "大西", "小", "小西", "A1", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他", "C9"], "东湖中餐")
     sort_campus_sub_sheets(wb)
-    assert _col_c(ws) == ["大西", "小西", "A1", "B5", "C9", "D2", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他"]
+    assert _col_c(ws) == ["大西", "小", "小西", "A1", "b6", "C9", "D2", "浙江省杭州市临安区浙江农林大学(东湖校区) 其他"]
 
 
 def test_sort_yijin_sub_sheet_order():

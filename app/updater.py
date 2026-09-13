@@ -113,6 +113,9 @@ TRUSTED_DOWNLOAD_HOSTS = {
     "release-assets.githubusercontent.com",
 }
 MAX_UPDATE_SIZE = 512 * 1024 * 1024
+# Linux 发布包（tar.gz）只允许这两类内容：应用二进制与内置浏览器目录。
+_LINUX_APP_BINARY_NAME = "yikou-light-food"
+_LINUX_BROWSER_PREFIX = "browser/"
 
 
 class UpdateError(RuntimeError):
@@ -1380,6 +1383,12 @@ def _download_and_install_linux(
         if stage_callback:
             stage_callback("解压更新")
         staged_binary = _extract_linux_binary(archive, staging)
+        # 老安装缺内置浏览器时随本次更新补齐；已有目录一律保留（当前进程
+        # 可能正在使用它，且浏览器载荷只在 Playwright 升级时才变化）。
+        staged_browser = staging / "browser"
+        if staged_browser.is_dir() and _install_linux_browser(staged_browser, install_dir):
+            if stage_callback:
+                stage_callback("安装内置浏览器")
 
         return _schedule_linux_replacement(staged_binary, target, workdir, staging, stage_callback)
     except BaseException:
@@ -1391,9 +1400,11 @@ def _download_and_install_linux(
 def _extract_linux_binary(archive: Path, destination: Path) -> Path:
     """解压 release tar.gz 到 destination，返回包内的应用可执行文件。
 
-    解压前逐个校验成员：拒绝绝对路径、``..`` 上跳与链接/设备等特殊条目；
-    再交给 ``tarfile`` 的 ``data`` 过滤器兜底（Python 3.10.12+/3.12+ 可用，
-    更旧的解释器上成员已校验过，直接解压也是安全的）。
+    发布包只允许两类内容：应用二进制 ``yikou-light-food``，以及内置浏览器
+    目录 ``browser/``。解压前逐个校验成员：拒绝绝对路径、``..`` 上跳与
+    链接/设备等特殊条目；再交给 ``tarfile`` 的 ``data`` 过滤器兜底
+    （Python 3.10.12+/3.12+ 可用，更旧的解释器上成员已校验过，直接解压
+    也是安全的）。
     """
     destination.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
@@ -1405,25 +1416,42 @@ def _extract_linux_binary(archive: Path, destination: Path) -> Path:
             if member.issym() or member.islnk() or not (member.isreg() or member.isdir()):
                 raise UpdateError("更新包含有意外条目类型")
             if member.isreg():
-                # 发布包只允许单个应用二进制；任何额外文件（尤其是可执行文件）
-                # 都可能是夹带物，直接拒绝而不是解压后再筛选。
-                if name != "yikou-light-food":
+                # 白名单之外的文件（尤其是可执行文件）都可能是夹带物，直接
+                # 拒绝而不是解压后再筛选。
+                if name != _LINUX_APP_BINARY_NAME and not name.startswith(_LINUX_BROWSER_PREFIX):
                     raise UpdateError(f"更新包包含预期外文件：{name}")
                 if member.mode & 0o7000:
-                    raise UpdateError("更新包中的应用文件带有 setuid/setgid 位")
+                    raise UpdateError("更新包中包含带 setuid/setgid 位的文件")
         try:
             tar.extractall(destination, members=members, filter="data")
         except TypeError:  # Python < 3.12 无过滤参数
             tar.extractall(destination, members=members)
-    binaries = [path for path in sorted(destination.rglob("yikou-light-food")) if path.is_file()]
-    if not binaries:
+    binary = destination / _LINUX_APP_BINARY_NAME
+    if not binary.is_file():
         raise UpdateError("更新包中未找到应用可执行文件")
-    if len(binaries) > 1:
-        raise UpdateError("更新包结构异常")
-    binary = binaries[0]
     # data 过滤器会保留执行位，但显式 chmod 不依赖过滤器行为。
     binary.chmod(0o755)
     return binary
+
+
+def _install_linux_browser(staged: Path, install_dir: Path) -> bool:
+    """把更新包里的 browser/ 安装到程序目录；已存在时原地保留。
+
+    浏览器载荷只在 Playwright 升级时才变化，而更新过程中当前进程可能正在
+    使用旧目录，因此这里只补装缺失的情况，不做覆盖替换。
+    """
+    target = install_dir / "browser"
+    if target.exists():
+        return False
+    scratch = install_dir / f".browser.new-{os.getpid()}"
+    shutil.rmtree(scratch, ignore_errors=True)
+    try:
+        shutil.copytree(staged, scratch, symlinks=True)
+        os.replace(scratch, target)
+    except OSError:
+        shutil.rmtree(scratch, ignore_errors=True)
+        return False
+    return True
 
 
 def _schedule_linux_replacement(

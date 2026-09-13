@@ -1,0 +1,25 @@
+# 闪时送只读耗时探针  2026-09-10 22:21:33
+url=https://sssplusnew.zhuopaikeji.com/takeout account=187****7837 read_timeout=20s page_size=100
+已从系统钥匙串读取闪时送密码
+验证码 GET 耗时 0.263s（6209 字节）
+登录 POST 耗时 0.229s
+余额接口 /consumer/account/get-login-user-account -> 0.085s http=200 bytes=128 reused=False
+
+## 订单列表分页计时（/consumer/order/one-touch-send/list）
+page 1: 2.387s http=200 bytes=172485 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 2: 1.937s http=200 bytes=202349 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 3: 2.009s http=200 bytes=202194 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 4: 2.352s http=200 bytes=200635 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 5: 1.983s http=200 bytes=202233 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 6: 1.977s http=200 bytes=202293 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 7: 2.31s http=200 bytes=200640 records=100 total=2222 reused_conn=False server=- enc=gzip
+page 8: 1.944s http=200 bytes=202238 records=100 total=2222 reused_conn=False server=- enc=gzip
+
+逐页耗时：min 1.937s / 中位 1.996s / max 2.387s / 合计 16.899s  (n=8)
+站内 total=2222 → 若每页 100 条，对账需要 23 页
+按实测中位每页耗时估算，单次对账的列表成本 ≈ 45.9s
+站内订单的预约送达日分布（前 10）：{'2026-06-23': 44, '2026-06-24': 58, '2026-06-25': 62, '2026-06-26': 49, '2026-06-27': 25, '2026-06-28': 29, '2026-06-29': 53, '2026-06-30': 47, '2026-07-01': 50, '2026-07-02': 45}
+列表记录字段结构：{"id": "int", "deliveryDemandPlatform": "int", "pickUpNumber": "str", "sssPickUpNumber": "str", "recipientAddress": "str", "recipientName": "str", "recipientPhone": "list[1]", "orderTime": "int", "sendTime": "int", "expectedDeliveryTime": "int", "status": "int", "outOrderNumber": "str", "image": "str", "izDelivery": "int", "sendAddressQuery": "{longitude,latitude,code}", "shippingAddressQuery": "{longitude,latitude,code}", "sendName": "str", "customerId": "int", "storeId": "int", "sendAddress": "str", "sendHouseNum": "str", "sendPhone": "str", "categoryId": "int", "categoryName": "str", "goodsWeight": "int", "expectedPickupTime": "int", "tipAmount": "int", "sendCityName": "str", "receiverCityName": "str", "storeName": "str", "originalPrice": "int", "totalPrice": "int", "goodsDetails": "list[1]", "quantity": "int", "customerOrderStatus": "int", "phoneAfterFour": "str", "customerOrderId": "int", "orderSource": "int", "extraBizInfo": "{showCustomerExpect}", "distance": "float", "showCustomerExpect": "bool", "customerOrderNo": "str", "phoneListCommand": "{receivePhone}", "izSendByCustomer": "int", "requestConsignee": "bool", "izNeglected": "bool", "appointmentTime": "int", "pickGoodsStatus": "int"}
+列表请求样例路径：/consumer/order/one-touch-send/list?pageNo=8&pageSize=100&sortType=1&sort=1
+
+本地任务组装：66/66 单，指纹计算 0.0 ms （纯 CPU，可忽略）

@@ -1,0 +1,183 @@
+{
+  "generated_at": "2026-09-11T21:48:03",
+  "semantics": {
+    "field": "试验田 = 程序写入目标（21:07 副本，今天干活之前的状态）",
+    "target": "验收标准 = 当前正式表（已含今天的工作成果）",
+    "rollback": "试验田达不到正式表预期时，回到 field 里的 file_id 重新开始",
+    "archive": "基线存档 = 基准-<子表名>.xlsx（只读，永不改动，重置时从这里复制）"
+  },
+  "field": {
+    "东湖中餐": {
+      "file_id": "Nv2JqWQh2xMqCUdZgQLL1xhGnc1gVbTpX",
+      "name": "测试-东湖中餐-0912-Nv2JqW.xlsx",
+      "version": 1,
+      "size": 31913,
+      "created": "2026-09-11T21:07:49",
+      "mtime": "2026-09-11T21:07:50",
+      "sha1": "fc2292ba17c370f6132250bd8dc986d2faf8e40b",
+      "people": 97
+    },
+    "衣锦中餐": {
+      "file_id": "8YsTveRZB1MRvxy7eGuB1xviHEV71KC4A",
+      "name": "测试-衣锦中餐-0912-8YsTve.xlsx",
+      "version": 1,
+      "size": 22650,
+      "created": "2026-09-11T21:07:51",
+      "mtime": "2026-09-11T21:07:52",
+      "sha1": "b42ed17c5e5340766c5643a18d4ee09f43efaa5d",
+      "people": 23
+    },
+    "医学院中餐": {
+      "file_id": "MefNMpqGRxMyhgo7xDimxxeSb4d5y4Vcg",
+      "name": "测试-医学院中餐-0912-MefNMp.xlsx",
+      "version": 1,
+      "size": 17772,
+      "created": "2026-09-11T21:07:54",
+      "mtime": "2026-09-11T21:07:54",
+      "sha1": "a46e444263bec9300ad5f18506e262e7711dd4cb",
+      "people": 13
+    },
+    "东湖晚餐": {
+      "file_id": "RBLtXB8x3rMcQhCp6zp11xGBN7Wey2xCD",
+      "name": "测试-东湖晚餐-0911b.xlsx",
+      "version": 1,
+      "size": 22726,
+      "created": "2026-09-11T20:58:45",
+      "mtime": "2026-09-11T20:58:45",
+      "sha1": "cc9d6e2575b425bc095e4e377414ce7db774487a",
+      "people": 30
+    },
+    "衣锦晚餐": {
+      "file_id": "afnJ5h5Di1M3U9VwX3rvxx9jpTn8EUw9o",
+      "name": "测试-衣锦晚餐-0911.xlsx",
+      "version": 1,
+      "size": 13985,
+      "created": "2026-09-11T10:58:35",
+      "mtime": "2026-09-11T10:58:36",
+      "sha1": "666046f98d936e9522f7c14d81f4271e986f4ad0",
+      "people": 7
+    },
+    "医学院晚餐": {
+      "file_id": "rxYTF8Juk9MBbhkbfjE9Bx1dQ3vGeZ3zr",
+      "name": "测试-医学院晚餐-0911.xlsx",
+      "version": 1,
+      "size": 12507,
+      "created": "2026-09-11T10:58:38",
+      "mtime": "2026-09-11T10:58:38",
+      "sha1": "33abc2eec0c57c22a8972a52dc8de9516749fa7d",
+      "people": 3
+    }
+  },
+  "target": {
+    "东湖中餐": {
+      "file_id": "fr2FrpFVMrM8poHaSHFK1xAsmSSBMspye",
+      "name": "东湖午餐9月.xlsx",
+      "version": 24,
+      "size": 34667,
+      "created": "2026-09-03T12:31:50",
+      "mtime": "2026-09-11T21:21:30",
+      "sha1": "bac60f324ea26ba589c0d29d9d4885664259b34f",
+      "people": 122
+    },
+    "衣锦中餐": {
+      "file_id": "amqzgcXVMrMWopCdyxkJrxnqzcQ8UbaJG",
+      "name": "校门口午餐9月.xlsx",
+      "version": 22,
+      "size": 23978,
+      "created": "2026-09-03T12:32:36",
+      "mtime": "2026-09-11T21:21:32",
+      "sha1": "2694e1cfa1e53a44517c2cad4447221b534cfbf6",
+      "people": 26
+    },
+    "医学院中餐": {
+      "file_id": "qvuPzdurK1MyKwL2weiZ1xF8RzdijFdaJ",
+      "name": "医学院午餐9月.xlsx",
+      "version": 19,
+      "size": 18245,
+      "created": "2026-09-03T12:32:52",
+      "mtime": "2026-09-11T21:21:33",
+      "sha1": "7fb7a1b069dc3b65bde882a9017ec44ebb82019f",
+      "people": 14
+    },
+    "东湖晚餐": {
+      "file_id": "noJa93Xq9xM62hfVqj6UrxEmgLjAHmqka",
+      "name": "东湖晚餐9月.xlsx",
+      "version": 22,
+      "size": 22726,
+      "created": "2026-09-03T12:30:59",
+      "mtime": "2026-09-11T19:15:00",
+      "sha1": "cc9d6e2575b425bc095e4e377414ce7db774487a",
+      "people": 30
+    },
+    "衣锦晚餐": {
+      "file_id": "mAc5hDw1q1MV33kW8JE7xxnnW1KEdYc1V",
+      "name": "校门口晚餐9月.xlsx",
+      "version": 15,
+      "size": 13985,
+      "created": "2026-09-03T12:34:41",
+      "mtime": "2026-09-10T21:40:03",
+      "sha1": "666046f98d936e9522f7c14d81f4271e986f4ad0",
+      "people": 7
+    },
+    "医学院晚餐": {
+      "file_id": "PpnGwh9ERxMRByaRp2EHrxUgCDjP4kZpA",
+      "name": "医学院晚餐9月.xlsx",
+      "version": 12,
+      "size": 12507,
+      "created": "2026-09-03T12:36:46",
+      "mtime": "2026-09-10T21:19:47",
+      "sha1": "33abc2eec0c57c22a8972a52dc8de9516749fa7d",
+      "people": 3
+    }
+  },
+  "archive": {
+    "东湖中餐": {
+      "file_id": "qnphBt172xM16W88YGo6rx4aRab434suF",
+      "name": "基准-东湖中餐.xlsx",
+      "version": 1,
+      "size": 31913,
+      "sha1": "fc2292ba17c370f6132250bd8dc986d2faf8e40b",
+      "matches_field": true
+    },
+    "衣锦中餐": {
+      "file_id": "egAHGwdRpxMhFcLtahdRxxHnaCdttYkgu",
+      "name": "基准-衣锦中餐.xlsx",
+      "version": 1,
+      "size": 22650,
+      "sha1": "b42ed17c5e5340766c5643a18d4ee09f43efaa5d",
+      "matches_field": true
+    },
+    "医学院中餐": {
+      "file_id": "nUzDSa972xMR6JWxuba11xME3NzETaUsv",
+      "name": "基准-医学院中餐.xlsx",
+      "version": 1,
+      "size": 17772,
+      "sha1": "a46e444263bec9300ad5f18506e262e7711dd4cb",
+      "matches_field": true
+    },
+    "东湖晚餐": {
+      "file_id": "sT4mJx4BY1MnWiJHGAmtxx8fcXCitKH4Z",
+      "name": "基准-东湖晚餐.xlsx",
+      "version": 1,
+      "size": 22726,
+      "sha1": "cc9d6e2575b425bc095e4e377414ce7db774487a",
+      "matches_field": true
+    },
+    "衣锦晚餐": {
+      "file_id": "FMtkrRxLgrMM3F9724Pmxx868641bUkz8",
+      "name": "基准-衣锦晚餐.xlsx",
+      "version": 1,
+      "size": 13985,
+      "sha1": "666046f98d936e9522f7c14d81f4271e986f4ad0",
+      "matches_field": true
+    },
+    "医学院晚餐": {
+      "file_id": "NA7fSSnnmxMcMLmEe3WL1xY4oiJFni6pf",
+      "name": "基准-医学院晚餐.xlsx",
+      "version": 1,
+      "size": 12507,
+      "sha1": "33abc2eec0c57c22a8972a52dc8de9516749fa7d",
+      "matches_field": true
+    }
+  }
+}

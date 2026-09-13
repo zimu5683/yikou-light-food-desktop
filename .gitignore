@@ -53,3 +53,15 @@ latest.json
 latest.json.sig
 workspace-before-audit.patch
 *.bak
+
+# 内置浏览器载荷（Chromium，约 320MB，不入库；
+# 构建脚本 scripts/fetch_browser.py 会自行抓取并精简）
+vendor/browser/
+browser/
+
+# WPS 云文档同步组件（金山官方二进制，体积大，不入库；
+# 校验和与获取方式见 vendor/kdocs-cli/README.md，构建脚本会自行下载）
+vendor/kdocs-cli/kdocs-cli
+vendor/kdocs-cli/kdocs-cli.exe
+vendor/kdocs-cli/*.tar.gz
+vendor/kdocs-cli/*.zip

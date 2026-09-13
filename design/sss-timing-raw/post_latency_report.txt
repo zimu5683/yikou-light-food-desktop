@@ -1,0 +1,19 @@
+# 真实报文形状 POST 耗时 + 过滤时区验证  2026-09-10 22:27:48
+探针报文：真实报文形状，storeId=999999999（不存在的门店，服务端必然校验失败，不会建单）
+真实报文示例字段：['expectedDeliveryTime', 'goodsDetail', 'orderType', 'receiveAddress', 'receiveName', 'receivePhone', 'storeId']
+
+登录成功
+
+## 0. startTime/endTime 窗口的时区语义（status=2）
+- 窗口 2026-09-10 00:00-23:59（CST+8）→ total=65 送达日分布={'2026-09-11': 65}  1.28s
+- 窗口 2026-09-11（CST+8）→ 结构异常：订单列表响应缺少 records/list（服务端可能不支持本次查询参数或结构已变化），为避免重复下单已停止
+- 窗口 2026-09-10 00:00-23:59（UTC）→ total=65 送达日分布={'2026-09-11': 65}  1.71s
+- 窗口 2026-09-11（UTC）→ 结构异常：订单列表响应缺少 records/list（服务端可能不支持本次查询参数或结构已变化），为避免重复下单已停止
+
+## 1. 真实报文形状 POST 耗时（storeId 不存在 → 必然校验失败）
+- 并发 1 路 × 1 次：单次 min 0.28s / 中位 0.28s / max 0.28s；总墙钟 0.28s → 吞吐 3.53 次/秒
+  服务端响应示例：{"success": false, "message": "操作失败，java.lang.NullPointerException", "code": 500, "timestamp": 1789050486855}
+- 并发 4 路 × 1 次：单次 min 0.27s / 中位 0.27s / max 0.27s；总墙钟 0.27s → 吞吐 3.75 次/秒
+  服务端响应示例：{"success": false, "message": "操作失败，java.lang.NullPointerException", "code": 500, "timestamp": 1789050487132}
+- 并发 8 路 × 1 次：单次 min 0.24s / 中位 0.24s / max 0.24s；总墙钟 0.24s → 吞吐 4.11 次/秒
+  服务端响应示例：{"success": false, "message": "操作失败，java.lang.NullPointerException", "code": 500, "timestamp": 1789050487379}

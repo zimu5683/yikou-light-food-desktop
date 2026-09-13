@@ -1,0 +1,42 @@
+# 预筛窗口漏单原因只读诊断  2026-09-13 22:59:23
+本机时区=CST+0800
+登录成功
+
+## 1. 最新 1 页订单的时间戳对照（按列表顺序，最新在前）
+- 列表 total=2395
+- id=201617375 status=2 orderTime=2026-09-13 22:57:39 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:48 name=卢灿灿
+- id=201617374 status=2 orderTime=2026-09-13 22:57:37 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:41 name=武龙湘
+- id=201617373 status=2 orderTime=2026-09-13 22:57:34 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:46 name=抓抓
+- id=201617372 status=2 orderTime=2026-09-13 22:57:31 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:43 name=初
+- id=201617371 status=2 orderTime=2026-09-13 22:57:29 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:39 name=王丽泞
+- id=201617370 status=2 orderTime=2026-09-13 22:57:27 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:36 name=董真妤
+- id=201617369 status=2 orderTime=2026-09-13 22:57:25 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:34 name=一箱子
+- id=201617367 status=2 orderTime=2026-09-13 22:57:23 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:29 name=河鲫鱼
+- id=201617366 status=2 orderTime=2026-09-13 22:57:21 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:31 name=种月亮
+- id=201617365 status=2 orderTime=2026-09-13 22:57:19 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:25 name=于涛
+- id=201617363 status=2 orderTime=2026-09-13 22:57:16 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:20 name=尚恩
+- id=201617361 status=2 orderTime=2026-09-13 22:57:14 expectedDeliveryTime=2026-09-14 17:00:00 appointmentTime=2026-09-14 16:00:00 sendTime=2026-09-13 22:57:27 name=叶展睿
+
+## 2. 本批目标日与生产预筛窗口
+- 本批 75 单，目标送达日=['2026-09-14']
+- 生产预筛：{'startTime': 1789228800000, 'endTime': 1789487999999}
+- 即 2026-09-13 00:00:00+08:00 ~ 2026-09-15 23:59:59.999000+08:00（CST）
+
+## 3. 候选时间窗实测（同一会话）
+- 生产预筛（目标日±1，CST）              2026-09-13 ~ 2026-09-15  1.91s total=116 首页=100
+    创建日分布={'2026-09-13': 100} 送达日分布={'2026-09-13': 25, '2026-09-14': 75}
+- 目标日±1，按 UTC 解释               2026-09-13 ~ 2026-09-15  1.64s total=75 首页=75
+    创建日分布={'2026-09-13': 75} 送达日分布={'2026-09-14': 75}
+- 仅目标日，CST                     2026-09-14 ~ 2026-09-14  0.41s ★订单列表响应缺少 records/list（服务端可能不支持本次查询参数或结构已
+    原始报文：{"success": true, "message": "操作成功！", "code": 200, "result": {"total": 0, "size": 10, "current": 1, "optimizeCountSql": true, "hitCount": false, "searchCount": true, "pages": 0}, "timestamp": 1789311785222}
+- 今天~目标日+1，CST                 2026-09-13 ~ 2026-09-15  1.94s total=116 首页=100
+    创建日分布={'2026-09-13': 100} 送达日分布={'2026-09-13': 25, '2026-09-14': 75}
+- 今天往前 3 天 ~ 今天+3 天，CST        2026-09-10 ~ 2026-09-16  2.05s total=308 首页=100
+    创建日分布={'2026-09-13': 100} 送达日分布={'2026-09-13': 25, '2026-09-14': 75}
+- 90 天宽窗，CST                   2026-06-15 ~ 2026-12-12  2.47s total=1206 首页=100
+    创建日分布={'2026-09-13': 100} 送达日分布={'2026-09-13': 25, '2026-09-14': 75}
+
+## 4. 判定
+- 最新一单：创建 2026-09-13 22:57:39，预约送达 2026-09-14 17:00:00
+- 生产预筛窗口：2026-09-13 00:00:00+08:00 ~ 2026-09-15 23:59:59.999000+08:00
+- 最新一单是否落在生产预筛窗口内（按 orderTime 判断）：True

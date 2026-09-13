@@ -3,68 +3,114 @@ from types import SimpleNamespace
 import datetime as dt
 
 
-def test_detect_browsers_finds_macos_app_paths(monkeypatch, tmp_path):
-    chrome = tmp_path / "Google Chrome.app/Contents/MacOS/Google Chrome"
-    edge = tmp_path / "Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
-    chrome.parent.mkdir(parents=True)
-    edge.parent.mkdir(parents=True)
-    chrome.touch()
-    edge.touch()
-    monkeypatch.setattr(automation.sys, "platform", "darwin")
-    monkeypatch.setattr(automation.os, "name", "posix")
-    monkeypatch.setattr(automation.Path, "home", staticmethod(lambda: tmp_path))
-    monkeypatch.setattr(automation, "_macos_browser_paths", lambda browser: [edge if browser == "msedge" else chrome])
-    monkeypatch.setattr(automation, "_playwright_chromium_path", lambda: None)
-    monkeypatch.setattr(automation.shutil, "which", lambda _: None)
-    result = automation.detect_browsers()
-    assert result["chrome"].endswith("Google Chrome")
-    assert result["msedge"].endswith("Microsoft Edge")
+def _stage_browser(root, relative, monkeypatch):
+    """在 root 下造一个假的 Chromium 可执行文件并返回它。"""
+    executable = root / relative
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_text("", encoding="utf-8")
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(root))
+    return executable
 
 
-def test_linux_browser_paths_resolves_distro_commands(monkeypatch):
-    def fake_which(name):
-        return "/usr/bin/google-chrome-stable" if name == "google-chrome-stable" else None
-
-    monkeypatch.setattr(automation.shutil, "which", fake_which)
-    # The POSIX literals must compare equal even when the suite runs on Windows,
-    # where Path renders them with backslashes.
-    chrome = [str(path).replace("\\", "/") for path in automation._linux_browser_paths("chrome")]
-    assert "/usr/bin/google-chrome-stable" in chrome
-    assert "/opt/google/chrome/chrome" in chrome
-    assert automation._linux_browser_paths("msedge") == [automation.Path("/opt/microsoft/msedge/msedge")]
+def test_bundled_browser_dir_follows_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path / "custom"))
+    assert automation.bundled_browser_dir() == tmp_path / "custom"
 
 
-def test_detect_browsers_finds_linux_chrome(monkeypatch, tmp_path):
-    chrome = tmp_path / "opt/google/chrome/chrome"
-    chrome.parent.mkdir(parents=True)
-    chrome.touch()
-    monkeypatch.setattr(automation.os, "name", "posix")
-    monkeypatch.setattr(automation.sys, "platform", "linux")
-    monkeypatch.setattr(automation, "_linux_browser_paths", lambda browser: [chrome] if browser == "chrome" else [])
-    monkeypatch.setattr(automation.shutil, "which", lambda _: None)
-    monkeypatch.setattr(automation, "_playwright_chromium_path", lambda: None)
-    result = automation.detect_browsers()
-    assert result["chrome"] == str(chrome)
-    assert result["msedge"] is None
+def test_find_bundled_browser_accepts_flat_layout(monkeypatch, tmp_path):
+    """发行包把浏览器直接平铺在 browser/ 下时的布局。"""
+    executable = _stage_browser(tmp_path, "chrome", monkeypatch)
+    assert automation.find_bundled_browser() == executable
+    assert automation.ensure_browser() == str(executable)
 
 
-def test_detect_browsers_finds_playwright_chromium(monkeypatch):
-    expected = str(automation.Path("C:/tmp/chromium"))
-    monkeypatch.setattr(automation.shutil, "which", lambda _: None)
-    monkeypatch.setattr(automation, "_playwright_chromium_path", lambda: automation.Path("C:/tmp/chromium"))
-    monkeypatch.setattr(automation.Path, "is_file", lambda self: str(self) == expected)
-    result = automation.detect_browsers()
-    assert result["chromium"] == expected
+def test_find_bundled_browser_accepts_playwright_layout(monkeypatch, tmp_path):
+    """Playwright 解包布局 browser/<name>-<rev>/chrome-<platform>/chrome。"""
+    executable = _stage_browser(tmp_path, "chromium-1234/chrome-linux64/chrome", monkeypatch)
+    assert automation.find_bundled_browser() == executable
 
 
-def test_ensure_browser_installs_chromium_when_missing(monkeypatch):
-    monkeypatch.setattr(automation, "detect_browsers", lambda: {"msedge": None, "chrome": None, "chromium": None})
-    calls = []
-    monkeypatch.setattr(automation, "_install_chromium", lambda: calls.append(True))
-    monkeypatch.setattr(automation, "detect_browsers", lambda: ({"msedge": None, "chrome": None, "chromium": None} if not calls else {"msedge": None, "chrome": None, "chromium": "/tmp/chromium"}))
-    monkeypatch.setattr(automation.sys, "frozen", False, raising=False)
-    assert automation.ensure_browser() == "chromium"
-    assert calls == [True]
+def test_find_bundled_browser_accepts_windows_layout(monkeypatch, tmp_path):
+    executable = _stage_browser(tmp_path, "chromium-1234/chrome-win64/chrome.exe", monkeypatch)
+    assert automation.find_bundled_browser() == executable
+
+
+def test_find_bundled_browser_accepts_macos_layout(monkeypatch, tmp_path):
+    executable = _stage_browser(
+        tmp_path,
+        "chromium-1234/chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+        monkeypatch,
+    )
+    assert automation.find_bundled_browser() == executable
+
+
+def test_find_bundled_browser_returns_none_when_missing(monkeypatch, tmp_path):
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path / "absent"))
+    assert automation.find_bundled_browser() is None
+
+
+def test_ensure_browser_reports_install_dir_when_payload_missing(monkeypatch, tmp_path):
+    import pytest
+
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path / "absent"))
+    with pytest.raises(automation.BrowserNotFoundError) as excinfo:
+        automation.ensure_browser()
+    # 报错必须点明缺失路径，否则用户不知道 browser/ 该放在哪里。
+    assert str(tmp_path / "absent") in str(excinfo.value)
+    assert excinfo.value.browser_dir == str(tmp_path / "absent")
+
+
+def test_browser_manifest_and_description(monkeypatch, tmp_path):
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
+    (tmp_path / automation.BROWSER_MANIFEST_NAME).write_text(
+        automation.json.dumps({"playwright": "1.62.0", "browser_version": "151.0.7922.34"}),
+        encoding="utf-8",
+    )
+    assert automation.browser_manifest()["browser_version"] == "151.0.7922.34"
+    assert automation.browser_description() == "Chromium 151.0.7922.34"
+
+
+def test_browser_manifest_defaults_when_absent(monkeypatch, tmp_path):
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
+    assert automation.browser_manifest() == {}
+    assert automation.browser_description() == "内置 Chromium"
+    assert automation.browser_version_warning() is None
+
+
+def test_browser_version_warning_flags_playwright_mismatch(monkeypatch, tmp_path):
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
+    (tmp_path / automation.BROWSER_MANIFEST_NAME).write_text(
+        automation.json.dumps({"playwright": "1.40.0"}), encoding="utf-8",
+    )
+    monkeypatch.setattr(automation, "playwright_version", lambda: "1.62.0")
+    warning = automation.browser_version_warning()
+    assert warning is not None and "1.40.0" in warning and "1.62.0" in warning
+
+
+def test_launch_browser_uses_bundled_executable(monkeypatch, tmp_path):
+    """自动化必须走内置 Chromium，并带上窗口尺寸参数。"""
+    executable = _stage_browser(tmp_path, "chromium-1234/chrome-linux64/chrome", monkeypatch)
+    captured = {}
+
+    class FakeChromium:
+        def launch(self, **kwargs):
+            captured.update(kwargs)
+            return "browser"
+
+    class FakePlaywright:
+        chromium = FakeChromium()
+
+    assert automation._launch_browser(FakePlaywright(), headless=True) == "browser"
+    assert captured["executable_path"] == str(executable)
+    assert captured["headless"] is True
+    assert captured["args"] == ["--window-size=1300,900"]
+
+
+def test_no_system_browser_probing_remains():
+    """系统 Edge/Chrome 探测与运行期下载入口必须彻底移除。"""
+    for name in ("detect_browsers", "_macos_browser_paths", "_linux_browser_paths",
+                 "_playwright_chromium_path", "_install_chromium"):
+        assert not hasattr(automation, name), f"{name} 应已删除"
 
 
 def test_find_order_cell_traverses_pagination():
@@ -535,41 +581,3 @@ def test_open_detail_reports_clear_error_when_click_misses():
     )
     with pytest.raises(LookupError, match="详情未点开"):
         automation._open_detail(Page(), "W8", Row(), config, None, 1000)
-
-
-def test_ensure_browser_explicit_install_works_when_frozen(monkeypatch):
-    # 打包版里显式入口（「检查浏览器」按钮 / --install-browser）必须可以安装。
-    calls = []
-    monkeypatch.setattr(
-        automation, "detect_browsers",
-        lambda: ({"msedge": None, "chrome": None, "chromium": None} if not calls
-                 else {"msedge": None, "chrome": None, "chromium": "/tmp/chromium"}),
-    )
-    monkeypatch.setattr(automation, "_install_chromium", lambda: calls.append(True))
-    monkeypatch.setattr(automation.sys, "frozen", True, raising=False)
-    assert automation.ensure_browser() == "chromium"
-    assert calls == [True]
-
-
-def test_launch_browser_does_not_silently_install_when_frozen(monkeypatch):
-    # 打包版任务启动时不静默下载浏览器，缺浏览器时交由 GUI 显式引导。
-    captured = {}
-    monkeypatch.setattr(automation.sys, "frozen", True, raising=False)
-
-    def fake_ensure(mode="auto", allow_install=True):
-        captured["allow_install"] = allow_install
-        return "msedge"
-
-    monkeypatch.setattr(automation, "ensure_browser", fake_ensure)
-    monkeypatch.setattr(automation, "detect_browsers",
-                        lambda: {"msedge": "C:/edge.exe", "chrome": None, "chromium": None})
-
-    class FakeChromium:
-        def launch(self, **_kwargs):
-            return "browser"
-
-    class FakePlaywright:
-        chromium = FakeChromium()
-
-    assert automation._launch_browser(FakePlaywright(), "auto", True) == "browser"
-    assert captured["allow_install"] is False

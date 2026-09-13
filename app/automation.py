@@ -12,7 +12,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -130,11 +129,19 @@ def parse_order_created_date(value: object) -> _dt.date | None:
 
 
 class BrowserNotFoundError(RuntimeError):
-    """Raised when no supported system browser is available."""
+    """Raised when the Chromium payload shipped with the program is missing.
 
-    def __init__(self, browsers: dict[str, str | None] | None = None) -> None:
-        self.browsers = browsers or detect_browsers()
-        super().__init__("未检测到可用浏览器，请安装 Microsoft Edge/Google Chrome，或安装 Playwright Chromium")
+    The application no longer probes for a system Edge/Chrome: automation
+    always drives the Chromium copy distributed next to the executable, so a
+    missing payload means the installation itself is incomplete.
+    """
+
+    def __init__(self, browser_dir: Path | None = None) -> None:
+        self.browser_dir = str(browser_dir or bundled_browser_dir())
+        super().__init__(
+            f"内置浏览器缺失或已损坏（{self.browser_dir}）。"
+            f"请重新下载完整安装包，并确认 {BROWSER_DIR_NAME}/ 目录与程序放在同一层。"
+        )
 
 
 class LocatorError(RuntimeError):
@@ -150,72 +157,109 @@ class OrderSearchNotFound(LookupError):
     """Raised when every order-list page was searched without a match."""
 
 
-def detect_browsers() -> dict[str, str | None]:
-    """Find system browsers and an already-installed Playwright Chromium."""
-    candidates: dict[str, list[Path]] = {"msedge": [], "chrome": [], "chromium": []}
-    for name in candidates:
-        found = shutil.which(name) or shutil.which(name + ".exe")
-        if found:
-            candidates[name].append(Path(found))
-    if os.name == "nt":
-        roots = [Path(os.environ.get(k, "")) for k in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
-        candidates["msedge"] += [root / "Microsoft/Edge/Application/msedge.exe" for root in roots if str(root)]
-        candidates["chrome"] += [root / "Google/Chrome/Application/chrome.exe" for root in roots if str(root)]
-    elif sys.platform == "darwin":
-        candidates["msedge"] += _macos_browser_paths("msedge")
-        candidates["chrome"] += _macos_browser_paths("chrome")
-    else:
-        candidates["msedge"] += _linux_browser_paths("msedge")
-        candidates["chrome"] += _linux_browser_paths("chrome")
-    chromium = _playwright_chromium_path()
-    if chromium:
-        candidates["chromium"].append(chromium)
-    return {name: next((str(path) for path in paths if path.is_file()), None) for name, paths in candidates.items()}
+BROWSER_DIR_NAME = "browser"
+BROWSER_DIR_ENV = "YIKOU_BROWSER_DIR"
+BROWSER_MANIFEST_NAME = "browser.json"
+# 内置目录里可执行文件的名字随 Playwright 版本变化，逐个探测；下面的 glob
+# 覆盖 ``browser/<name>-<revision>/chrome-<platform>/…`` 解包布局。
+_BROWSER_EXECUTABLE_NAMES = (
+    "chrome.exe",                     # Windows
+    "chrome",                         # Linux
+    "Chromium",                       # macOS（Playwright 较早版本）
+    "Google Chrome for Testing",      # macOS（Playwright 1.4x 起）
+)
+_BROWSER_EXECUTABLE_GLOBS = (
+    "*/chrome-*/chrome.exe",
+    "*/chrome-*/chrome",
+    "*/chrome-*/Chromium.app/Contents/MacOS/Chromium",
+    "*/chrome-*/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+)
 
 
-def _macos_browser_paths(browser: str) -> list[Path]:
-    app_roots = (Path("/Applications"), Path.home() / "Applications")
-    app_name, executable = {
-        "msedge": ("Microsoft Edge.app", "Microsoft Edge"),
-        "chrome": ("Google Chrome.app", "Google Chrome"),
-    }[browser]
-    return [root / app_name / "Contents" / "MacOS" / executable for root in app_roots]
+def bundled_browser_dir() -> Path:
+    """返回内置浏览器根目录（不保证存在）。
 
-
-def _linux_browser_paths(browser: str) -> list[Path]:
-    """Resolve distro browser executables whose names differ from ``msedge``/``chrome``."""
-    commands, fixed = {
-        "msedge": (("microsoft-edge", "microsoft-edge-stable"), ("/opt/microsoft/msedge/msedge",)),
-        "chrome": (("google-chrome", "google-chrome-stable"), ("/opt/google/chrome/chrome",)),
-    }[browser]
-    paths = [Path(found) for name in commands if (found := shutil.which(name))]
-    paths += [Path(target) for target in fixed]
-    return paths
-
-
-_CHROMIUM_PATH_CACHE: Path | None = None
-
-
-def _playwright_chromium_path() -> Path | None:
-    """Return Playwright's Chromium executable when the browser payload exists.
-
-    Each lookup spawns Playwright's Node driver subprocess, so a positive
-    result is cached for the lifetime of the process.  A failed lookup is not
-    cached: after ``_install_chromium`` the next call must find the new
-    payload without explicit invalidation.
+    解析顺序：``YIKOU_BROWSER_DIR`` 覆盖 → 打包版可执行文件同级的 ``browser/``
+    （macOS 优先 ``.app/Contents/Resources/browser``）→ 源码运行时的仓库根目录
+    ``browser/``，其次是 ``scripts/fetch_browser.py`` 的默认暂存位置
+    ``vendor/browser/``。
     """
-    global _CHROMIUM_PATH_CACHE
-    if _CHROMIUM_PATH_CACHE is not None:
-        return _CHROMIUM_PATH_CACHE
+    override = os.environ.get(BROWSER_DIR_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates = ([exe_dir.parent / "Resources" / BROWSER_DIR_NAME] if sys.platform == "darwin" else [])
+        candidates.append(exe_dir / BROWSER_DIR_NAME)
+        return next((path for path in candidates if path.is_dir()), candidates[0])
+    project = Path(__file__).resolve().parent.parent
+    candidates = [project / BROWSER_DIR_NAME, project / "vendor" / BROWSER_DIR_NAME]
+    return next((path for path in candidates if path.is_dir()), candidates[0])
+
+
+def find_bundled_browser() -> Path | None:
+    """在内置目录里定位 Chromium 可执行文件；缺失时返回 ``None``。"""
+    root = bundled_browser_dir()
+    if not root.is_dir():
+        return None
+    for name in _BROWSER_EXECUTABLE_NAMES:
+        direct = root / name
+        if direct.is_file():
+            return direct
+    for pattern in _BROWSER_EXECUTABLE_GLOBS:
+        for path in sorted(root.glob(pattern)):
+            if path.is_file():
+                return path
+    return None
+
+
+def browser_manifest() -> dict[str, Any]:
+    """读取构建期内置浏览器时写入的版本标记；没有标记时返回空字典。"""
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as playwright:
-            path = Path(playwright.chromium.executable_path)
-        if path.is_file():
-            _CHROMIUM_PATH_CACHE = path
-            return path
+        payload = json.loads((bundled_browser_dir() / BROWSER_MANIFEST_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def browser_description() -> str:
+    """给日志用的一行内置浏览器描述，例如 ``Chromium 151.0.7922.34``。"""
+    manifest = browser_manifest()
+    version = str(manifest.get("browser_version") or "").strip()
+    return f"Chromium {version}" if version else "内置 Chromium"
+
+
+def playwright_version() -> str:
+    """返回当前依赖的 Playwright 版本；无法确定时返回空字符串。
+
+    打包版里 ``importlib.metadata`` 未必能读到 dist-info，因此再退回读取
+    Playwright 驱动自带的 ``package.json``。
+    """
+    try:
+        from importlib.metadata import version
+        if found := version("playwright"):
+            return found
     except Exception:
         pass
+    try:
+        import playwright
+        manifest = Path(playwright.__file__).parent / "driver" / "package" / "package.json"
+        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "")
+    except Exception:
+        return ""
+
+
+def browser_version_warning() -> str | None:
+    """内置浏览器与当前 Playwright 版本不一致时返回提示文本。
+
+    版本错配通常仍能启动，但协议差异可能让自动化在个别站点上失败，因此只
+    提示、不阻断，由用户决定是否重新下载完整安装包。
+    """
+    packaged = str(browser_manifest().get("playwright") or "").strip()
+    current = playwright_version()
+    if packaged and current and packaged != current:
+        return (f"内置浏览器由 Playwright {packaged} 打包，当前程序依赖 Playwright "
+                f"{current}，建议重新下载完整安装包。")
     return None
 
 
@@ -434,71 +478,26 @@ def extract_product_note_text(page: Any, locators: dict[str, Any] | None = None)
     return " ".join(lines)
 
 
-def ensure_browser(mode: str = "auto", allow_install: bool = True) -> str:
-    """Return a usable browser, installing Playwright Chromium when needed."""
-    mode = (mode or "auto").lower()
-    found = detect_browsers()
-    if mode in {"msedge", "edge"}:
-        if found["msedge"]:
-            return "msedge"
-        raise BrowserNotFoundError(found)
-    if mode in {"chrome", "google-chrome"}:
-        if found["chrome"]:
-            return "chrome"
-        raise BrowserNotFoundError(found)
-    if found["msedge"]:
-        return "msedge"
-    if found["chrome"]:
-        return "chrome"
-    if found.get("chromium"):
-        return "chromium"
-    if allow_install:
-        try:
-            _install_chromium()
-        except Exception as exc:
-            error = BrowserNotFoundError(found)
-            error.__cause__ = exc
-            raise error from exc
-        found = detect_browsers()
-        if found.get("chromium"):
-            return "chromium"
-    raise BrowserNotFoundError(found)
+def ensure_browser() -> str:
+    """返回内置 Chromium 可执行文件路径，缺失时抛 :class:`BrowserNotFoundError`。
 
-
-def _install_chromium() -> None:
-    """Install Chromium using Playwright's bundled Node driver.
-
-    Calling ``sys.executable -m playwright`` does not work from a PyInstaller
-    executable because ``sys.executable`` points back to the application.  The
-    driver and CLI are included by the PyInstaller Playwright hook, so invoking
-    them directly works in both source and packaged builds.
+    程序固定使用随包分发的 Chromium，既不探测系统 Edge/Chrome，也不在
+    运行时下载浏览器，因此这里没有回退分支。
     """
-    from playwright._impl._driver import compute_driver_executable, get_driver_env
+    root = bundled_browser_dir()
+    executable = find_bundled_browser()
+    if executable is None:
+        raise BrowserNotFoundError(root)
+    return str(executable)
 
-    driver, cli = compute_driver_executable()
-    result = subprocess.run(
-        [driver, cli, "install", "chromium"],
-        env=get_driver_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
+
+def _launch_browser(playwright: Any, headless: bool = False) -> Any:
+    """用内置 Chromium 启动浏览器，供订单抓取与闪时送下单共用。"""
+    return playwright.chromium.launch(
+        executable_path=ensure_browser(),
+        headless=headless,
+        args=["--window-size=1300,900"],
     )
-    if result.returncode != 0:
-        # 输出可能很长（下载进度），只保留尾部关键错误信息用于排障。
-        tail = (result.stdout or "").strip()[-500:]
-        raise RuntimeError(f"Playwright Chromium 安装失败（退出码 {result.returncode}）：{tail}")
-
-
-def _launch_browser(playwright: Any, mode: str, headless: bool) -> Any:
-    # 任务启动不静默下载浏览器：打包版里下载没有任何进度提示，缺浏览器时
-    # 报错交给 GUI 的「检查浏览器」按钮或 --install-browser 显式安装。
-    allow_install = str(mode or "auto").lower() == "auto" and not getattr(sys, "frozen", False)
-    preferred = ensure_browser(mode, allow_install=allow_install)
-    kwargs = {"headless": headless, "args": ["--window-size=1300,900"]}
-    executable = detect_browsers().get(preferred)
-    if not executable:
-        raise BrowserNotFoundError()
-    return playwright.chromium.launch(executable_path=executable, **kwargs)
 
 
 def _label(page: Any, label: str, timeout: int, locators: dict[str, Any] | None = None) -> str:
@@ -1245,7 +1244,7 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                 raise RuntimeError("缺少 Playwright，请先安装 requirements.txt") from exc
 
             with sync_playwright() as playwright:
-                browser = _launch_browser(playwright, getattr(config, "browser_mode", "auto"), bool(getattr(config, "headless", False)))
+                browser = _launch_browser(playwright, bool(getattr(config, "headless", False)))
                 page = browser.new_page()
                 try:
                     _emit(progress_callback, "正在登录...")
@@ -1647,4 +1646,4 @@ def _find_order_cell(page: Any, code: str, config: Any, callback: Callable[[str]
     raise OrderSearchNotFound(f"订单 {code} 未找到（已搜索全部订单页）") from last_error
 
 
-__all__ = ["run_job", "ensure_browser", "detect_browsers", "BrowserNotFoundError", "LocatorError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]
+__all__ = ["run_job", "ensure_browser", "find_bundled_browser", "bundled_browser_dir", "browser_manifest", "BrowserNotFoundError", "LocatorError", "parse_receiver_info", "parse_meal_rows", "extract_meal_info", "extract_product_note_text", "get_yijin_address_from_product_note", "get_address_base_sheet_name", "get_donghu_address_segment"]

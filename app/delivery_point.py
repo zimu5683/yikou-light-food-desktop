@@ -4,9 +4,10 @@
 拼接，写法非常杂乱：混入人名、手机号、房间号、街道名、繁体、重复拼写等。
 排单时人工只关心「放到哪个取餐点」。
 
-输出口径（2026-09-08 与店主确认）：
-- 东湖农林：宿舍楼输出字母楼码 ``A5``/``B5``/``C12``/``D1``；两个校门沿用现网
-  ``大西``/``小西``；命名点输出文字（学三/学14/教2/图书馆/国重楼…）。
+输出口径（2026-09-11 按店主最新要求调整）：
+- 东湖农林：B 区楼码小写（``B6`` → ``b6``），A/C/D 区维持大写；
+  小西门/西南门输出 ``小``，大西门仍输出 ``大西``；
+  命名点输出文字（学三/学14/教2/图书馆/国重楼…）。
 - 医学院：宿舍楼输出 ``医{N}号``（如 医5号/医6号）。
 - 楼与校门并存时放宿舍楼下，取楼码不取校门（prefer_gate_when_both=False）。
 
@@ -26,17 +27,18 @@ CAMPUS_DONGHU_KEYWORDS = ("东湖", "农林", "农大")
 
 # 东湖校区字母宿舍区。E 区属衣锦联建；其余字母当异常。
 DORM_ZONES = ("A", "B", "C", "D")
-# 字母楼码统一大写（与现有排单一致）；若个别区习惯记小写可改为 False。
+# 字母楼码默认大写；但店主明确要求 B 区输出小写 b（如 B6 → b6）。
 DORM_UPPER = True
+DORM_LOWER_ZONES = ("B",)
 
 # 医学院楼号命名模板：医{N}号。
 YIXUE_BUILDING_TMPL = "医{n}号"
 
-# 校门别名 → 标准点位（沿用现网排单短名）。
+# 校门别名 → 标准点位（店主最新口径：小西门统一写“小”）。
 GATE_POINT = {
-    "西南1门": "小西",   # 后台地址库把西南门存成"西南1门"
-    "西南门": "小西",
-    "小西门": "小西",
+    "西南1门": "小",     # 后台地址库把西南门存成"西南1门"
+    "西南门": "小",
+    "小西门": "小",
     "大西门": "大西",
     "西门": "大西",      # 单独"西门"更靠近大西，命中即 medium 复核
 }
@@ -83,6 +85,26 @@ DEFAULT_ALIASES = {
     "浙江省杭州市临安区浙江农林大学(东湖校区)行政楼 325 室（放学三外卖柜）": "学三",
 }
 
+# 旧点位写法 → 最新排单口径。小西短名和自动识别结果都在返回前统一。
+_POINT_RENAMES = {"小西": "小"}
+_B_ZONE_CODE = re.compile(r"^B(\d{1,2})$")
+
+
+def _format_dorm_letter(zone: str) -> str:
+    """按最新口径输出宿舍区字母：B 区小写，其余区默认大写。"""
+    code = zone.upper() if DORM_UPPER else zone.lower()
+    return code.lower() if code.upper() in DORM_LOWER_ZONES else code
+
+
+def _canonical_point_name(point: str) -> str:
+    """统一校门/楼码显示：小西→小，B6→b6。"""
+    text = str(point or "")
+    text = _POINT_RENAMES.get(text, text)
+    match = _B_ZONE_CODE.fullmatch(text)
+    if match:
+        return f"b{match.group(1)}"
+    return text
+
 
 def _cn_to_int(text: str) -> Optional[int]:
     if not text:
@@ -127,13 +149,14 @@ def _extract_candidates(body: str, campus: str) -> tuple[dict[str, int], bool, b
     cands: dict[str, int] = {}
 
     def add(kw: str) -> None:
+        kw = _canonical_point_name(kw)
         cands[kw] = cands.get(kw, 0) + 1
 
     # 字母楼栋码（东湖宿舍区 A/B/C/D）
     for m in _RE_BLDG.finditer(body):
-        zone, no = m.group(1).upper() if DORM_UPPER else m.group(1), m.group(2)
+        zone, no = m.group(1), m.group(2)
         if zone.upper() in DORM_ZONES:
-            add(f"{zone.upper() if DORM_UPPER else zone}{no}")
+            add(f"{_format_dorm_letter(zone)}{no}")
     # 数字楼：医学院宿舍用「医N号」；东湖出现"学院楼 N 号"之类不带字母则仍按楼号。
     for m in _RE_NUM_BLDG.finditer(body):
         raw = m.group(1)
@@ -176,7 +199,7 @@ def _pick_primary(cands: dict[str, int], prefer_gate_when_both: bool) -> tuple[s
     if len(ordered) == 1:
         return ordered[0][1], "唯一候选"
     gates = {k for k in cands if k in GATE_POINT.values()}
-    bldgs = [k for k in cands if re.fullmatch(r"[A-D]\d{1,2}|\d{1,2}号楼|医\d+号", k)]
+    bldgs = [k for k in cands if re.fullmatch(r"[A-Da-d]\d{1,2}|\d{1,2}号楼|医\d+号", k)]
     if gates and bldgs:
         if prefer_gate_when_both:
             return next(iter(gates)), "门与楼共存，默认取门"
@@ -212,32 +235,35 @@ def normalize_delivery_point(
     if aliases:
         alias_map.update(aliases)
     if raw in alias_map:
+        point = _canonical_point_name(alias_map[raw])
         return {
             "campus": detect_campus(raw),
-            "point": alias_map[raw],
+            "point": point,
             "confidence": "high",
             "reason": "别名表命中",
             "raw_address": raw,
-            "candidates": {alias_map[raw]: 1},
+            "candidates": {point: 1},
             "cabinet": False,
         }
     campus = detect_campus(raw)
     body = _clean(raw)
     cands, has_cabinet, named_college = _extract_candidates(body, campus)
 
-    if not cands and body in {"大西", "小西", "校门口", "外卖柜"}:
+    if not cands and body in {"大西", "小西", "小", "校门口", "外卖柜"}:
+        point = _canonical_point_name(body)
         return {
-            "campus": campus, "point": body, "confidence": "high",
+            "campus": campus, "point": point, "confidence": "high",
             "reason": "已是短名直接采用", "raw_address": raw,
-            "candidates": {body: 1}, "cabinet": False,
+            "candidates": {point: 1}, "cabinet": False,
         }
 
     if not cands:
         if "学院楼" in body:
             point, reason = "学院楼", "学院楼未带具体楼号，待确认"
-        elif has_cabinet and re.search(r"[A-D]区", body):
-            m = re.search(r"([A-D])区", body)
-            point, reason = f"{m.group(1).upper() if DORM_UPPER else m.group(1)}区", "仅有区提示，待确认"
+        elif has_cabinet and re.search(r"[A-Da-d]区", body):
+            m = re.search(r"([A-Da-d])区", body)
+            point = f"{_format_dorm_letter(m.group(1))}区"
+            reason = "仅有区提示，待确认"
         else:
             point, reason = "", "未识别出任何取餐点"
         return {
@@ -246,7 +272,7 @@ def normalize_delivery_point(
             "candidates": dict(cands), "cabinet": has_cabinet,
         }
     if len(cands) == 1:
-        point = next(iter(cands))
+        point = _canonical_point_name(next(iter(cands)))
         # A bare "西门" is ambiguous in the real data; explicit 大/小西门
         # and 西南门 remain high-confidence aliases.
         has_explicit_gate = bool(re.search(r"大西门|小西门|西南1?门", body))
@@ -263,6 +289,7 @@ def normalize_delivery_point(
             "candidates": dict(cands), "cabinet": has_cabinet,
         }
     point, reason = _pick_primary(cands, prefer_gate_when_both)
+    point = _canonical_point_name(point)
     # 楼码与校门并存时按既定口径取楼码，规则确定，无需人工复核。
     if reason.startswith("门与楼共存"):
         confidence = "high"

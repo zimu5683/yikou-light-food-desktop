@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import re
+import sys
 import time
 import unicodedata
 import uuid
@@ -71,14 +73,37 @@ _DRY_RUN_PREVIEW_N = 3
 # 对账只读轮询：服务端列表延迟时多查几次，绝不在轮询期间重发 POST。
 _RECONCILE_POLL_ATTEMPTS = 3
 _RECONCILE_POLL_INTERVAL_S = 0.5
+# 服务端预筛返回「窗口内一条都没有」时的快速重查间隔。实测 2026-09-13：批次
+# 刚创建完立刻做预筛会查到 0 条，几分钟后同一窗口能查到全部订单（列表写后
+# 可见性延迟）。「窗口真的为空」与「刚写入还没读到」在响应上无法区分，
+# 因此先短暂重查一次，仍为空才退回无过滤全量扫描。
+_PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 # 订单创建时间与本地批次起点的最大时钟偏差；用于排除其他设备更早创建的相似订单。
 _BATCH_CLOCK_SKEW_S = 120.0
+# 对账页大小。实测 2026-09-10：100 条/页每页约 2.0s；改成 1000 条/页反而要
+# 17.9s，所以宁可多翻几页也不要放大单页体积。
+_LIST_PAGE_SIZE = 100
+# 服务端预筛的时间窗安全边界：订单创建时间可能早于/晚于预约送达日，
+# 因此窗口在目标日基础上前后各放宽这么多天。放宽只会多取几条记录，
+# 真正的判定仍然由本地按送达日/状态过滤负责。
+_SERVER_PREFILTER_MARGIN_DAYS = 1
+# 服务端预筛开关：默认开启；设 YIKOU_SSS_SERVER_PREFILTER=0 可一键退回全量扫描。
+_SSS_SERVER_PREFILTER = os.environ.get(
+    "YIKOU_SSS_SERVER_PREFILTER", "").strip().lower() not in ("0", "false", "no", "off")
+# 订单列表接口的 time 型参数只接受 epoch 毫秒（2026-09-10 实测：传字符串会被
+# Spring 以 BindException 拒绝）。状态参数是单数 ``status``；``statusList`` 无效。
+_SERVER_PREFILTER_STATUS = 2
 # 平台抓包报文没有客户端幂等字段。留空时明确采用“至少一次提交 + 对账确认”；
 # 若平台后续支持，可在配置/调用方指定字段名后启用稳定 UUID（见 build_order_payload）。
 _CLIENT_IDEMPOTENCY_FIELD = ""
 
 # 同一时刻只允许一个闪时送下单任务，避免两个 worker 并发提交相似订单。
 _SSS_RUN_LOCK = Lock()
+
+# 一键发货订单非活跃 status（2026-09-09/10 实测只见过 2=待发单在途、
+# 3=已发送；其余状态码未经实测，一律按活跃处理——对账多算比漏算安全，
+# 漏算会导致重复提交）。
+_INACTIVE_ORDER_STATUS = frozenset()
 
 _DOOR_RE = re.compile(r"\s+")
 _PHONE_RE = re.compile(r"^[0-9]{11}$")
@@ -106,6 +131,21 @@ async ({method, path, body}) => {
 
 def _clean(value: Any) -> Any:
     return value.strip() if isinstance(value, str) else value
+
+
+# 耗时埋点：默认关闭，设 YIKOU_SSS_TRACE=1 才输出每页列表 / 每次下单的真实耗时。
+# 2026-09-10 实测背景：站内 2200+ 单、列表每页 100 条约 2s、一次对账要扫 23 页；
+# 下单 POST 的耗时此前完全没有记录，无法区分是客户端还是服务端慢。
+_SSS_TRACE_ENABLED = os.environ.get("YIKOU_SSS_TRACE", "").strip().lower() not in (
+    "", "0", "false", "no", "off")
+
+
+def _trace(message: str) -> None:
+    """把埋点写到标准输出（GUI 启动时仍落在终端），不影响业务日志。"""
+    if not _SSS_TRACE_ENABLED:
+        return
+    stamp = time.strftime("%H:%M:%S")
+    print(f"[sss-trace {stamp}] {message}", file=sys.stderr, flush=True)
 
 
 def load_sss_orders(excel_path: str | Path, sheets=DEFAULT_SHEETS) -> dict[str, list[dict[str, Any]]]:
@@ -236,6 +276,31 @@ def _pick(record: dict[str, Any], keys: tuple[str, ...]) -> Any:
     """按优先级从记录里取第一个非空字段。"""
     for key in keys:
         value = record.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _unwrap_scalar(value: Any) -> Any:
+    """把列表/元组字段摊平成首个标量。
+
+    闪时送订单列表把电话返回成数组（如 ``["18545726939"]``），直接
+    ``str()`` 会得到 ``"['18545726939']"``，与下单报文的单值永远不相等。
+    """
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, dict):
+                continue
+            if item not in (None, ""):
+                return item
+        return None
+    return value
+
+
+def _pick_scalar(record: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    """同 ``_pick``，但把数组字段取首元素，适配列表接口的数组化字段。"""
+    for key in keys:
+        value = _unwrap_scalar(record.get(key))
         if value not in (None, ""):
             return value
     return None
@@ -598,7 +663,7 @@ def _collect_tasks(orders_by_sheet: dict[str, list[dict[str, Any]]],
 
 
 def _run_dry_run(tasks: list[dict[str, Any]],
-                 callback: Callable[[str], Any] | None) -> dict[str, int]:
+                 callback: Callable[[str], Any] | None) -> dict[str, Any]:
     """干跑：只组装打印报文，不真实提交；只预览前几单全文。"""
     _emit(callback, f"【干跑模式】只组装报文，不真实提交，共 {len(tasks)} 单")
     for index, task in enumerate(tasks):
@@ -608,8 +673,49 @@ def _run_dry_run(tasks: list[dict[str, Any]],
                   f"{json.dumps(task['payload'], ensure_ascii=False)}")
     if len(tasks) > _DRY_RUN_PREVIEW_N:
         _emit(callback, f"【干跑】…其余 {len(tasks) - _DRY_RUN_PREVIEW_N} 单报文已省略")
-    _emit(callback, f"闪时送下单完成（干跑）：成功 {len(tasks)}/{len(tasks)}")
-    return {"processed": len(tasks), "created": len(tasks)}
+    _emit(callback, f"闪时送干跑完成：已组装 {len(tasks)}/{len(tasks)}，未创建真实订单")
+    return {
+        "status": "dry_run",
+        "processed": len(tasks),
+        "created": 0,
+        "previewed": len(tasks),
+        "submitted": 0,
+        "reconciled": False,
+        "uncertain": False,
+    }
+
+
+def _balance_precheck(tasks: list[dict[str, Any]], total: float | None,
+                     unit_price: float, callback: Callable[[str], Any] | None
+                     ) -> tuple[str, float]:
+    """阻止余额未知或不足的真实批次，且保证尚未发送任何 POST。"""
+    estimate = round(max(0.0, unit_price) * len(tasks), 2)
+    if total is None:
+        _emit(callback, "余额未知，为避免产生无法完成的订单，本批不会提交")
+        return "balance_unknown", estimate
+    if unit_price > 0 and total < estimate:
+        shortage = round(estimate - total, 2)
+        _emit(callback, f"余额不足：当前可用 {total:.2f}，本批预计 {estimate:.2f}，"
+                        f"还差 {shortage:.2f}，本批不会提交")
+        return "insufficient_balance", estimate
+    return "ok", estimate
+
+
+def _preflight_tasks(tasks: list[dict[str, Any]],
+                     fetch_json: Callable[[str], dict[str, Any]],
+                     callback: Callable[[str], Any] | None
+                     ) -> tuple[str, _Reconciliation | None]:
+    """只读检查订单列表；预检失败时绝不进入 POST 阶段。"""
+    reconciliation = _safe_reconcile(tasks, fetch_json, callback, "预检站内对账", attempts=1)
+    if reconciliation is None:
+        return "preflight_uncertain", None
+    if reconciliation.duplicate_count:
+        _emit(callback, "预检发现站内重复订单，停止且不会提交")
+        return "duplicate_detected", reconciliation
+    if reconciliation.confirmed:
+        _emit(callback, f"预检发现已有 {len(reconciliation.confirmed)} 单匹配，"
+                        "这些订单不会重复提交")
+    return "preflight_ok", reconciliation
 
 
 def _check_success(resp: dict[str, Any]) -> None:
@@ -805,6 +911,28 @@ def _record_address(record: dict[str, Any]) -> dict[str, Any]:
     return address
 
 
+_FLAT_ADDRESS_KEYS = (
+    "recipientAddress", "receiverAddress", "address", "addressDetail",
+    "detailedAddress", "deliveryAddress", "position",
+)
+
+
+def _record_address_text(record: dict[str, Any]) -> str:
+    """取拍平成一整串的收货地址（订单列表把地址拍平成 ``recipientAddress``）。
+
+    新结构（2026-09 实测）列表记录没有 ``receiveAddress`` 子对象，只有
+    ``recipientAddress`` 字符串，门牌号也被拼进这一串，因此这里原样返回，
+    由对账阶段与下单报文的 ``addressDetail + doorNum`` 组合后比较。
+    """
+    if _record_address(record):
+        return ""
+    for key in _FLAT_ADDRESS_KEYS:
+        value = _unwrap_scalar(record.get(key))
+        if isinstance(value, str) and value.strip():
+            return _normalise_text(value)
+    return ""
+
+
 def _record_region_code(address: dict[str, Any]) -> str:
     value = _pick(address, ("areaCode", "adcode", "area_code", "regionCode", "code"))
     if value not in (None, ""):
@@ -854,55 +982,107 @@ def _task_fingerprint(task: dict[str, Any]) -> OrderFingerprint:
 
 
 def _order_record_fingerprint(record: dict[str, Any], *, account: str = "") -> OrderFingerprint:
-    """从站内列表记录提取完整指纹；缺失字段留空，由对账阶段 fail-closed。"""
+    """从站内列表记录提取完整指纹；缺失字段留空，由对账阶段判定。
+
+    列表接口（2026-09 实测）返回的是概要结构：姓名/电话/地址为
+    ``recipientName``/``recipientPhone``(数组)/``recipientAddress``(整串)，
+    且通常不带 ``storeId``/``goodsDetail``/坐标。缺失的字段留空，由
+    ``_reconcile_tasks`` 区分“字段未返回”与“值相冲突”。
+    """
     address = _record_address(record)
+    flat_address = _record_address_text(record)
     user = record.get("user") if isinstance(record.get("user"), dict) else {}
     store = record.get("store") if isinstance(record.get("store"), dict) else {}
     goods_name, goods_num = _record_goods(record)
     return OrderFingerprint(
-        receive_name=_normalise_text(_pick(record, (
-            "receiveName", "receiverName", "contactName", "contacts", "name")) or
+        receive_name=_normalise_text(_pick_scalar(record, (
+            "receiveName", "receiverName", "recipientName", "consigneeName",
+            "contactName", "contacts", "recipient", "consignee", "receiver", "name")) or
             _pick(address, ("contact", "contactName", "name"))),
-        receive_phone=_normalise_text(_pick(record, (
-            "receivePhone", "receiverPhone", "contactPhone", "phone", "mobile")) or
-            _pick(address, ("mobile", "phone", "tel")), compact=True),
-        door_num=_normalise_text(_pick(address, (
+        receive_phone=_normalise_text(_pick_scalar(record, (
+            "receivePhone", "receiverPhone", "recipientPhone", "consigneePhone",
+            "contactPhone", "recipientMobile", "receiverMobile", "mobilePhone",
+            "phone", "mobile")) or
+            _pick_scalar(address, ("mobile", "phone", "tel")), compact=True),
+        door_num=_normalise_text(_pick_scalar(address, (
             "doorNum", "houseNum", "door", "description")) or
-            _pick(record, ("doorNum", "houseNum")), compact=True),
-        expected_delivery_time=_normalise_delivery_time(_pick(record, (
+            _pick_scalar(record, ("recipientDoorNum", "receiverDoorNum",
+                                  "doorNum", "houseNum")), compact=True),
+        expected_delivery_time=_normalise_delivery_time(_pick_scalar(record, (
             "expectedDeliveryTime", "appointmentTime", "deliveryTime", "expected_time"))),
-        account=_normalise_text(_pick(record, (
+        account=_normalise_text(_pick_scalar(record, (
             "account", "sssAccount", "customerMobile", "loginMobile")) or
-            _pick(user, ("mobile", "phone", "account")) or account, compact=True),
-        store_id=_normalise_int_text(_pick(record, ("storeId", "storeID", "store_id")) or
-                                     _pick(store, ("id", "storeId"))),
+            _pick_scalar(user, ("mobile", "phone", "account")) or account, compact=True),
+        store_id=_normalise_int_text(_pick_scalar(record, ("storeId", "storeID", "store_id")) or
+                                     _pick_scalar(store, ("id", "storeId"))),
         goods_name=goods_name,
         goods_num=goods_num,
         address_detail=_normalise_text(_pick(address, (
             "addressDetail", "address_detail", "address", "position", "description")) or
-            _pick(record, ("addressDetail", "address_detail", "position", "address"))),
+            _pick(record, ("addressDetail", "address_detail", "position")) or
+            flat_address),
         area_code=_record_region_code(address) or _record_region_code(record),
-        lnt=_normalise_number(_pick(address, ("lnt", "lng", "longitude", "lon")) or
-                              _pick(record, ("lnt", "lng", "longitude", "lon"))),
-        lat=_normalise_number(_pick(address, ("lat", "latitude")) or
-                              _pick(record, ("lat", "latitude"))),
-        order_type=_normalise_order_type(_pick(record, ("orderType", "order_type")) or
-                                         _pick(record, ("orderTypeFormat",))),
+        lnt=_normalise_number(_pick_scalar(address, ("lnt", "lng", "longitude", "lon")) or
+                              _pick_scalar(record, ("lnt", "lng", "longitude", "lon"))),
+        lat=_normalise_number(_pick_scalar(address, ("lat", "latitude")) or
+                              _pick_scalar(record, ("lat", "latitude"))),
+        order_type=_normalise_order_type(_pick_scalar(record, ("orderType", "order_type")) or
+                                         _pick_scalar(record, ("orderTypeFormat",))),
     )
 
 
-def _record_fingerprint_or_raise(record: dict[str, Any], *, account: str = "") -> OrderFingerprint:
-    """只接受能确定收货核心字段的站内记录，避免未知结构被误判为缺失。
+def _record_core(fingerprint: OrderFingerprint) -> tuple[str, str, str]:
+    """可用来判定“是否本批订单”的最小身份：姓名 + 电话 + 预约时间。"""
+    return (fingerprint.receive_name, fingerprint.receive_phone,
+            fingerprint.expected_delivery_time)
 
-    列表接口本身按当前登录账号隔离；若记录没有暴露账号字段，用本次任务的
-    账号兜底，避免把“字段缺失”误判成“不同账号订单”。
+
+def _address_combo(fingerprint: OrderFingerprint) -> str:
+    """把地址折成单一串：``addressDetail + doorNum``。
+
+    列表接口把两者拼成一整串（``recipientAddress``），下单报文则分开存放，
+    统一折叠后即可比较；返回空串表示该侧未提供地址。
     """
-    fingerprint = _order_record_fingerprint(record, account=account)
-    if all((fingerprint.receive_name, fingerprint.receive_phone,
-            fingerprint.door_num, fingerprint.expected_delivery_time)):
-        return fingerprint
-    raise LookupError("订单列表记录缺少姓名、电话、门牌或预约送达时间，无法安全对账："
-                      + json.dumps(record, ensure_ascii=False)[:300])
+    return (_normalise_text(fingerprint.address_detail, compact=True)
+            + _normalise_text(fingerprint.door_num, compact=True))
+
+
+def _addresses_compatible(record_address: str, task_address: str) -> bool:
+    """地址是否指向同一处：折叠后相等，或一方包含另一方。
+
+    列表接口的地址是整串拼接（可能带省市区前缀、空格或“号”等尾缀），而任务
+    地址由 ``addressDetail`` 与门牌拼成，两边很难逐字相等；用包含关系兼容
+    这些格式差异，避免把同一订单误判成“其他订单”而重复提交。
+    """
+    if record_address == task_address:
+        return True
+    return record_address in task_address or task_address in record_address
+
+
+def _fingerprint_compatibility(record: OrderFingerprint,
+                               task: OrderFingerprint) -> tuple[bool, bool]:
+    """比较站内记录与某条任务指纹，返回 ``(是否冲突, 是否因缺字段无法判定)``。
+
+    列表接口只返回概要字段，因此缺失的字段一律忽略（视为“未提供”），不能
+    当成“不同”；只有站内明确给出、且与任务不一致的字段才算冲突。地址是
+    判断归属的关键，记录缺少地址时标记为无法判定，由调用方 fail-closed。
+    """
+    record_address = _address_combo(record)
+    task_address = _address_combo(task)
+    if task_address and not record_address:
+        return False, True
+    if record_address and task_address and not _addresses_compatible(
+            record_address, task_address):
+        return True, False
+    for name in ("area_code", "lnt", "lat", "store_id", "goods_name",
+                 "goods_num", "order_type", "account"):
+        on_site = getattr(record, name)
+        expected = getattr(task, name)
+        if not on_site:
+            continue
+        if expected and on_site != expected:
+            return True, False
+    return False, False
 
 
 def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
@@ -921,53 +1101,130 @@ def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | 
             except (TypeError, ValueError):
                 total = None
             return ([item for item in records if isinstance(item, dict)], total)
+        # 服务端对不支持的过滤参数返回 success:true + 无 records 的空壳
+        # （2026-09-10 实测：带 startTime/endTime/statusList 即如此）。调用方
+        # 已改为无过滤参数 + 本地过滤；此处保留 fail-closed，但报错必须点名
+        # 结构，避免与“真的零订单”混淆。
+        if isinstance(container, dict) and container:
+            raise LookupError(
+                "订单列表响应缺少 records/list（服务端可能不支持本次查询参数"
+                "或结构已变化），为避免重复下单已停止")
     raise LookupError("订单列表响应缺少 records/list")
 
 
-def _delivery_day_bounds(delivery_time: str) -> tuple[int, int]:
-    try:
-        day = _dt.date.fromisoformat(delivery_time[:10])
-    except ValueError as exc:
-        raise LookupError(f"预约送达时间格式异常：{delivery_time}") from exc
-    china_tz = _dt.timezone(_dt.timedelta(hours=8))
-    start = _dt.datetime.combine(day, _dt.time.min, tzinfo=china_tz)
-    end = start + _dt.timedelta(days=1)
-    return int(start.timestamp() * 1000), int(end.timestamp() * 1000)
+def _build_list_prefilter(tasks: list[dict[str, Any]],
+                          *,
+                          now: _dt.datetime | None = None) -> dict[str, Any]:
+    """按目标送达日构造「服务端预筛」查询参数（epoch 毫秒时间窗）。
+
+    2026-09-10 实测纠正了此前「服务端不支持时间过滤」的结论：服务端字段名是
+    ``startTime``/``endTime``，**必须是 epoch 毫秒**（传字符串会被 Spring 以
+    ``BindException`` 拒绝），而 ``statusList`` 才是真的无效。实测同一账号
+    一次对账由 23 页/46s 降到 1 页/1.7s，且过滤后的记录跑原有对账逻辑结论
+    完全一致。
+
+    窗口在目标日基础上前后各放宽 ``_SERVER_PREFILTER_MARGIN_DAYS`` 天：订单
+    创建时间可能早于或晚于预约送达日，放宽只是多取几条，真正的判定依然由
+    本地按送达日/状态过滤负责。
+
+    **刻意不带 ``status`` 参数**：2026-09-11 实测送达日 09-10 的订单全部是
+    ``status=3``（已发单），而目标日 09-11 的订单是 ``status=2``。也就是说
+    同一批订单在派发后会从 2 变成 3，硬编码 ``status=2`` 会把这批订单直接
+    筛没、误判成「缺失」。``statusList`` 又无效、``status`` 是单值，无法
+    一次查多个状态，因此只按时间窗预筛。
+    """
+    days: list[_dt.date] = []
+    for task in tasks:
+        fingerprint = task.get("fingerprint") if isinstance(task, dict) else None
+        raw = str(getattr(fingerprint, "expected_delivery_time", "") or "")[:10]
+        try:
+            days.append(_dt.datetime.strptime(raw, "%Y-%m-%d").date())
+        except ValueError:
+            continue
+    if not days:
+        return {}
+
+    margin = _dt.timedelta(days=max(0, _SERVER_PREFILTER_MARGIN_DAYS))
+    timezone = (now or _dt.datetime.now()).astimezone().tzinfo or _dt.timezone.utc
+    start = _dt.datetime.combine(min(days) - margin, _dt.time.min, tzinfo=timezone)
+    end = _dt.datetime.combine(max(days) + margin, _dt.time.max, tzinfo=timezone)
+    return {
+        "startTime": int(start.timestamp() * 1000),
+        "endTime": int(end.timestamp() * 1000),
+    }
 
 
 def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
-                         tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """按预约日期分页查询所有活跃状态订单，不发任何写请求。"""
-    # 同一天的午餐/晚餐共用一次列表查询，避免把同一页记录重复计入对账。
-    dates = sorted({_task_fingerprint(task).expected_delivery_time[:10] for task in tasks})
+                         tasks: list[dict[str, Any]],
+                         *,
+                         prefilter: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """分页拉取订单列表并在本地按预约日期/状态过滤，不发任何写请求。
+
+    ``prefilter`` 非空时只作为服务端粗筛条件（缩小翻页范围）；无论服务端返回
+    什么，送达日与活跃状态的判定一律由本地过滤负责，判定标准不因预筛改变。
+    """
+    wanted_days = {_task_fingerprint(task).expected_delivery_time[:10] for task in tasks}
     records: list[dict[str, Any]] = []
-    for delivery_time in dates:
-        start_time, end_time = _delivery_day_bounds(delivery_time)
-        page_no = 1
-        page_size = 100
-        while page_no <= 100:
-            query = urlencode({
-                "pageNo": page_no,
-                "pageSize": page_size,
-                "sortType": 1,
-                "sort": 1,
-                "startTime": start_time,
-                "endTime": end_time,
-                "statusList": [0, 1, 2],
-            }, doseq=True)
-            payload = fetch_json(f"{_ORDER_LIST_PATH}?{query}")
-            if payload.get("success") is False:
-                raise LookupError(str(payload.get("message") or "订单列表查询失败"))
+    page_no = 1
+    page_size = _LIST_PAGE_SIZE
+    sweep_started = time.perf_counter()
+    page_count = 0
+    prefilter_active = bool(prefilter)
+    while page_no <= 100:
+        query = urlencode({
+            "pageNo": page_no,
+            "pageSize": page_size,
+            "sortType": 1,
+            "sort": 1,
+            **(prefilter or {}),
+        })
+        page_started = time.perf_counter()
+        payload = fetch_json(f"{_ORDER_LIST_PATH}?{query}")
+        page_seconds = time.perf_counter() - page_started
+        page_count += 1
+        if payload.get("success") is False:
+            raise LookupError(str(payload.get("message") or "订单列表查询失败"))
+        try:
             page_records, total = _list_records(payload)
-            records.extend(page_records)
-            if not page_records or len(page_records) < page_size:
-                break
-            if total is not None and len(page_records) + (page_no - 1) * page_size >= total:
-                break
-            page_no += 1
-        else:
-            raise LookupError("订单列表分页超过 100 页，拒绝继续下单")
+        except LookupError:
+            # 服务端对某些查询参数返回 success:true 的「空壳」（无 records）。
+            # 埋点里连同完整查询串与原始报文一起记录，便于定位是哪个参数触发。
+            _trace(f"list page {page_no} 结构异常，查询串={query} "
+                   f"原始报文={json.dumps(payload, ensure_ascii=False)[:400]}")
+            raise
+        _trace(f"list page {page_no}: {page_seconds:.2f}s 返回 {len(page_records)} 条 total={total}")
+        if not page_records:
+            break
+        for record in page_records:
+            if _record_active_for_days(record, wanted_days):
+                records.append(record)
+        if len(page_records) < page_size:
+            break
+        if total is not None and page_no * page_size >= total:
+            break
+        page_no += 1
+    else:
+        raise LookupError("订单列表分页超过 100 页，拒绝继续下单")
+    _trace(f"list sweep 结束：{page_count} 页 {time.perf_counter() - sweep_started:.1f}s，"
+           f"命中目标日 {len(records)} 条，预筛={'开' if prefilter_active else '关'}")
     return records
+
+
+def _record_active_for_days(record: dict[str, Any], wanted_days: set[str]) -> bool:
+    """本地过滤：预约送达日在目标日期内且状态为活跃（未取消/未退款）。"""
+    raw_expected = _pick(record, ("expectedDeliveryTime", "expected_delivery_time",
+                                  "appointmentTime", "appointment_time"))
+    day = _normalise_delivery_time(raw_expected)[:10]
+    if day not in wanted_days:
+        return False
+    status = _pick(record, ("status", "orderStatus", "state"))
+    try:
+        code = int(str(status).strip())
+    except (TypeError, ValueError):
+        # 状态不可读时按“不排除”处理，避免字段缺失导致整批误判缺失。
+        return True
+    # 取消/退款/忽略类状态不计入在途；其余一律视为活跃。
+    return code not in _INACTIVE_ORDER_STATUS
 
 
 def _record_created_timestamp(record: dict[str, Any]) -> float | None:
@@ -996,31 +1253,63 @@ def _record_created_timestamp(record: dict[str, Any]) -> float | None:
 def _reconcile_tasks(tasks: list[dict[str, Any]],
                      fetch_json: Callable[[str], dict[str, Any]],
                      *, created_after: float | None = None,
-                     created_before: float | None = None) -> _Reconciliation:
-    """按完整 ``OrderFingerprint`` 多重集合对账。
+                     created_before: float | None = None,
+                     prefilter: dict[str, Any] | None = None) -> _Reconciliation:
+    """按订单身份对账，兼容列表接口的概要结构。
+
+    匹配以「姓名 + 电话 + 预约时间」为核心；站内明确给出、却与任务不一致的
+    字段（门店/商品/坐标等）判定为他人订单而忽略；站内未返回的字段视为
+    “未提供”而不参与比较。地址是归属的关键：若记录疑似本批订单却缺少地址，
+    则无法安全判定，直接 fail-closed，绝不猜测。
 
     ``created_after``/``created_before`` 用于收尾对账时只接受本批次时间窗口
-    内创建的订单；站内记录缺少创建时间时无法证明归属，按“不排除”处理并由
-    完整指纹兜底，避免因列表 schema 缺失字段导致整批误判缺失。
+    内创建的订单；站内记录缺少创建时间时无法证明归属，按“不排除”处理。
+
+    ``prefilter`` 只是服务端粗筛（参见 ``_build_list_prefilter``），不改变
+    任何本地判定标准。
     """
     expected = Counter(_task_fingerprint(task) for task in tasks)
     waiting: dict[OrderFingerprint, list[dict[str, Any]]] = {}
+    by_core: dict[tuple[str, str, str], list[OrderFingerprint]] = {}
     for task in tasks:
-        waiting.setdefault(_task_fingerprint(task), []).append(task)
+        fingerprint = _task_fingerprint(task)
+        waiting.setdefault(fingerprint, []).append(task)
+    for fingerprint in expected:
+        by_core.setdefault(_record_core(fingerprint), []).append(fingerprint)
     expected_accounts = {fingerprint.account for fingerprint in expected if fingerprint.account}
     fallback_account = next(iter(expected_accounts)) if len(expected_accounts) == 1 else ""
 
     actual = Counter()
-    for record in _list_pending_orders(fetch_json, tasks):
+    for record in _list_pending_orders(fetch_json, tasks, prefilter=prefilter):
         created_at = _record_created_timestamp(record)
         if created_at is not None:
             if created_after is not None and created_at < created_after:
                 continue
             if created_before is not None and created_at > created_before:
                 continue
-        fingerprint = _record_fingerprint_or_raise(record, account=fallback_account)
-        if fingerprint in expected:
-            actual[fingerprint] += 1
+        fingerprint = _order_record_fingerprint(record, account=fallback_account)
+        core = _record_core(fingerprint)
+        if not all(core):
+            # 连姓名/电话/预约时间都读不出，无法排除是本批订单，必须 fail-closed。
+            raise LookupError("订单列表记录缺少姓名、电话或预约送达时间，无法安全对账："
+                              + json.dumps(record, ensure_ascii=False)[:300])
+        candidates = by_core.get(core, [])
+        matched: OrderFingerprint | None = None
+        undecidable = False
+        for candidate in candidates:
+            conflict, unknown = _fingerprint_compatibility(fingerprint, candidate)
+            if unknown:
+                undecidable = True
+                continue
+            if not conflict:
+                matched = candidate
+                break
+        if matched is not None:
+            actual[matched] += 1
+        elif undecidable:
+            raise LookupError("订单列表记录疑似本批订单但缺少地址等字段，无法安全对账："
+                              + json.dumps(record, ensure_ascii=False)[:300])
+        # 否则：与同人同时间的任务在已知字段上冲突，判定为其他订单，忽略。
 
     confirmed: set[str] = set()
     missing: list[dict[str, Any]] = []
@@ -1063,17 +1352,21 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     def run_one(task: dict[str, Any]) -> tuple[str, str, str]:
         if stop_event.is_set():
             return task["identifier"], "stopped", ""
+        started = time.perf_counter()
         try:
             _check_success(submit(task["payload"]))
         except _AuthExpired as exc:
-            return task["identifier"], "auth", str(exc)
+            state, detail = "auth", str(exc)
         except _BalanceDepleted as exc:
-            return task["identifier"], "balance", str(exc)
+            state, detail = "balance", str(exc)
         except (_SubmissionUncertain, SssTransportError) as exc:
-            return task["identifier"], "uncertain", str(exc)
+            state, detail = "uncertain", str(exc)
         except Exception as exc:
-            return task["identifier"], "failure", str(exc)
-        return task["identifier"], "success", ""
+            state, detail = "failure", str(exc)
+        else:
+            state, detail = "success", ""
+        _trace(f"POST {task['identifier']}: {time.perf_counter() - started:.2f}s -> {state}")
+        return task["identifier"], state, detail
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         exhausted = False
@@ -1147,7 +1440,7 @@ def query_balance(fetch_json: Callable[[str], dict[str, Any]]) -> tuple[float | 
 def _format_balance(total: float | None, frozen: float | None) -> str:
     """余额日志一行：查不到时如实说明，不编造数字。"""
     if total is None:
-        return "账户余额查询失败（接口异常），继续下单"
+        return "账户余额查询失败（接口异常），本批将停止提交"
     if frozen is None:
         return f"账户可用余额：{total}"
     return f"账户可用余额：{total}（冻结 {frozen}）"
@@ -1189,29 +1482,88 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
                     label: str,
                     *,
                     created_after: float | None = None,
-                    attempts: int = 1) -> _Reconciliation | None:
-    """只读对账；列表延迟时有限轮询，绝不因“暂时查不到”而重发 POST。"""
+                    attempts: int = 1,
+                    prefilter: dict[str, Any] | None = None,
+                    zero_retry_delay: float | None = None) -> _Reconciliation | None:
+    """只读对账；列表延迟时有限轮询，绝不因“暂时查不到”而重发 POST。
+
+    ``prefilter`` 非空时先用服务端粗筛对账；只要粗筛没有得出「全部匹配」，
+    就再用无过滤的全量扫描复核一次，以全量结论为准。这样即使服务端将来
+    忽略或改变时间窗语义，最坏结果只是多扫一遍，绝不会因为预筛把订单
+    筛没而误判「缺失」。
+
+    ``zero_retry_delay`` 为秒数时：预筛窗口返回「一条都没有」会先等这么久
+    再重查一次，用于覆盖「刚写入、列表还读不到」的情况。只应在**提交后**的
+    对账里启用——提交前站内本就没有本批订单，重查纯属浪费。
+    """
+    if prefilter is None and _SSS_SERVER_PREFILTER:
+        prefilter = _build_list_prefilter(tasks)
+    if prefilter:
+        _trace(f"{label} 服务端预筛窗口 startTime={prefilter.get('startTime')} "
+               f"endTime={prefilter.get('endTime')}")
     attempts = max(1, int(attempts))
     last: _Reconciliation | None = None
+    last_error = ""
+    zero_retry_done = False
     for attempt in range(attempts):
         try:
-            reconciliation = _reconcile_tasks(tasks, fetch_json, created_after=created_after)
+            reconciliation = _reconcile_tasks(tasks, fetch_json, created_after=created_after,
+                                              prefilter=prefilter)
         except Exception as exc:
+            last_error = str(exc)
             if attempt + 1 < attempts:
                 _emit(callback, f"{label}第 {attempt + 1} 次查询失败：{exc}；"
                                 f"{_RECONCILE_POLL_INTERVAL_S:g}s 后只读复查")
                 time.sleep(_RECONCILE_POLL_INTERVAL_S)
                 continue
-            _emit(callback, f"{label}失败：{exc}；为避免重复下单，后续不会自动提交")
+            reconciliation = None
+        # 预筛窗口一条都没查到、而目标批次非空：很可能是「刚写入还没被列表读到」。
+        # 先做一次短暂重查，把这种情况和「窗口真的为空」区分开；这次重查不占用
+        # attempts 配额，因此后面仍会正常进入全量兜底。
+        if (zero_retry_delay is not None and reconciliation is not None and prefilter
+                and not zero_retry_done and reconciliation.matched_count == 0
+                and len(reconciliation.missing) == len(tasks)):
+            zero_retry_done = True
+            _emit(callback, f"{label}：服务端预筛窗口内 0 条，"
+                            f"{zero_retry_delay:g}s 后重查一次"
+                            f"（可能是刚写入尚未可见）")
+            time.sleep(zero_retry_delay)
+            try:
+                reconciliation = _reconcile_tasks(
+                    tasks, fetch_json, created_after=created_after, prefilter=prefilter)
+            except Exception as exc:
+                last_error = str(exc)
+                reconciliation = None
+        if reconciliation is not None:
+            last_error = ""
+            _emit_reconciliation(callback, label, reconciliation, len(tasks))
+            last = reconciliation
+            if not reconciliation.missing:
+                return reconciliation
+            if attempt + 1 < attempts:
+                _emit(callback, f"{label}暂缺 {len(reconciliation.missing)} 单，"
+                                f"{_RECONCILE_POLL_INTERVAL_S:g}s 后只读复查（不重发 POST）")
+                time.sleep(_RECONCILE_POLL_INTERVAL_S)
+                continue
+        # 轮询用尽仍有缺失或查询报错：若这次用了服务端预筛，先用无过滤的全量
+        # 扫描确认不是预筛窗口/参数把站内订单挡住，再以全量结论为准。
+        if not prefilter:
+            break
+        why = (f"缺少 {len(reconciliation.missing)} 单" if reconciliation is not None
+               else f"查询失败（{last_error}）")
+        _emit(callback, f"{label}：服务端预筛{why}，正在用无过滤全量扫描复核")
+        try:
+            full = _reconcile_tasks(tasks, fetch_json, created_after=created_after)
+        except Exception as exc:
+            _emit(callback, f"{label}全量复核失败：{exc}；为避免重复下单，后续不会自动提交")
             return None
-        _emit_reconciliation(callback, label, reconciliation, len(tasks))
-        last = reconciliation
-        if not reconciliation.missing:
-            return reconciliation
-        if attempt + 1 < attempts:
-            _emit(callback, f"{label}暂缺 {len(reconciliation.missing)} 单，"
-                            f"{_RECONCILE_POLL_INTERVAL_S:g}s 后只读复查（不重发 POST）")
-            time.sleep(_RECONCILE_POLL_INTERVAL_S)
+        _emit_reconciliation(callback, label, full, len(tasks))
+        if reconciliation is not None and len(full.confirmed) != len(reconciliation.confirmed):
+            _emit(callback, f"{label}：全量复核确认为 {len(full.confirmed)}/{len(tasks)} 单，"
+                            f"以全量结果为准")
+        return full
+    if last is None:
+        _emit(callback, f"{label}失败：{last_error}；为避免重复下单，后续不会自动提交")
     return last
 
 
@@ -1315,7 +1667,8 @@ def _run_reconciled_submission(
     poll_attempts = _RECONCILE_POLL_ATTEMPTS if not (stop_event.is_set() or balance_error) else 1
     final_current = _safe_reconcile(
         current, fetch_json, callback, "收尾站内对账",
-        created_after=batch_window_start, attempts=poll_attempts)
+        created_after=batch_window_start, attempts=poll_attempts,
+        zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
     if final_current is None:
         stop_event.set()
         return None, False
@@ -1342,7 +1695,8 @@ def _run_reconciled_submission(
             continue
         before_retry = _safe_reconcile(
             current, fetch_json, callback, "重试前站内对账",
-            created_after=batch_window_start, attempts=_RECONCILE_POLL_ATTEMPTS)
+            created_after=batch_window_start, attempts=_RECONCILE_POLL_ATTEMPTS,
+            zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
         if before_retry is None:
             stop_event.set()
             return None, False
@@ -1365,7 +1719,8 @@ def _run_reconciled_submission(
         final_current = _safe_reconcile(
             current, fetch_json, callback, "重试后站内对账",
             created_after=batch_window_start,
-            attempts=1 if stop_event.is_set() else _RECONCILE_POLL_ATTEMPTS)
+            attempts=1 if stop_event.is_set() else _RECONCILE_POLL_ATTEMPTS,
+            zero_retry_delay=_PREFILTER_ZERO_RETRY_DELAY_S)
         if final_current is None:
             stop_event.set()
             return None, False
@@ -1528,8 +1883,36 @@ def run_sss_job(config: Any, stop_event: Any,
                 estimate = round(unit_price * len(tasks), 2)
                 _emit(progress_callback,
                       f"本批 {len(tasks)} 单预计送完结算约 {estimate} 元"
-                      + (f"，当前可用 {balance_total}，结算时请留意充值"
-                         if balance_total is not None and balance_total < estimate else ""))
+                      + (f"，当前可用 {balance_total}"
+                         if balance_total is not None else "，当前余额未知"))
+
+            balance_status, estimate = _balance_precheck(
+                tasks, balance_total, unit_price, progress_callback)
+            if balance_status != "ok":
+                return {
+                    "status": balance_status,
+                    "processed": len(tasks), "created": 0, "submitted": 0,
+                    "previewed": 0, "stopped": True, "partial": False,
+                    "reconciled": False, "uncertain": balance_status == "balance_unknown",
+                    "estimate": estimate,
+                    "semantics": "pre-submit-balance-guard",
+                }
+
+            if bool(getattr(config, "sss_preflight", False)):
+                preflight_status, preflight = _preflight_tasks(
+                    tasks, client.get_json, progress_callback)
+                return {
+                    "status": preflight_status,
+                    "processed": len(tasks),
+                    "created": len(preflight.confirmed) if preflight else 0,
+                    "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
+                    "partial": False,
+                    "reconciled": preflight is not None,
+                    "uncertain": preflight is None,
+                    "balance_total": balance_total,
+                    "estimate": estimate,
+                    "semantics": "preflight-only",
+                }
 
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
@@ -1600,7 +1983,6 @@ def run_sss_job(config: Any, stop_event: Any,
     with sync_playwright() as playwright:
         browser = _launch_browser(
             playwright,
-            getattr(config, "browser_mode", "auto"),
             bool(getattr(config, "headless", False)),
         )
         page = browser.new_page()
@@ -1635,8 +2017,13 @@ def run_sss_job(config: Any, stop_event: Any,
                       f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
                 return store_id, address
 
-            store_id, address = _with_auth_relogin(
-                prepare_browser_session_data, relogin_browser,
+            def prepare_browser_session_data_with_balance() -> tuple[
+                    int, dict[str, Any], tuple[float | None, float | None]]:
+                store_id, address = prepare_browser_session_data()
+                return store_id, address, query_balance(fetch_json)
+
+            store_id, address, (balance_total, balance_frozen) = _with_auth_relogin(
+                prepare_browser_session_data_with_balance, relogin_browser,
                 progress_callback, "读取门店/地址")
 
             tasks = _collect_tasks(
@@ -1646,6 +2033,36 @@ def run_sss_job(config: Any, stop_event: Any,
                 _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
             else:
                 _emit(progress_callback, "平台接口未探测到客户端幂等字段：采用“至少一次提交 + 对账确认”语义，不承诺 exactly-once")
+            try:
+                unit_price = float(getattr(config, "sss_unit_price", 0) or 0)
+            except (TypeError, ValueError):
+                unit_price = 0
+            balance_status, estimate = _balance_precheck(
+                tasks, balance_total, unit_price, progress_callback)
+            if balance_status != "ok":
+                return {
+                    "status": balance_status,
+                    "processed": len(tasks), "created": 0, "submitted": 0,
+                    "previewed": 0, "stopped": True, "partial": False,
+                    "reconciled": False, "uncertain": balance_status == "balance_unknown",
+                    "estimate": estimate,
+                    "semantics": "pre-submit-balance-guard",
+                }
+            if bool(getattr(config, "sss_preflight", False)):
+                preflight_status, preflight = _preflight_tasks(
+                    tasks, fetch_json, progress_callback)
+                return {
+                    "status": preflight_status,
+                    "processed": len(tasks),
+                    "created": len(preflight.confirmed) if preflight else 0,
+                    "submitted": 0, "previewed": 0, "stopped": preflight_status != "preflight_ok",
+                    "partial": False,
+                    "reconciled": preflight is not None,
+                    "uncertain": preflight is None,
+                    "balance_total": balance_total,
+                    "estimate": estimate,
+                    "semantics": "preflight-only",
+                }
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行")
             submit_start = time.perf_counter()
