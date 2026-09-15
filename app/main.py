@@ -74,6 +74,7 @@ def main() -> None:
         return
     if "--self-check" in sys.argv:
         # 更新替换前由 updater 调用：只验证打包产物能导入关键模块，不启动 GUI。
+        import app.artifact_store  # noqa: F401
         import app.automation  # noqa: F401
         import app.bridge  # noqa: F401
         import app.excel_templates  # noqa: F401
@@ -87,6 +88,25 @@ def main() -> None:
         )
         from . import __version__
         print(f"self-check OK {__version__}")
+        return
+    if "--compact-artifacts" in sys.argv:
+        # 上下文自适应压缩：把用户配置目录里的诊断产物（logs/ 证据快照、update.log）
+        # 控制在预算内。``--dry-run`` 只打印计划不动手。
+        from .artifact_store import DEFAULT_POLICY, enforce_budget
+
+        dry_run = "--dry-run" in sys.argv
+        report = enforce_budget(dry_run=dry_run)
+        print(f"受管目录：{report.root}")
+        print(f"预算：{DEFAULT_POLICY.budget_bytes // (1024 * 1024)} MiB "
+              f"（逼近 {DEFAULT_POLICY.trigger_ratio:.0%} 触发，"
+              f"压到 {DEFAULT_POLICY.target_ratio:.0%} 以下）")
+        print(report.summary())
+        for action in report.actions:
+            print(f"  · {action.label}")
+        for failure in report.failed:
+            print(f"  ! {failure}")
+        if report.over_budget:
+            print("警告：受管目录仍高于预算，可能还有程序正在写入这些文件。")
         return
     if "--wps-check" in sys.argv:
         # 打包后自检：确认随包分发的 kdocs-cli 能被找到、授权状态可读，
