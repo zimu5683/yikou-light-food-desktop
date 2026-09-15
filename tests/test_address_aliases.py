@@ -39,3 +39,17 @@ def test_write_pending_atomically_replaces_previous_report(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["target_date"] == "2026-09-07"
     assert payload["items"] == [{"raw_address": "地址"}]
+
+
+# ----------------------------------------------------------------------
+# 改动前完全未被引用的两个路径辅助
+# ----------------------------------------------------------------------
+def test_alias_and_pending_paths_live_side_by_side():
+    from app.address_aliases import aliases_path, pending_path
+
+    aliases = aliases_path()
+    pending = pending_path()
+
+    assert aliases.name == "address_aliases.json"
+    assert pending.name == "pending_addresses.json"
+    assert aliases.parent == pending.parent, "两个文件必须放在同一个配置目录下"

@@ -810,3 +810,50 @@ def test_clear_deletes_rows_and_shrinks_sheet():
     assert ws.max_row == 2
     assert ws["A1"].value == "东湖晚餐"
     assert ws.cell(2, 1).value == "订单"
+
+
+# ----------------------------------------------------------------------
+# 改动前完全未被引用的两个纯函数
+# ----------------------------------------------------------------------
+def test_split_text_and_number_separates_letters_from_digits():
+    """把「地址/楼号」拆成（非数字部分, 数字部分）—— 排序键要用。"""
+    from app.processing import split_text_and_number
+
+    assert split_text_and_number("b2") == ("b", "2")
+    assert split_text_and_number("A10号楼") == ("A号楼", "10")   # 数字全部抽走
+    assert split_text_and_number("医 3号") == ("医 号", "3")
+    assert split_text_and_number("123") == ("", "123")
+    assert split_text_and_number("纯文字") == ("纯文字", "")
+
+
+def test_split_text_and_number_handles_empty_input():
+    from app.processing import split_text_and_number
+
+    assert split_text_and_number(None) == ("", "")
+    assert split_text_and_number("") == ("", "")
+    assert split_text_and_number("   ") == ("", "")
+
+
+def test_get_weekday_fill_value_marks_tomorrow():
+    """协作者的通讯记号写的是**运行日的次日**周几（周日跑 → 周一）。"""
+    import datetime as dt
+
+    from app.processing import get_weekday_fill_value
+
+    names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    for offset in range(7):
+        day = dt.datetime(2026, 9, 14) + dt.timedelta(days=offset)   # 9.14 是周一
+        marks = get_weekday_fill_value(day)
+        assert set(marks) == set(names), "七个键必须都在（未命中的写空串）"
+        marked = [name for name, value in marks.items() if value == 1]
+        assert marked == [names[(day.weekday() + 1) % 7]]
+
+
+def test_get_weekday_fill_value_uses_exactly_one_marker():
+    import datetime as dt
+
+    from app.processing import get_weekday_fill_value
+
+    marks = get_weekday_fill_value(dt.datetime(2026, 9, 20, 23, 59))  # 周日深夜
+    assert marks["周一"] == 1
+    assert [v for k, v in marks.items() if k != "周一"] == [""] * 6

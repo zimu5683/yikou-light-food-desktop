@@ -89,3 +89,72 @@ def test_update_health_marker_roundtrip(tmp_path, monkeypatch):
 
     assert wait_for_health(marker, "token-123", timeout=0.5)
     assert not wait_for_health(marker, "wrong-token", timeout=0.01)
+
+
+# ----------------------------------------------------------------------
+# 改动前完全未被引用的 begin_update_health_check
+# ----------------------------------------------------------------------
+def test_begin_update_health_check_returns_unique_token_and_marker(tmp_path):
+    """更新器靠「唯一 token + 唯一标记文件」区分『二进制已替换』与『GUI 真起来了』。
+
+    token 或路径重复会让健康检查误判成功 → 坏版本不会被回滚。
+    """
+    from app.update_health import begin_update_health_check
+
+    first_token, first_marker = begin_update_health_check(tmp_path)
+    second_token, second_marker = begin_update_health_check(tmp_path)
+
+    assert first_token != second_token
+    assert first_marker != second_marker
+    assert len(first_token) == 32 and all(c in "0123456789abcdef" for c in first_token)
+
+
+def test_begin_update_health_check_places_marker_inside_directory(tmp_path):
+    import os
+    from pathlib import Path
+
+    from app.update_health import begin_update_health_check
+
+    token, marker = begin_update_health_check(tmp_path)
+    path = Path(marker)
+
+    assert path.parent == tmp_path
+    assert str(os.getpid()) in path.name
+    assert token[:8] in path.name
+    # 只算出路径，不该把文件真的建出来（要等 GUI 启动后才写）
+    assert not path.exists()
+
+
+def test_begin_update_health_check_removes_stale_marker(tmp_path, monkeypatch):
+    """同一路径上若已存在陈旧标记，必须被清掉。
+
+    标记名里带随机 token，正常调用永远算不出同一个路径，所以这里把
+    ``secrets.token_hex`` 固定住，专门覆盖那行 ``marker.unlink``。
+    """
+    import os
+    from pathlib import Path
+
+    from app.update_health import begin_update_health_check
+
+    monkeypatch.setattr("app.update_health.secrets.token_hex", lambda _n: "ab" * 16)
+    expected = tmp_path / f".yikou-update-health-{os.getpid()}-abababab.json"
+    expected.write_text("陈旧的标记", encoding="utf-8")
+
+    token, marker = begin_update_health_check(tmp_path)
+
+    assert Path(marker) == expected
+    assert token == "ab" * 16
+    assert not expected.exists(), "陈旧标记必须被清掉，否则会被误判成启动成功"
+
+
+def test_begin_update_health_check_tolerates_missing_directory(tmp_path):
+    """目录不存在时不该抛错（只算路径，不建目录、不建文件）。"""
+    from pathlib import Path
+
+    from app.update_health import begin_update_health_check
+
+    target = tmp_path / "还不存在"
+    _token, marker = begin_update_health_check(target)
+
+    assert Path(marker).parent == target
+    assert not target.exists()

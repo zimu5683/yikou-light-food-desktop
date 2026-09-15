@@ -1548,3 +1548,48 @@ def test_local_filter_keeps_only_wanted_delivery_day():
     result = sss._reconcile_tasks([task], fetch)
     assert result.confirmed == {"t1"}
     assert result.duplicate_count == 0
+
+
+# ----------------------------------------------------------------------
+# 改动前完全未被引用的 expected_delivery_date
+# ----------------------------------------------------------------------
+def test_expected_delivery_date_follows_the_16h_rollover_rule():
+    """16 点后下单顺延次日；午餐与晚餐共用同一条规则（仅时刻不同）。
+
+    云端名单的「识别日期」必须与它一致，否则程序会**拒绝下单**
+    （见 ``sss_import.check_target_day``），所以这条边界要钉死。
+    """
+    import datetime as dt
+
+    from app.sss import expected_delivery_date
+
+    same_day = [0, 9, 15]          # 00:00 ~ 15:59 → 运行日
+    next_day = [16, 19, 20, 23]    # 16:00 ~ 23:59 → 次日
+    for hour in same_day:
+        now = dt.datetime(2026, 9, 15, hour, 30)
+        assert expected_delivery_date(now) == dt.date(2026, 9, 15), hour
+    for hour in next_day:
+        now = dt.datetime(2026, 9, 15, hour, 30)
+        assert expected_delivery_date(now) == dt.date(2026, 9, 16), hour
+
+
+def test_expected_delivery_date_agrees_with_compute_delivery_time():
+    """两者必须永远一致 —— 它们算的是同一件事（日期），只是往返形式不同。"""
+    import datetime as dt
+
+    from app.sss import compute_delivery_time, expected_delivery_date
+
+    for hour in range(24):
+        now = dt.datetime(2026, 9, 15, hour, 0)
+        date_part = expected_delivery_date(now).isoformat()
+        assert compute_delivery_time(False, now).startswith(date_part)
+        assert compute_delivery_time(True, now).startswith(date_part)
+
+
+def test_expected_delivery_date_rolls_over_month_boundary():
+    import datetime as dt
+
+    from app.sss import expected_delivery_date
+
+    assert expected_delivery_date(dt.datetime(2026, 9, 30, 20, 0)) == dt.date(2026, 10, 1)
+    assert expected_delivery_date(dt.datetime(2026, 12, 31, 16, 0)) == dt.date(2027, 1, 1)
