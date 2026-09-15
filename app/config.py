@@ -198,6 +198,9 @@ class AppConfig:
     sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout"
     sss_account: str = ""
     sss_excel_path: Path | None = None
+    # 名单来源：wps = 每次下单前从 WPS 云端读当天标 1 的人（东湖午餐/东湖晚餐）；
+    # excel = 旧行为，读《闪时送.xlsx》。云端模式下标 1 名单仍会写一份到该 Excel 留档。
+    sss_order_source: str = "wps"
     sss_product_name: str = "轻食"
     sss_common_address: str = "嗯哼"
     sss_store_name: str = "一口轻食"
@@ -259,6 +262,7 @@ class AppConfig:
                  sss_url: str = "https://sssplusnew.zhuopaikeji.com/takeout",
                  sss_account: str = "",
                  sss_excel_path: str | os.PathLike[str] = "",
+                 sss_order_source: str = "wps",
                  sss_product_name: str = "轻食",
                  sss_common_address: str = "嗯哼",
                  sss_store_name: str = "一口轻食",
@@ -314,6 +318,9 @@ class AppConfig:
         self.sss_url = sss_url
         self.sss_account = sss_account
         self.sss_excel_path = Path(sss_excel_path) if sss_excel_path else None
+        # 只接受 wps / excel 两个取值；其它（含旧配置缺字段）一律按云端模式。
+        source = str(sss_order_source or "").strip().lower()
+        self.sss_order_source = "excel" if source == "excel" else "wps"
         self.sss_product_name = sss_product_name or "轻食"
         self.sss_common_address = sss_common_address or "嗯哼"
         self.sss_store_name = sss_store_name or "一口轻食"

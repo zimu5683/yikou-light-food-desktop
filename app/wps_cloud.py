@@ -561,6 +561,44 @@ def find_cli(explicit: str | os.PathLike[str] | None = None) -> str:
         "找不到 kdocs-cli 组件。请确认程序完整安装，或在「云文档同步」里手动指定路径。")
 
 
+def effective_tables(config: Any) -> dict[str, dict[str, str]]:
+    """返回当前实际生效的云端目标表，并拒绝过期或越权目标。
+
+    测试模式一律写测试副本（且副本 ID 不能是正式表、也不能是已废弃的试验田）；
+    正式模式只允许写正式表 ID。「闪时送下单」的云端名单读取同样走这里，
+    这样测试模式下读的也是副本，不会拿正式表的数据做实验。
+    """
+    production = {sheet: conf.get("file_id", "") for sheet, conf in
+                  (getattr(config, "wps_production_tables", None) or {}).items()}
+    legacy_test_ids = {
+        "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG",
+        "qFBgqf13GxM7vPUbTSJmxxsrgopD4DnpA",
+        "p9P2p2NFfxMZjLXGZ1fyxxrFTBf9s81Kn",
+        "RBLtXB8x3rMcQhCp6zp11xGBN7Wey2xCD",
+        "afnJ5h5Di1M3U9VwX3rvxx9jpTn8EUw9o",
+        "rxYTF8Juk9MBbhkbfjE9Bx1dQ3vGeZ3zr",
+    }
+    if bool(getattr(config, "wps_test_mode", False)):
+        test = {sheet: str(fid).strip() for sheet, fid in
+                (getattr(config, "wps_test_tables", None) or {}).items()
+                if str(fid).strip()}
+        if not test:
+            raise WpsCloudError("测试模式未配置新的测试副本，拒绝写入；请先从正式表创建副本")
+        # 注意：必须比对正式表的 **file_id 值**，而不是 dict 的键（键是子表名）。
+        stale = {fid for fid in test.values() if fid in set(production.values())}
+        if stale:
+            raise WpsCloudError("测试副本配置包含正式表 ID，拒绝写入")
+        if set(test.values()) & legacy_test_ids:
+            raise WpsCloudError("测试副本配置包含已过期试验田 ID，拒绝写入")
+        return {sheet: {"file_id": fid} for sheet, fid in test.items()}
+    active = {sheet: dict(conf) for sheet, conf in
+              (getattr(config, "wps_tables", None) or {}).items()}
+    active_ids = {conf.get("file_id", "") for conf in active.values()}
+    if active_ids - set(production.values()):
+        raise WpsCloudError("正式模式目标包含非正式表 ID，拒绝写入")
+    return active
+
+
 class KdocsCli:
     """kdocs-cli 的最小封装。"""
 
@@ -1442,8 +1480,16 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                             if str(c.meal_kind).strip() != "豪华"]
                     lux = [c.insert_row or c.row for c in new_changes
                            if str(c.meal_kind).strip() == "豪华"]
-                    ops = build_format_ops(spec, econ_rows=econ, lux_rows=lux,
-                                           col_from=col_lo, col_to=col_hi)
+                    ops = build_format_ops(
+                        spec, econ_rows=econ, lux_rows=lux,
+                        col_from=col_lo, col_to=col_hi,
+                        # A~「餐种」整段刷底色（含日期与类型之间可能夹着的空列）
+                        plain_to=(plan.columns.get("kind")
+                                  or plan.columns.get("type") or 0),
+                        # 金黄带按列身份固定：总餐次 / 已出餐 / 剩余餐
+                        band_cols=tuple(c for c in (plan.columns.get("total"),
+                                                    plan.columns.get("served"),
+                                                    plan.columns.get("left")) if c))
                     cli.write_format_ops(plan.file_id, worksheet_id, ops)
                     emit(f"[云同步] {plan.sheet}：{len(new_changes)} 个新客户已套用"
                          f"表格原有格式（字体/对齐、经济餐照抄模板底色"
@@ -1731,15 +1777,21 @@ def learn_row_format(cli: "KdocsCli", file_id: str, worksheet_id: int, *,
 
 def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
                      lux_rows: Sequence[int],
-                     col_from: int, col_to: int) -> list[dict[str, Any]]:
+                     col_from: int, col_to: int,
+                     plain_to: int = 0,
+                     band_cols: Sequence[int] = ()) -> list[dict[str, Any]]:
     """把"新客户行 × 模板格式"压成尽量少的格式操作。
 
-    - 经济行：**逐列照抄**模板底色（黄带位置与老行一致），相邻同色列合并；
+    - 经济行：**第 A 列 ~ 「餐种」列整段刷成模板底色**（用户 2026-09-15 要求）。
+      原因：日期列与「类型」之间有时夹着一列**空列**，接口不返回空单元格、读不到
+      它的底色，逐列照抄就会漏掉它 —— 那一格于是保留插入时从上一行继承的颜色，
+      看起来就是"有一格没涂到"。整段刷过去就不会再有漏网的列。
+    - 金黄色的三列（总餐次/已出餐/剩余餐）按**列的身份**固定涂金，不依赖模板行
+      那几格有没有内容（实测有客户行的总餐次是空的，模板选到它就学不到金色）。
     - 豪华行：**整行金黄**（名字到备注整段，用户 2026-09-12 确认）；
-    - 相邻的同模式行再合并成行区间。
+    - 相邻同色列再合并成区间。
 
     这样 25 个新行只要 ~1 次接口调用（逐行设格式要 25 次，曾把当日额度打满）。
-    模板里没有底色的列跳过不设（保持插入后的默认白底）。
     """
     base_xf: dict[str, Any] = {"alcH": spec.get("alcH", 2), "alcV": spec.get("alcV", 1)}
     if spec.get("font_name"):
@@ -1766,20 +1818,37 @@ def build_format_ops(spec: Mapping[str, Any], *, econ_rows: Sequence[int],
                 runs.append((value, value))
         return runs
 
-    ops: list[dict[str, Any]] = []
     fills: Mapping[int, str] = spec.get("fills") or {}
+    # 注意：fills 里是 "#AARRGGBB" 字符串，而 fill_default 已经是整数 —— 别再转一次，
+    # 否则 str(4294967295) 会被当十六进制解析成 0x94967295（离线仿真抓到的真实教训）。
+    if fills.get(col_from):
+        base_color = _argb_to_int(str(fills[col_from]))
+    else:
+        base_color = int(spec.get("fill_default") or 0xFFFFFFFF) & 0xFFFFFFFF
+    # 「餐种」列及其左边整段用模板底色；它右边只有金黄三列是特殊的。
+    plain_end = plain_to if col_from <= plain_to <= col_to else col_from - 1
+    band = {int(c) for c in band_cols if col_from <= int(c) <= col_to}
+
+    def color_of(column: int) -> int:
+        if column <= plain_end:
+            return base_color
+        if column in band:
+            return FILL_GOLD
+        learned = fills.get(column)
+        return _argb_to_int(learned) if learned else base_color
+
+    ops: list[dict[str, Any]] = []
     for r0, r1 in _runs(econ_rows):
         col = col_from
         while col <= col_to:
-            color_hex = fills.get(col)
+            color = color_of(col)
             col_end = col
-            while col_end + 1 <= col_to and fills.get(col_end + 1) == color_hex:
+            while col_end + 1 <= col_to and color_of(col_end + 1) == color:
                 col_end += 1
-            if color_hex:
-                ops.append({"opType": "format",
-                            "rowFrom": r0 - 1, "rowTo": r1 - 1,
-                            "colFrom": col - 1, "colTo": col_end - 1,
-                            "xf": _xf(_argb_to_int(color_hex))})
+            ops.append({"opType": "format",
+                        "rowFrom": r0 - 1, "rowTo": r1 - 1,
+                        "colFrom": col - 1, "colTo": col_end - 1,
+                        "xf": _xf(color)})
             col = col_end + 1
     for r0, r1 in _runs(lux_rows):
         ops.append({"opType": "format",

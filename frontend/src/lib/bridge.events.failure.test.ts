@@ -24,7 +24,8 @@ test('listener failure keeps cursor and replays the event', async () => {
       config: {
         target_url: '', phone_number: '', excel_path: '', order_date: '',
         order_count: null, split_ratio: 0.38, sss_url: '', sss_account: '',
-        sss_excel_path: '', sss_product_name: '', sss_common_address: '',
+        sss_excel_path: '', sss_order_source: 'wps' as const,
+        sss_product_name: '', sss_common_address: '',
         sss_use_fixed_address: true, sss_fixed_lnt: 0, sss_fixed_lat: 0,
         sss_fixed_area_code: '', sss_fixed_address_detail: '',
         sss_dry_run: true, api_mode: true,

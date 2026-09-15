@@ -377,9 +377,9 @@ def test_scan_bounds_respects_read_budget():
     assert wc.scan_bounds(None) == (0, 0)
 
 
-# 模板行的颜色分布：A~J 白、K~M 黄、N 白（东湖中餐第 99 行的真实分布）
+# 模板行的颜色分布（对齐 BASE_HEADER 与真实表）：名字~餐种白、总餐次/已出餐/剩余餐金黄、备注白
 TEMPLATE_COLORS = {c: "#FFFFFFFF" for c in range(1, 15)}
-for _c in (11, 12, 13):
+for _c in (8, 9, 10):
     TEMPLATE_COLORS[_c] = "#FFFFC000"
 
 
@@ -419,8 +419,9 @@ def test_learn_row_format_copies_font_and_per_column_fills():
     assert spec["font_size"] == 10
     assert spec["alcH"] == 2 and spec["alcV"] == 1
     assert spec["fills"][1] == "#FFFFFFFF"
-    assert spec["fills"][11] == "#FFFFC000", "K~M 列必须照抄成黄色"
-    assert spec["fills"][14] == "#FFFFFFFF"
+    assert spec["fills"][8] == "#FFFFC000", "总餐次列必须照抄成黄色"
+    assert spec["fills"][9] == "#FFFFC000" and spec["fills"][10] == "#FFFFC000"
+    assert spec["fills"][11] == "#FFFFFFFF", "备注列照抄成白色"
 
 
 def test_learn_row_format_returns_empty_when_no_reference():
@@ -453,11 +454,52 @@ def test_new_rows_copy_template_fills():
     assert (lux[0]["colFrom"], lux[0]["colTo"]) == (0, 10), "豪华餐整行（名字到备注列）金黄"
     assert lux[0]["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY
     white = next(op for op in econ if op["colFrom"] == 0)
-    assert white["colTo"] == 9, "白底列合并成一个区间"
+    assert white["colTo"] == 6, "第 1~7 列（名字~餐种）合并成一个白底区间"
     assert white["xf"]["fill"]["back"]["value"] == wc._argb_to_int("#FFFFFFFF")
     gold = next(op for op in econ
                 if op["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY)
-    assert (gold["colFrom"], gold["colTo"]) == (10, 10), "总餐次列照抄成金黄"
+    assert (gold["colFrom"], gold["colTo"]) == (7, 9), "总餐次~剩余餐 三列金黄"
+
+
+
+
+# 真实表里实测到的写法：日期列与「类型」之间夹着一列空列（正式表 L 列就是它）
+GAPPED_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四", 4: "9.11 周五",
+                 # 第 5 列（0-based）= F 列：表头与数据都没有内容
+                 6: "类型", 7: "餐种", 8: "总餐次", 9: "已出餐", 10: "剩余餐",
+                 11: "备注"}
+
+
+def test_paint_covers_gap_column_between_dates_and_type():
+    """日期与「类型」之间夹着空列时，那一格也必须被涂到。
+
+    用户 2026-09-15 反馈：接口不返回空单元格、读不到它的底色，逐列照抄会漏掉它，
+    于是那一格保留了插入时从上一行继承的颜色。现在改成 A~餐种 整段刷。
+    """
+    cli = TemplateCli(make_grid(GAPPED_HEADER, [
+        {0: "老人", 1: "D1", 2: "111", 3: "1", 4: "1",
+         6: "中餐", 7: "经济", 8: "3", 9: "1", 10: "2", 11: "备注"},
+    ]))
+    plans = _plan(cli, [CloudOrder("东湖中餐", "经济人", "D2", "13900000001",
+                                   "中餐", "经济", 1)], sort=False)
+    plan = plans[0]
+    apply_plan(cli, plans, ledger=None, marker_enabled=False)
+
+    ops = [op for op in cli.format_ops[0] if op["rowFrom"] == 3]
+    covered = set()
+    for op in ops:
+        covered.update(range(op["colFrom"] + 1, op["colTo"] + 2))
+    want = set(range(1, plan.columns["remark"] + 1))
+    assert covered >= want, f"这些列没涂到：{sorted(want - covered)}"
+
+    white = next(op for op in ops if op["colFrom"] == 0)
+    assert white["colTo"] + 1 == plan.columns["kind"], "A~餐种 一整段（含空列）刷底色"
+    assert white["xf"]["fill"]["back"]["value"] == wc._argb_to_int("#FFFFFFFF")
+    gap = next(op for op in ops if op["colFrom"] <= 5 <= op["colTo"])
+    assert gap["xf"]["fill"]["back"]["value"] == wc._argb_to_int("#FFFFFFFF"), \
+        "空列（第 6 列）不能漏掉"
+    gold = next(op for op in ops if op["xf"]["fill"]["back"]["value"] == wc.FILL_LUXURY)
+    assert gold["colFrom"] + 1 == plan.columns["total"], "金黄带从总餐次列开始"
 
 
 # ----------------------------------------------------------------------
@@ -1014,3 +1056,53 @@ def test_interior_blank_row_is_not_dumped_at_table_end():
     names = [cli.grid.get((r, 0)) for r in range(2, 7)]
     assert names == ["甲", "乙", "新人", None, "丙"], f"实际 {names}"
     assert cli.grid.get((5, 11)) == "分隔行", "分隔行留在小组之后、大西之前"
+
+
+# ----------------------------------------------------------------------
+# 生效目标（effective_tables）：闪时送云端名单读取与云同步共用同一份判定
+# ----------------------------------------------------------------------
+
+
+class _Cfg:
+    def __init__(self, **kwargs):
+        self.wps_test_mode = False
+        self.wps_tables = {}
+        self.wps_production_tables = {}
+        self.wps_test_tables = {}
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+PROD = {"东湖中餐": {"file_id": "prod-lunch"},
+        "东湖晚餐": {"file_id": "prod-dinner"}}
+
+
+def test_effective_tables_production_mode():
+    config = _Cfg(wps_tables={"东湖中餐": {"file_id": "prod-lunch"}},
+                  wps_production_tables=PROD)
+    assert wc.effective_tables(config) == {"东湖中餐": {"file_id": "prod-lunch"}}
+
+
+def test_effective_tables_rejects_non_production_id():
+    config = _Cfg(wps_tables={"东湖中餐": {"file_id": "other"}},
+                  wps_production_tables=PROD)
+    with pytest.raises(WpsCloudError, match="非正式表"):
+        wc.effective_tables(config)
+
+
+def test_effective_tables_test_mode_uses_copies_and_rejects_production():
+    config = _Cfg(wps_test_mode=True, wps_production_tables=PROD,
+                  wps_test_tables={"东湖中餐": "copy-lunch"})
+    assert wc.effective_tables(config) == {"东湖中餐": {"file_id": "copy-lunch"}}
+
+    config.wps_test_tables = {}
+    with pytest.raises(WpsCloudError, match="未配置新的测试副本"):
+        wc.effective_tables(config)
+
+    config.wps_test_tables = {"东湖中餐": "prod-lunch"}
+    with pytest.raises(WpsCloudError, match="包含正式表 ID"):
+        wc.effective_tables(config)
+
+    config.wps_test_tables = {"东湖中餐": "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG"}
+    with pytest.raises(WpsCloudError, match="已过期试验田"):
+        wc.effective_tables(config)

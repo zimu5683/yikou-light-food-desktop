@@ -56,11 +56,12 @@ from .config import AppConfig, clamp_split_ratio, default_wps_address_order
 from .credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
 from .excel_templates import write_order_template, write_sss_template
-from .sss import run_sss_job
+from .sss import expected_delivery_date, run_sss_job
+from .sss_import import ImportRefused, prepare_day_orders
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
-                        build_plan, format_plan, read_local_orders,
-                        summarize_plan, target_date_for)
+                        build_plan, effective_tables, format_plan,
+                        read_local_orders, summarize_plan, target_date_for)
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +329,7 @@ class Bridge:
                 "sss_url": config.sss_url,
                 "sss_account": config.sss_account,
                 "sss_excel_path": str(config.sss_excel_path) if config.sss_excel_path else "",
+                "sss_order_source": config.sss_order_source,
                 "sss_product_name": config.sss_product_name,
                 "sss_common_address": config.sss_common_address,
                 "sss_use_fixed_address": config.sss_use_fixed_address,
@@ -426,7 +428,11 @@ class Bridge:
         if not password:
             fields["password"] = {"message": "请输入登录密码"}
         excel_error = _excel_field_error(excel)
-        if excel_error:
+        order_source = str(payload.get("order_source", self._config.sss_order_source) or "").strip().lower()
+        order_source = "excel" if order_source == "excel" else "wps"
+        # 云端模式下《闪时送.xlsx》只是留档目标：没选文件、文件不在也能下单，
+        # 只在下单日志里提示“跳过留档”。本地 Excel 模式仍需严格校验。
+        if order_source == "excel" and excel_error:
             fields["excel"] = {"message": excel_error}
         use_fixed_address = bool(payload.get("use_fixed_address", False))
         fixed_lnt = str(payload.get("fixed_lnt", "")).strip()
@@ -453,6 +459,7 @@ class Bridge:
         # 就地更新并保存：避免全新 AppConfig 把订单处理侧配置重置成默认。
         _apply_sss_payload(self._config, {
             "url": url, "account": account, "excel": excel,
+            "order_source": order_source,
             "product_name": str(payload.get("product_name", "轻食")).strip() or "轻食",
             "common_address": str(payload.get("common_address", "")).strip(),
             "use_fixed_address": use_fixed_address,
@@ -492,6 +499,42 @@ class Bridge:
             return {"ok": False, "reason": "write_failed"}
         return {"ok": True}
 
+    def sss_day_orders(self) -> dict[str, Any]:
+        """读取云端当天名单（东湖午餐/东湖晚餐）并留档，但不下单。
+
+        「闪时送下单」页签的「读取云端当天名单」按钮用它：只读取 + 写留档
+        Excel + 汇报人数，方便下单前先核对日期与名单。任何失败都只返回原因，
+        不会触碰下单流程。
+        """
+        if self.worker_alive():
+            return {"ok": False, "reason": "已有任务正在运行，请先停止后再读取当天名单"}
+        try:
+            day = prepare_day_orders(self._config,
+                                     delivery_date=expected_delivery_date(),
+                                     log=lambda message: self.log(message))
+        except ImportRefused as exc:
+            self.log("读取云端当天名单失败：" + str(exc), "ERROR")
+            return {"ok": False, "reason": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - 界面需要原样原因
+            self.log("读取云端当天名单失败：" + str(exc), "ERROR")
+            return {"ok": False, "reason": str(exc)}
+
+        summary = day.as_summary()
+        parts = []
+        for name, info in (summary.get("meals") or {}).items():
+            if info.get("skipped"):
+                parts.append(f"{name}不下单（{info.get('reason') or '没有当天列'}）")
+            else:
+                parts.append(
+                    f"{name} {info.get('orders', 0)} 人"
+                    f"（标 1 共 {info.get('marked', 0)} 人，"
+                    f"其中 {info.get('skipped_address', 0)} 人地址是大西/小不下单）")
+        self.log(f"云端当天名单 {summary.get('target_date')} "
+                 f"{summary.get('date_text')}：" + ("；".join(parts) or "没有数据"), "OK")
+        if summary.get("archive_error"):
+            self.log("留档 Excel 写入失败：" + str(summary["archive_error"]), "WARN")
+        return {"ok": True, **summary}
+
     def _launch(self, mode: str, config: AppConfig, count: int | None, password: str) -> bool:
         """启动 worker；已有任务时拒绝，返回 False（不覆盖在跑线程）。"""
         with self._worker_lock:
@@ -527,9 +570,18 @@ class Bridge:
                                  captcha_callback=self._sss_captcha,
                                  store_cache_callback=self._remember_sss_store_cache)
             status = result.get("status")
+            source_label = ("本地 Excel" if result.get("source") == "excel"
+                            else "云端当天名单")
             if status == "dry_run":
-                message = (f"闪时送干跑完成：已组装 {result.get('previewed', 0)} 单，"
-                           "未创建真实订单")
+                message = (f"闪时送干跑完成：已组装 {result.get('previewed', 0)} 单"
+                           f"（名单来源：{source_label}），未创建真实订单")
+            elif status == "no_orders":
+                meals = (result.get("import") or {}).get("meals") or {}
+                detail = "；".join(
+                    f"{name}不下单（{info.get('reason') or '没有当天列'}）"
+                    if info.get("skipped") else f"{name} {info.get('orders', 0)} 人"
+                    for name, info in meals.items())
+                message = "闪时送没有需要下单的订单" + (f"：{detail}" if detail else "")
             elif status == "insufficient_balance":
                 message = (f"闪时送已安全停止：余额不足，本批未提交，"
                            f"预计 {result.get('estimate', '?')} 元")
@@ -826,33 +878,8 @@ class Bridge:
         return KdocsCli(self._config.wps_cli_path or None)
 
     def _wps_effective_tables(self) -> dict[str, dict[str, str]]:
-        """返回实际写入目标，并拒绝过期或越权目标。"""
-        production = {s: c.get("file_id", "") for s, c in
-                      self._config.wps_production_tables.items()}
-        legacy_test_ids = {
-            "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG",
-            "qFBgqf13GxM7vPUbTSJmxxsrgopD4DnpA",
-            "p9P2p2NFfxMZjLXGZ1fyxxrFTBf9s81Kn",
-            "RBLtXB8x3rMcQhCp6zp11xGBN7Wey2xCD",
-            "afnJ5h5Di1M3U9VwX3rvxx9jpTn8EUw9o",
-            "rxYTF8Juk9MBbhkbfjE9Bx1dQ3vGeZ3zr",
-        }
-        if self._config.wps_test_mode:
-            test = {s: str(fid).strip() for s, fid in
-                    self._config.wps_test_tables.items() if str(fid).strip()}
-            if not test:
-                raise WpsCloudError("测试模式未配置新的测试副本，拒绝写入；请先从正式表创建副本")
-            stale = {fid for fid in test.values() if fid in production}
-            if stale:
-                raise WpsCloudError("测试副本配置包含正式表 ID，拒绝写入")
-            if set(test.values()) & legacy_test_ids:
-                raise WpsCloudError("测试副本配置包含已过期试验田 ID，拒绝写入")
-            return {s: {"file_id": fid} for s, fid in test.items()}
-        active = {s: dict(c) for s, c in self._config.wps_tables.items()}
-        active_ids = {c.get("file_id", "") for c in active.values()}
-        if active_ids - set(production.values()):
-            raise WpsCloudError("正式模式目标包含非正式表 ID，拒绝写入")
-        return active
+        """返回实际写入目标，并拒绝过期或越权目标（实现在 wps_cloud.effective_tables）。"""
+        return effective_tables(self._config)
 
     def save_wps_config(self, payload: dict[str, Any]) -> dict[str, Any]:
         """保存云文档同步的配置（沿用 AppConfig 的原子保存）。"""
@@ -1469,6 +1496,9 @@ def _apply_sss_payload(cfg: AppConfig, p: dict[str, Any]) -> None:
     excel = str(p.get("excel", "") or "").strip()
     if excel:
         cfg.sss_excel_path = _Path(excel)
+    if "order_source" in p:
+        source = str(p.get("order_source") or "").strip().lower()
+        cfg.sss_order_source = "excel" if source == "excel" else "wps"
     cfg.sss_product_name = str(p.get("product_name", cfg.sss_product_name) or "").strip()
     cfg.sss_common_address = str(p.get("common_address", cfg.sss_common_address) or "").strip()
     use_fixed = bool(p.get("use_fixed_address", cfg.sss_use_fixed_address))

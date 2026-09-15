@@ -39,6 +39,7 @@ try:
         _launch_browser,
     )
     from .locators import SSS_LOCATORS, load_sss_locators
+    from .sss_import import ImportRefused, prepare_day_orders
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from api_client import (ApiError, SssApiClient, SssTransportError,
                             auth_error_message, is_auth_expired_payload)
@@ -49,6 +50,7 @@ except ImportError:  # pragma: no cover - allows ``python app/sss.py``
         _launch_browser,
     )
     from locators import SSS_LOCATORS, load_sss_locators
+    from sss_import import ImportRefused, prepare_day_orders
 
 DEFAULT_SHEETS = ("午餐", "晚餐")
 LUNCH_TIME = "11:00:00"
@@ -244,6 +246,15 @@ def compute_delivery_time(is_dinner: bool, now: _dt.datetime | None = None) -> s
         target_date = now + _dt.timedelta(days=1)
     time_str = DINNER_TIME if is_dinner else LUNCH_TIME
     return target_date.strftime("%Y-%m-%d ") + time_str
+
+
+def expected_delivery_date(now: _dt.datetime | None = None) -> _dt.date:
+    """本次下单会给平台报的送达日期。
+
+    午餐与晚餐使用同一条顺延规则，因此只有时间不同、日期相同；云端名单的
+    「识别日期」必须与它一致，否则拒绝下单（见 ``sss_import.check_target_day``）。
+    """
+    return _dt.date.fromisoformat(compute_delivery_time(False, now)[:10])
 
 
 def _resolve(locators: dict[str, Any] | None, name: str) -> dict[str, Any]:
@@ -621,13 +632,18 @@ def _collect_tasks(orders_by_sheet: dict[str, list[dict[str, Any]]],
                    goods_name: str, *,
                    account: str = "",
                    batch_id: str = "",
-                   idempotency_field: str = "") -> list[dict[str, Any]]:
+                   idempotency_field: str = "",
+                   now: _dt.datetime | None = None) -> list[dict[str, Any]]:
     """把午餐/晚餐两表展平成待下单任务；送达时间每表只算一次。
 
     每条任务带完整 ``OrderFingerprint``（账号/门店/商品/地址/坐标/类型等）
     以及稳定 ``client_request_id``，避免仅凭姓名+电话+门牌+时间误判。
+
+    ``now`` 由调用方传入时复用同一时刻：日期闸门（云端识别日期 vs 送达日期）
+    与报文里的 ``expectedDeliveryTime`` 必须基于同一个瞬间计算，否则在
+    16:00 / 午夜这样的边界上会出现两套日期。
     """
-    now = _dt.datetime.now()
+    now = now or _dt.datetime.now()
     tasks: list[dict[str, Any]] = []
     for sheet_name in DEFAULT_SHEETS:
         orders = orders_by_sheet.get(sheet_name, [])
@@ -1755,7 +1771,16 @@ def run_sss_job(config: Any, stop_event: Any,
                 locators: dict[str, Any] | None = None,
                 captcha_callback: Callable[[bytes], str] | None = None,
                 store_cache_callback: Callable[[str, int], None] | None = None) -> dict[str, Any]:
-    """读取《闪时送.xlsx》并通过接口批量创建预约单。
+    """按配置的名单来源读取当天订单，并通过接口批量创建预约单。
+
+    名单来源（``config.sss_order_source``）：
+
+    - ``wps``（默认）：下单前从 WPS 云端的「东湖中餐 / 东湖晚餐」读取当天
+      （运行时刻 20:00 之后识别次日，其余时刻识别运行日；见
+      ``sss_import.ordering_target_date``）标 ``1`` 的人，地址是「大西 / 小」的不下单；
+      名单直接用内存数据下单，同时写一份到《闪时送.xlsx》留档。云端读不到、
+      数据不完整或「识别日期 ≠ 本次送达日期」时**一律拒绝下单**（不登录、不提交）。
+    - ``excel``：旧行为，读《闪时送.xlsx》（人工准备名单时的兜底）。
 
     ``decision_callback(identifier, error)`` 返回 ``retry``/``skip``/``stop``，
     用于单个订单创建失败时的交互决策（与订单处理的 order_decision 一致）。
@@ -1766,14 +1791,49 @@ def run_sss_job(config: Any, stop_event: Any,
     查询站内订单列表；状态不确定时绝不直接重复 POST。
     """
     load_start = time.perf_counter()
+    now = _dt.datetime.now()
+    source = str(getattr(config, "sss_order_source", "wps") or "wps").strip().lower()
+    if source != "excel":
+        source = "wps"
     configured_excel = getattr(config, "sss_excel_path", None)
-    if not configured_excel:
-        raise FileNotFoundError("尚未选择闪时送 Excel 文件")
-    excel_path = Path(configured_excel)
-    if not excel_path.is_file():
-        raise FileNotFoundError(f"Excel 文件不存在: {excel_path}")
-    if excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
-        raise ValueError("仅支持 .xlsx 和 .xlsm Excel 文件")
+    excel_path = Path(configured_excel) if configured_excel else None
+    import_summary: dict[str, Any] | None = None
+
+    if source == "wps":
+        # 云端当天名单：读云端 → 地址过滤 → 校验 → 留档；任何问题都在这里
+        # 抛 ImportRefused，此时还没有登录、没有提交任何订单。
+        day = prepare_day_orders(config, now=now,
+                                 delivery_date=expected_delivery_date(now),
+                                 log=progress_callback)
+        orders_by_sheet = day.orders_by_sheet
+        import_summary = day.as_summary()
+    else:
+        if excel_path is None:
+            raise FileNotFoundError("尚未选择闪时送 Excel 文件")
+        if not excel_path.is_file():
+            raise FileNotFoundError(f"Excel 文件不存在: {excel_path}")
+        if excel_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+            raise ValueError("仅支持 .xlsx 和 .xlsm Excel 文件")
+        orders_by_sheet = load_sss_orders(excel_path)
+
+    def _result(payload: dict[str, Any]) -> dict[str, Any]:
+        """给结果补上名单来源与云端导入摘要（界面/日志用）。"""
+        payload["source"] = source
+        if import_summary is not None:
+            payload["import"] = import_summary
+        return payload
+
+    _validate_sss_orders(orders_by_sheet)
+    total = sum(len(orders) for orders in orders_by_sheet.values())
+    if total == 0:
+        if source == "wps":
+            _emit(progress_callback,
+                  "当天云端名单为空（没有当天日期列，或标 1 的人都是「大西/小」），本次不下单")
+        else:
+            _emit(progress_callback, "闪时送 Excel 中没有任何订单")
+        return _result({"processed": 0, "created": 0, "status": "no_orders"})
+    _emit(progress_callback,
+          f"读取订单表耗时 {(time.perf_counter() - load_start):.1f} 秒，共 {total} 单")
     if password is None:
         password = ""
     dry_run = bool(getattr(config, "sss_dry_run", False))
@@ -1789,15 +1849,6 @@ def run_sss_job(config: Any, stop_event: Any,
     max_workers = max(1, min(20, max_workers))
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
-
-    orders_by_sheet = load_sss_orders(excel_path)
-    _validate_sss_orders(orders_by_sheet)
-    total = sum(len(orders) for orders in orders_by_sheet.values())
-    if total == 0:
-        _emit(progress_callback, "闪时送 Excel 中没有任何订单")
-        return {"processed": 0, "created": 0}
-    _emit(progress_callback,
-          f"读取订单表耗时 {(time.perf_counter() - load_start):.1f} 秒，共 {total} 单")
 
     # 干跑短路：组装报文即返回，不取验证码、不登录、不查门店地址。
     timeout_ms = int(getattr(config, "element_timeout_ms", 8000))
@@ -1820,8 +1871,8 @@ def run_sss_job(config: Any, stop_event: Any,
         tasks = _collect_tasks(
             orders_by_sheet, store_id, address, goods_name,
             account=str(getattr(config, "sss_account", "") or ""),
-            batch_id=batch_id, idempotency_field=idempotency_field)
-        return _run_dry_run(tasks, progress_callback)
+            batch_id=batch_id, idempotency_field=idempotency_field, now=now)
+        return _result(_run_dry_run(tasks, progress_callback))
 
     if locators is None:
         locators = load_sss_locators()
@@ -1870,7 +1921,8 @@ def run_sss_job(config: Any, stop_event: Any,
 
             tasks = _collect_tasks(
                 orders_by_sheet, store_id, address, goods_name,
-                account=account, batch_id=batch_id, idempotency_field=idempotency_field)
+                account=account, batch_id=batch_id, idempotency_field=idempotency_field,
+                now=now)
             if idempotency_field:
                 _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
             else:
@@ -1889,19 +1941,19 @@ def run_sss_job(config: Any, stop_event: Any,
             balance_status, estimate = _balance_precheck(
                 tasks, balance_total, unit_price, progress_callback)
             if balance_status != "ok":
-                return {
+                return _result({
                     "status": balance_status,
                     "processed": len(tasks), "created": 0, "submitted": 0,
                     "previewed": 0, "stopped": True, "partial": False,
                     "reconciled": False, "uncertain": balance_status == "balance_unknown",
                     "estimate": estimate,
                     "semantics": "pre-submit-balance-guard",
-                }
+                })
 
             if bool(getattr(config, "sss_preflight", False)):
                 preflight_status, preflight = _preflight_tasks(
                     tasks, client.get_json, progress_callback)
-                return {
+                return _result({
                     "status": preflight_status,
                     "processed": len(tasks),
                     "created": len(preflight.confirmed) if preflight else 0,
@@ -1912,7 +1964,7 @@ def run_sss_job(config: Any, stop_event: Any,
                     "balance_total": balance_total,
                     "estimate": estimate,
                     "semantics": "preflight-only",
-                }
+                })
 
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
@@ -1971,7 +2023,7 @@ def run_sss_job(config: Any, stop_event: Any,
                 result["balance_total"] = balance_total
             if end_total is not None:
                 result["balance_end"] = end_total
-            return result
+            return _result(result)
         finally:
             client.close()
 
@@ -2028,7 +2080,8 @@ def run_sss_job(config: Any, stop_event: Any,
 
             tasks = _collect_tasks(
                 orders_by_sheet, store_id, address, goods_name,
-                account=account, batch_id=batch_id, idempotency_field=idempotency_field)
+                account=account, batch_id=batch_id, idempotency_field=idempotency_field,
+                now=now)
             if idempotency_field:
                 _emit(progress_callback, f"已启用客户端幂等字段「{idempotency_field}」")
             else:
@@ -2040,18 +2093,18 @@ def run_sss_job(config: Any, stop_event: Any,
             balance_status, estimate = _balance_precheck(
                 tasks, balance_total, unit_price, progress_callback)
             if balance_status != "ok":
-                return {
+                return _result({
                     "status": balance_status,
                     "processed": len(tasks), "created": 0, "submitted": 0,
                     "previewed": 0, "stopped": True, "partial": False,
                     "reconciled": False, "uncertain": balance_status == "balance_unknown",
                     "estimate": estimate,
                     "semantics": "pre-submit-balance-guard",
-                }
+                })
             if bool(getattr(config, "sss_preflight", False)):
                 preflight_status, preflight = _preflight_tasks(
                     tasks, fetch_json, progress_callback)
-                return {
+                return _result({
                     "status": preflight_status,
                     "processed": len(tasks),
                     "created": len(preflight.confirmed) if preflight else 0,
@@ -2062,7 +2115,7 @@ def run_sss_job(config: Any, stop_event: Any,
                     "balance_total": balance_total,
                     "estimate": estimate,
                     "semantics": "preflight-only",
-                }
+                })
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行")
             submit_start = time.perf_counter()
@@ -2105,11 +2158,11 @@ def run_sss_job(config: Any, stop_event: Any,
         _emit(progress_callback,
               f"闪时送下单完成：确认 {created}/{processed}，"
               f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
-    return {"processed": processed, "created": created,
-            "stopped": stopped, "partial": partial, "reconciled": reconciled,
-            "uncertain": not reconciled,
-            "semantics": ("idempotency-key+reconciliation"
-                          if idempotency_field else "at-least-once+reconciliation")}
+    return _result({"processed": processed, "created": created,
+                    "stopped": stopped, "partial": partial, "reconciled": reconciled,
+                    "uncertain": not reconciled,
+                    "semantics": ("idempotency-key+reconciliation"
+                                  if idempotency_field else "at-least-once+reconciliation")})
 
 
 def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -2118,5 +2171,5 @@ def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, An
 
 
 __all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time",
-           "build_order_payload", "SSS_LOCATORS",
-           "BrowserNotFoundError", "LocatorError"]
+           "expected_delivery_date", "build_order_payload", "SSS_LOCATORS",
+           "ImportRefused", "BrowserNotFoundError", "LocatorError"]

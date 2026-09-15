@@ -223,3 +223,80 @@ def test_dropped_ranges_merge_even_when_critical_pruned_after_logs(tmp_path, mon
     assert dropped["payload"]["first_sequence"] == 1
     assert dropped["payload"]["last_sequence"] == 3
     assert dropped["payload"]["critical_dropped_count"] == 1
+
+
+# ----------------------------------------------------------------------
+# 闪时送云端当天名单：只读取 + 留档，不下单
+# ----------------------------------------------------------------------
+
+
+def test_sss_day_orders_rejects_while_worker_running(tmp_path):
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._worker = _AliveWorker()
+    result = bridge.sss_day_orders()
+    assert result["ok"] is False
+    assert "正在运行" in result["reason"]
+
+
+def test_sss_day_orders_reports_import_refusal(tmp_path, monkeypatch):
+    from app.sss_import import ImportRefused
+
+    def refuse(config, **kwargs):
+        raise ImportRefused("读取云端表「东湖中餐」失败：未授权")
+
+    monkeypatch.setattr("app.bridge.prepare_day_orders", refuse)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    result = bridge.sss_day_orders()
+    assert result["ok"] is False
+    assert "未授权" in result["reason"]
+    logs = [event["payload"]["msg"] for event in bridge.drain_events(0)["events"]
+            if event["event"] == "log"]
+    assert any("读取云端当天名单失败" in line for line in logs)
+
+
+def test_sss_day_orders_returns_counts_and_logs(tmp_path, monkeypatch):
+    import datetime as dt
+
+    from app.sss_import import DayOrders, MealImport
+
+    meals = [
+        MealImport(meal="午餐", table="东湖中餐", date_text="9.16 周三",
+                   marked_total=45, skipped_address=12,
+                   orders=[{"row": 3, "name": "张三", "door": "b2",
+                            "phone": "13800000001"}]),
+        MealImport(meal="晚餐", table="东湖晚餐", skipped=True,
+                   skip_reason="云端表「东湖晚餐」没有 9.16 这一列，当天不送这一餐"),
+    ]
+    day = DayOrders(target_date=dt.date(2026, 9, 16), meals=meals,
+                    orders_by_sheet={"午餐": meals[0].orders, "晚餐": []})
+
+    monkeypatch.setattr("app.bridge.prepare_day_orders",
+                        lambda config, **kwargs: day)
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    result = bridge.sss_day_orders()
+    assert result["ok"] is True
+    assert result["target_date"] == "2026-09-16"
+    assert result["date_text"] == "9.16 周三"
+    assert result["total"] == 1
+    assert result["meals"]["午餐"] == {
+        "table": "东湖中餐", "marked": 45, "skipped_address": 12, "orders": 1,
+        "date_text": "9.16 周三", "skipped": False, "reason": "", "warnings": [],
+    }
+    assert result["meals"]["晚餐"]["skipped"] is True
+    logs = [event["payload"]["msg"] for event in bridge.drain_events(0)["events"]
+            if event["event"] == "log"]
+    assert any("午餐 1 人" in line and "大西/小" in line for line in logs)
+    assert any("晚餐不下单" in line for line in logs)
+
+
+def test_sss_config_defaults_to_wps_source_and_roundtrips(tmp_path):
+    from app.config import AppConfig
+
+    path = tmp_path / "config.json"
+    config = AppConfig(config_path=str(path))
+    assert config.sss_order_source == "wps"
+    config.sss_order_source = "excel"
+    config.save()
+    assert AppConfig.load(path).sss_order_source == "excel"
+    # 非法值一律回落到云端模式
+    assert AppConfig(sss_order_source="weird").sss_order_source == "wps"

@@ -302,26 +302,32 @@ def main() -> int:
         elif seen_tail:
             problems.append(f"清单外地址后面又出现了清单内地址（第 {sequence[idx][0]} 行）")
 
-    # 3) 新行底色：经济餐照抄模板行；豪华餐整行金黄
+    # 3) 新行底色：A~餐种 整段 = 模板行第 A 列的颜色（含日期与类型之间的空列），
+    #    总餐次/已出餐/剩余餐 三列 = 金黄；豪华行整行金黄。
+    #    （2026-09-15 用户要求：不再逐列照抄模板 —— 接口读不到空格的底色。）
+    base_fill = template_fills.get(plan.columns["name"], "")
+    band = {c for c in (plan.columns["total"], plan.columns["served"],
+                        plan.columns["left"]) if c}
+    plain_range = range(1, (plan.columns["remark"] or 15) + 1)
     for change in new_changes:
         row = by_person.get(person_key(change.name, change.phone))
         if not row:
             problems.append(f"新客户 {change.name} 不在表里")
             continue
-        if str(change.meal_kind).strip() == "豪华":
-            for c in range(1, 16):
-                got = cell_fill_hex(cloud.ws.cell(row, c))
+        luxury = str(change.meal_kind).strip() == "豪华"
+        for c in plain_range:
+            got = cell_fill_hex(cloud.ws.cell(row, c))
+            if luxury:
                 if got != f"#{GOLD}":
-                    problems.append(f"{change.name} 豪华行第 {c} 列底色应为金黄，实际 {got or '无'}")
-        else:
-            for c in range(1, 16):
-                want = template_fills.get(c, "")
-                got = cell_fill_hex(cloud.ws.cell(row, c))
-                if is_white(want) and is_white(got):
-                    continue
-                if want != got:
-                    problems.append(f"{change.name} 第 {c} 列底色应为 {want or '无'}，"
+                    problems.append(f"{change.name} 豪华行第 {c} 列底色应为金黄，"
                                     f"实际 {got or '无'}")
+                continue
+            want = f"#{GOLD}" if c in band else base_fill
+            if is_white(want) and is_white(got):
+                continue
+            if (want or "") != (got or ""):
+                problems.append(f"{change.name} 第 {c} 列底色应为 {want or '无'}，"
+                                f"实际 {got or '无'}")
 
     # 4) 新行公式：只统计真实日期列
     date_lo, date_hi = min(plan.date_cols), max(plan.date_cols)

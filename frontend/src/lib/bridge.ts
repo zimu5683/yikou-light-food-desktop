@@ -35,6 +35,8 @@ export interface AppConfigState {
   sss_url: string
   sss_account: string
   sss_excel_path: string
+  /** 名单来源：wps = 下单前从 WPS 云端读当天标 1 的人；excel = 读《闪时送.xlsx》。 */
+  sss_order_source: 'wps' | 'excel'
   sss_product_name: string
   sss_common_address: string
   sss_use_fixed_address: boolean
@@ -134,6 +136,29 @@ export interface WpsResult {
   summary?: WpsPlanSummary
   test_mode?: boolean
   result?: { written: number; failed: number; sheets: Array<{ sheet: string; status: string; reason?: string }> }
+}
+
+/** 云端当天名单（bridge.sss_day_orders 返回）。 */
+export interface SssDayOrders {
+  ok: boolean
+  reason?: string
+  target_date?: string
+  date_text?: string
+  total?: number
+  archive_error?: string
+  meals?: Record<
+    string,
+    {
+      table: string
+      marked: number
+      skipped_address: number
+      orders: number
+      date_text: string
+      skipped: boolean
+      reason: string
+      warnings: string[]
+    }
+  >
 }
 
 export interface AppState {
@@ -276,6 +301,7 @@ export interface SssConfigPayload {
   url?: string
   account?: string
   excel?: string
+  order_source?: 'wps' | 'excel'
   product_name?: string
   common_address?: string
   use_fixed_address?: boolean
@@ -293,6 +319,7 @@ export interface SssFormPayload {
   account: string
   password: string
   excel: string
+  order_source: 'wps' | 'excel'
   product_name: string
   common_address: string
   use_fixed_address: boolean
@@ -336,6 +363,7 @@ interface PywebviewApi {
   bridge_ready(): Promise<AppState>
   start_order(payload: OrderFormPayload): Promise<FieldErrors>
   start_sss(payload: SssFormPayload): Promise<FieldErrors>
+  sss_day_orders(): Promise<SssDayOrders>
   stop_task(): Promise<{ ok: boolean }>
   worker_alive(): Promise<boolean>
   resolve_decision(id: string, choice: string): Promise<{ ok: boolean }>
@@ -589,6 +617,7 @@ function mockState(): AppState {
       sss_url: 'https://sssplusnew.zhuopaikeji.com/takeout',
       sss_account: '18758187837',
       sss_excel_path: '/home/zimu/文档/闪时送.xlsx',
+      sss_order_source: 'wps',
       sss_product_name: '轻食',
       sss_common_address: '嗯哼',
       sss_use_fixed_address: true,

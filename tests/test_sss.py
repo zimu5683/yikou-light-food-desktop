@@ -123,7 +123,7 @@ def test_dry_run_validates_all_excel_rows_before_any_network_path(tmp_path):
     wb.close()
 
     with pytest.raises(ValueError, match=r"午餐第 3 行.*11 位电话"):
-        sss.run_sss_job(SimpleNamespace(sss_excel_path=str(path), sss_dry_run=True),
+        sss.run_sss_job(SimpleNamespace(sss_excel_path=str(path), sss_dry_run=True, sss_order_source="excel"),
                         object())
 
 
@@ -364,7 +364,7 @@ def test_dry_run_skips_network(tmp_path):
     wb.close()
 
     cfg = SimpleNamespace(
-        sss_excel_path=str(path), sss_account="18758187837",
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
         sss_dry_run=True, sss_store_name="一口轻食", sss_common_address="嗯哼",
         sss_use_fixed_address=True, sss_fixed_lnt=1.0, sss_fixed_lat=2.0,
         sss_fixed_area_code="330110", sss_fixed_address_detail="X",
@@ -1060,7 +1060,7 @@ def test_sss_job_lock_rejects_concurrent_run(tmp_path):
     sss._SSS_RUN_LOCK.acquire()
     try:
         with pytest.raises(RuntimeError, match="拒绝并发执行"):
-            sss.run_sss_job(SimpleNamespace(sss_excel_path=str(tmp_path / "missing.xlsx")),
+            sss.run_sss_job(SimpleNamespace(sss_excel_path=str(tmp_path / "missing.xlsx"), sss_order_source="excel"),
                             Stop())
     finally:
         sss._SSS_RUN_LOCK.release()
@@ -1270,7 +1270,7 @@ def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
     monkeypatch.setattr(sss, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
-        sss_excel_path=str(path), sss_account="18758187837",
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
         sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
@@ -1348,7 +1348,7 @@ def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
     monkeypatch.setattr(sss, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
-        sss_excel_path=str(path), sss_account="18758187837",
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
         sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=119.728224, sss_fixed_lat=30.256632,
@@ -1425,7 +1425,7 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
     monkeypatch.setattr(sss, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
-        sss_excel_path=str(path), sss_account="18758187837",
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
         sss_dry_run=False, sss_preflight=True, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
@@ -1499,7 +1499,7 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
     monkeypatch.setattr(sss, "SssApiClient", FakeClient)
 
     cfg = SimpleNamespace(
-        sss_excel_path=str(path), sss_account="18758187837",
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
         sss_dry_run=False, sss_preflight=False, sss_store_name="一口轻食",
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",

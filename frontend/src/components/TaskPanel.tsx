@@ -4,6 +4,7 @@
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { MoreHorizontal } from 'lucide-react'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { CloudForm } from '@/components/CloudForm'
 import {
@@ -248,6 +249,7 @@ function SssForm() {
   const [account, setAccount] = useState(config?.sss_account ?? '')
   const [password, setPassword] = useState(passwords.sss ?? '')
   const [excel, setExcel] = useState(config?.sss_excel_path ?? '')
+  const [orderSource, setOrderSource] = useState<'wps' | 'excel'>(config?.sss_order_source ?? 'wps')
   const [productName, setProductName] = useState(config?.sss_product_name ?? '轻食')
   // 固定地址配置当前不在界面中编辑，直接由 config 派生，避免未使用 setter。
   const commonAddress = config?.sss_common_address ?? ''
@@ -262,6 +264,7 @@ function SssForm() {
   const [apiMode, setApiMode] = useState(config?.api_mode ?? true)
   const [fields, setFields] = useState<FieldErrors | null>(null)
   const [busy, setBusy] = useState(false)
+  const [dayBusy, setDayBusy] = useState(false)
 
   // 字段停止变化后自动落盘（切页签/退出重进都从后端还原，配置不丢失）。
   const scheduleSave = useDebouncedSave(() => {
@@ -271,6 +274,7 @@ function SssForm() {
         url,
         account,
         excel,
+        order_source: orderSource,
         product_name: productName,
         common_address: commonAddress,
         use_fixed_address: useFixedAddress,
@@ -294,6 +298,7 @@ function SssForm() {
   }, [
     url, account, excel, productName, commonAddress, useFixedAddress,
     fixedLnt, fixedLat, fixedAreaCode, fixedAddressDetail, dryRun, preflight, apiMode,
+    orderSource,
     scheduleSave,
   ])
 
@@ -310,6 +315,7 @@ function SssForm() {
         account,
         password,
         excel,
+        order_source: orderSource,
         product_name: productName,
         common_address: commonAddress,
         use_fixed_address: useFixedAddress,
@@ -343,6 +349,35 @@ function SssForm() {
     if (result.error) setFields((prev) => ({ ...prev, excel: { message: result.error } }))
   }
 
+  /** 读取云端当天名单（东湖午餐/东湖晚餐）并留档，不下单。 */
+  async function readDayOrders() {
+    if (dayBusy) return
+    setDayBusy(true)
+    try {
+      const result = await api().sss_day_orders()
+      if (!result.ok) {
+        toast.error(result.reason ?? '读取云端当天名单失败', { duration: 8000 })
+        return
+      }
+      const parts = Object.entries(result.meals ?? {}).map(([name, info]) =>
+        info.skipped
+          ? `${name}不下单（${info.reason || '没有当天列'}）`
+          : `${name} ${info.orders} 人（标 1 共 ${info.marked}，大西/小 ${info.skipped_address} 人不送）`,
+      )
+      toast.success(
+        `云端当天名单 ${result.target_date ?? ''} ${result.date_text ?? ''}：${parts.join('；') || '没有数据'}`,
+        { duration: 8000 },
+      )
+      if (result.archive_error) {
+        toast.error(`留档 Excel 写入失败：${result.archive_error}`, { duration: 8000 })
+      }
+    } catch (error) {
+      toast.error(`读取失败：${String(error)}`)
+    } finally {
+      setDayBusy(false)
+    }
+  }
+
   return (
     <div>
       <Field label="闪时送网址" htmlFor="sss-url" error={modeError(fields, 'url')} helper="闪时送下单平台地址">
@@ -363,11 +398,39 @@ function SssForm() {
       </Field>
 
       <Field
+        label="名单来源"
+        helper={
+          orderSource === 'wps'
+            ? '每次下单前读取东湖午餐/东湖晚餐「当天列标 1」的人；地址是大西/小的不下单'
+            : '读取《闪时送.xlsx》里的名单（人工准备），不做云端读取'
+        }
+      >
+        <div className="flex gap-1.5" role="group" aria-label="名单来源">
+          <SourceButton
+            active={orderSource === 'wps'}
+            onClick={() => setOrderSource('wps')}
+          >
+            云端当天名单
+          </SourceButton>
+          <SourceButton
+            active={orderSource === 'excel'}
+            onClick={() => setOrderSource('excel')}
+          >
+            本地 Excel
+          </SourceButton>
+        </div>
+      </Field>
+
+      <Field
         label="订单 Excel 文件"
         htmlFor="sss-excel"
         error={excelError}
         okMessage={excelOk}
-        helper="午餐/晚餐两表，A=姓名 B=门牌号 C=电话"
+        helper={
+          orderSource === 'wps'
+            ? '云端模式：作为当天名单的留档文件，可留空'
+            : '午餐/晚餐两表，A=姓名 B=门牌号 C=电话'
+        }
       >
         <div className="flex gap-1.5">
           <TextInput
@@ -382,6 +445,17 @@ function SssForm() {
           <GhostButton onClick={newTemplate}>新建模板</GhostButton>
         </div>
       </Field>
+
+      {orderSource === 'wps' && (
+        <div className="mb-4 -mt-1 flex items-center gap-2">
+          <GhostButton onClick={readDayOrders} disabled={dayBusy || workerAlive}>
+            {dayBusy ? '读取中…' : '读取云端当天名单'}
+          </GhostButton>
+          <span className="text-[11px] text-muted-foreground">
+            只读取并写留档，不下单
+          </span>
+        </div>
+      )}
 
       <Field label="商品名称" htmlFor="sss-product" helper="下单时商品“名称”的默认值">
         <TextInput
@@ -431,6 +505,33 @@ function SssForm() {
 /* ------------------------------------------------------------------ */
 /* 共享：主操作条 + 工具菜单                                              */
 /* ------------------------------------------------------------------ */
+
+/** 名单来源分段按钮（云端当天名单 / 本地 Excel） */
+function SourceButton({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean
+  onClick: () => void
+  children: ReactNode
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        'h-[34px] flex-1 rounded-[4px] border px-3 text-xs transition-colors',
+        active
+          ? 'border-primary bg-secondary font-medium text-primary-strong'
+          : 'border-border bg-card text-muted-foreground hover:border-primary hover:text-primary-strong',
+      )}
+    >
+      {children}
+    </button>
+  )
+}
 
 /** 表单底部停靠坞：更多菜单 + 主操作条整体吸底 */
 function BottomDock({ children }: { children: ReactNode }) {
