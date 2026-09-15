@@ -121,14 +121,16 @@ def test_multiple_rows_are_preserved_in_order():
 # extract_product_note_text
 # ----------------------------------------------------------------------
 class _Page:
-    """假 page：按 CSS 选择器返回产品文本；记录调用顺序。"""
+    """假 page：按 CSS 选择器返回产品文本；记录调用顺序与注入的 JS。"""
 
     def __init__(self, by_css: dict[str, list[str]]) -> None:
         self.by_css = by_css
         self.calls: list[str] = []
+        self.scripts: list[str] = []
 
-    def eval_on_selector_all(self, css: str, _js: str) -> list[str]:
+    def eval_on_selector_all(self, css: str, js: str) -> list[str]:
         self.calls.append(css)
+        self.scripts.append(js)
         if css == ".boom":
             raise RuntimeError("选择器执行失败")
         return self.by_css.get(css, [])
@@ -179,6 +181,21 @@ def test_the_first_candidate_with_data_wins_even_if_later_ones_also_have_data():
 def test_no_data_or_all_candidates_failing_returns_empty_string():
     assert extract_product_note_text(_Page({".good": []}), _locators(".good")) == ""
     assert extract_product_note_text(_Page({}), _locators(".boom")) == ""
+
+
+def test_injected_script_reads_the_product_and_quantity_columns():
+    """注入浏览器的 JS 必须去读**第 1 列（品名）**与**第 3 列（数量）**。
+
+    假 page 不会真的执行 JS，所以光看返回值发现不了 JS 被写坏；
+    这里对脚本内容做一次契约断言（不是复述实现，只钉住它依赖的列号）。
+    """
+    page = _Page({".good": ["套餐A\n备注"]})
+    extract_product_note_text(page, _locators(".good"))
+
+    assert len(page.scripts) == 1
+    script = page.scripts[0]
+    assert "td:nth-child(1)" in script, "品名在第 1 列"
+    assert "innerText" in script, "必须取可见文本"
 
 
 def test_candidates_without_css_are_skipped():
