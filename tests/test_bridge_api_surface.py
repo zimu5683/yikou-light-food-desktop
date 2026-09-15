@@ -138,17 +138,25 @@ def test_bridge_ready_loads_each_password_into_its_own_slot(tmp_path, monkeypatc
 
 
 def test_bridge_ready_stringifies_excel_paths(tmp_path):
-    """路径要以字符串交给前端（路径对象会被序列化成 null / 报错）。"""
+    """路径要以字符串交给前端（路径对象会被序列化成 null / 报错）。
+
+    ⚠️ 用 ``tmp_path`` 而不是硬编码 ``/tmp/...``：Windows 上 ``str(Path("/tmp/x"))``
+    是 ``"\\tmp\\x"``，写死 POSIX 字面量会让这条测试只在 Linux/macOS 通过
+    （CI 的 windows 作业正是这样抓到的）。
+    """
     from pathlib import Path
 
     bridge = _bridge(tmp_path)
-    bridge._config.excel_path = Path("/tmp/排单 名单.xlsx")
-    bridge._config.sss_excel_path = Path("/tmp/闪时送.xlsx")
+    excel = tmp_path / "排单 名单.xlsx"
+    sss = tmp_path / "闪时送.xlsx"
+    bridge._config.excel_path = Path(excel)
+    bridge._config.sss_excel_path = Path(sss)
 
     config = bridge.bridge_ready()["config"]
 
-    assert config["excel_path"] == "/tmp/排单 名单.xlsx"
-    assert config["sss_excel_path"] == "/tmp/闪时送.xlsx"
+    assert config["excel_path"] == str(excel)
+    assert config["sss_excel_path"] == str(sss)
+    assert "名单.xlsx" in config["excel_path"], "中文与空格要原样保留"
 
 
 def test_bridge_ready_returns_a_fresh_top_level_mapping(tmp_path):
