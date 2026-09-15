@@ -240,17 +240,29 @@ def test_reads_actually_overlap(tmp_path, monkeypatch):
     assert cli.max_inflight >= 2, "并发度没有生效，仍在串行读"
 
 
-def test_concurrency_is_faster_than_serial(tmp_path, monkeypatch):
-    start = time.perf_counter()
-    _run(tmp_path, monkeypatch, workers=1, delay=0.03)
-    serial_s = time.perf_counter() - start
+def test_concurrency_beats_the_serial_floor(tmp_path, monkeypatch):
+    """并发必须快于「完全串行」的**理论下界**，而不是去比两次墙钟测量值。
 
+    ⚠️ 原先这条是「并发实测 < 串行实测 × 0.75」，在 CI 上**假失败过**：
+    macOS runner 上 2 路并发的收益被线程启动开销吃掉，实测串行 0.473s /
+    并发 0.404s（仅 1.17x），达不到 1.33x。墙钟比值天生不稳，不能作为断言。
+
+    改成与**理论下界**比较：共 N 次读、每次 sleep `delay`，完全串行至少要
+    ``N × delay``；并发只要 6 个波次就是 ``6 × delay``，留足余量后仍然
+    能证明「确实重叠了」。真正的确定性证据是隔壁的
+    ``test_reads_actually_overlap``（断言同时在途的请求数 ≥ 2）。
+    """
+    delay = 0.03
     start = time.perf_counter()
-    _run(tmp_path, monkeypatch, workers=4, delay=0.03)
+    _, cli, _ = _run(tmp_path, monkeypatch, workers=4, delay=delay)
     parallel_s = time.perf_counter() - start
 
-    # 11 次读、每次 30ms：串行 ≈ 0.33s，4 并发 ≈ 0.12s。留足余量避免 CI 抖动。
-    assert parallel_s < serial_s * 0.75, f"串行 {serial_s:.3f}s / 并发 {parallel_s:.3f}s"
+    reads = len(cli.calls)
+    serial_floor = reads * delay           # 完全串行的理论下界
+    assert reads >= 6, "读数太少，这条测试没有意义"
+    assert parallel_s < serial_floor * 0.9, (
+        f"并发 {parallel_s:.3f}s 没有明显快于串行下界 {serial_floor:.3f}s"
+        f"（{reads} 次读 / 每次 {delay}s）")
 
 
 def test_single_table_skips_thread_pool(tmp_path, monkeypatch):
