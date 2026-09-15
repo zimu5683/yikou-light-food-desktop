@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pytest
 
+from app import config as config_module
 from app.config import (DEFAULT_ADDRESS_ORDER, DEFAULT_WPS_PRODUCTION_TABLES,
                         MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, clamp_split_ratio,
                         default_wps_address_order, default_wps_production_tables,
@@ -138,11 +139,24 @@ def test_normalize_wps_tables_ignores_unknown_conf_types():
 # normalize_wps_address_order：显式空列表是有效值（文档记录的坑）
 # ----------------------------------------------------------------------
 def test_normalize_wps_address_order_keeps_explicit_empty_list():
-    """**空列表 = 该表按地址升序**，绝不能被「空即忽略」吞掉。"""
-    result = normalize_wps_address_order({"医学院中餐": []})
-    assert result["医学院中餐"] == []
+    """**空列表 = 该表按地址升序**，绝不能被「空即忽略」吞掉。
+
+    注意这里**必须挑默认值非空的子表**（衣锦中餐默认 ``["外卖柜","校门口"]``）：
+    若用默认本来就是 ``[]`` 的医学院，那么「空列表被忽略」的 bug 也能蒙混过关
+    —— 这正是变异测试暴露出来的盲点。
+    """
+    result = normalize_wps_address_order({"衣锦中餐": []})
+    assert result["衣锦中餐"] == [], "显式空列表必须覆盖掉默认的 [外卖柜, 校门口]"
     # 未提及的子表仍保留默认
     assert result["东湖中餐"] == list(DEFAULT_ADDRESS_ORDER["东湖中餐"])
+
+    # 显式传入的 base 同样要被空列表覆盖
+    cleared = normalize_wps_address_order({"东湖中餐": []},
+                                          base={"东湖中餐": ["小", "大西"]})
+    assert cleared["东湖中餐"] == []
+
+    # 多行空串同样算「显式清空」
+    assert normalize_wps_address_order({"衣锦中餐": "\n  \n"})["衣锦中餐"] == []
 
 
 def test_normalize_wps_address_order_accepts_multiline_string():
@@ -211,6 +225,24 @@ def test_normalize_wps_production_tables_uses_independent_production_base():
             == DEFAULT_WPS_PRODUCTION_TABLES["衣锦中餐"]["file_id"])
     # 且不等于「当前生效表」的默认值来源被污染
     assert result is not DEFAULT_WPS_PRODUCTION_TABLES
+
+
+def test_normalize_wps_production_tables_ignores_current_effective_tables(monkeypatch):
+    """把「当前生效表」换成测试副本后，正式表备份**不能**跟着变。
+
+    这条是变异测试逼出来的：``DEFAULT_WPS_TABLES`` 目前恰好等于
+    ``DEFAULT_WPS_PRODUCTION_TABLES``，所以「底表写错成 default_wps_tables()」
+    这种 bug 靠对比常量根本抓不到。测试模式的真实场景正是让两者**分叉**
+    （生效表 = 测试副本，正式表 = 线上表），这里就把那个分叉造出来。
+    """
+    production_id = DEFAULT_WPS_PRODUCTION_TABLES["东湖中餐"]["file_id"]
+    monkeypatch.setattr(config_module, "DEFAULT_WPS_TABLES",
+                        {"东湖中餐": {"file_id": "测试副本_ID"}})
+
+    result = normalize_wps_production_tables(None)
+
+    assert result["东湖中餐"]["file_id"] == production_id
+    assert result["东湖中餐"]["file_id"] != "测试副本_ID"
 
 
 def test_normalize_wps_production_tables_tolerates_garbage():
@@ -322,5 +354,11 @@ def test_should_skip_address_matches_skip_groups(raw):
 
 @pytest.mark.parametrize("raw", ["b2", "C3", "学三", "外卖柜", "", None, "   "])
 def test_should_skip_address_leaves_others_alone(raw):
-    """空地址**不能**被当成「小」而跳过 —— 否则会静默漏单。"""
+    """空地址**不能**被当成「小」而跳过 —— 否则会静默漏单。
+
+    说明：``should_skip_address`` 里的 ``bool(key) and`` 守卫在**当前常量下**
+    其实是冗余的（``_SKIP_ADDRESS_KEYS`` 只有「大西」「小」，而空地址的 key 是
+    ``""``，本来就不在集合里）。变异测试确认去掉它能得到完全相同的结果 ——
+    属于「等价变异」，不是测试缺口；保留断言是为了锁住**可观察行为**。
+    """
     assert should_skip_address(raw) is False
