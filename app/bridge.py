@@ -39,6 +39,7 @@ import time
 import logging
 import webbrowser
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path as _Path
 from typing import Any
@@ -81,6 +82,19 @@ CRITICAL_EVENT_LIMIT = 500
 DROPPABLE_EVENTS = frozenset({"log", "update:progress", "update:stage"})
 # 交互请求（decision/captcha）等待上限；到点后 worker 必须能退出，而不是永久阻塞。
 DEFAULT_INTERACTION_TIMEOUT_S = 300.0
+
+# 「核对副本」的并发度：每张子表要读 2 张云表，6 张子表串行时最多 12 次往返。
+# 并发只改变往返的重叠方式：**正常路径（含全部 5 种 status 与 WpsCloudError）
+# 的调用次数与参数完全不变**，因此不额外消耗云端每日额度；只有出现
+# ``WpsCloudError`` 之外的意外异常时，最坏会多发 workers-1 次调用（见下方分批
+# 提交的注释），串行版本则是 0 次。
+#
+# 为什么是 2 而不是 4：金山接口的 429002 表示「短时间频繁触发」，而
+# ``_TRANSIENT_HINTS`` 并不包含限流提示，`_run` 不会重试它 —— 一旦突发触发，
+# 该表就会从「已核对」变成「读不了」，属于可观测的行为偏差。取 2 只把瞬时速率
+# 翻倍（串行约 5 次/秒 → 并发约 10 次/秒），在明显提速与不制造突发之间取平衡；
+# 这也是项目里最保守的既有取值（app/sss.py 的验证码/登录轮询同样用 2）。
+WPS_COPY_CHECK_WORKERS = 2
 
 RETRY_CHOICES = [{"value": "retry", "label": "重试", "style": "primary"},
                  {"value": "skip", "label": "跳过", "style": "neutral"},
@@ -1138,7 +1152,6 @@ class Bridge:
         cfg = self._config
         active = self._wps_effective_tables()
         production = cfg.wps_production_tables or {}
-        results: list[dict[str, Any]] = []
         try:
             cli = self._wps_cli()
 
@@ -1155,7 +1168,12 @@ class Bridge:
                 return {(row.get(0, ""), row.get(2, "")): r + 1
                         for r, row in rows.items() if r >= 2 and row.get(0)}
 
-            for sheet, conf in active.items():
+            def probe(sheet: str, conf: dict[str, str]) -> dict[str, Any]:
+                """核对单个子表（只读）。
+
+                只读写自己的局部变量，不碰 ``self`` 的任何可变状态，因此可以安全地
+                放进工作线程并发执行；结果与串行版本逐字段一致。
+                """
                 file_id = conf.get("file_id", "")
                 prod_id = (production.get(sheet) or {}).get("file_id", "")
                 item: dict[str, Any] = {"sheet": sheet, "file_id": file_id,
@@ -1164,20 +1182,17 @@ class Bridge:
                     active_people = people(file_id)
                 except WpsCloudError as exc:
                     item.update(status="unreadable", reason=str(exc)[:120])
-                    results.append(item)
-                    continue
+                    return item
                 item["rows"] = len(active_people)
                 if not prod_id or prod_id == file_id:
                     # 写入目标就是正式表本身（未使用副本），无需比对。
                     item.update(status="same_as_production")
-                    results.append(item)
-                    continue
+                    return item
                 try:
                     prod_people = people(prod_id)
                 except WpsCloudError as exc:
                     item.update(status="production_unreadable", reason=str(exc)[:120])
-                    results.append(item)
-                    continue
+                    return item
                 item["production_rows"] = len(prod_people)
                 if set(active_people) == set(prod_people):
                     item.update(status="aligned")
@@ -1192,7 +1207,30 @@ class Bridge:
                     else:
                         item.update(status="drifted", missing=missing[:10],
                                     extra=extra[:10])
-                results.append(item)
+                return item
+
+            items = list(active.items())
+            results: list[dict[str, Any]] = []
+            if len(items) <= 1:
+                # 单张表没有可重叠的往返，直接顺序执行，省掉线程池开销。
+                results = [probe(sheet, conf) for sheet, conf in items]
+            else:
+                # ``Executor.map`` 按**提交顺序**产出结果，因此 tables/drifted
+                # 的顺序与串行版本完全一致，前端展示不受影响。
+                #
+                # 分批提交而不是一次提交全部：``probe`` 只把 ``WpsCloudError``
+                # 转成状态，其他意外异常会向上抛。若一次提交全部，抛错时已经
+                # 发出去的调用收不回来（``cancel()`` 只能取消尚未开始的任务），
+                # 最多会白耗 n-1 次云端调用；分批后最多只多耗 workers-1 次，
+                # 更贴近串行版本「出错即停」的行为。
+                workers = max(1, min(WPS_COPY_CHECK_WORKERS, len(items)))
+                with ThreadPoolExecutor(
+                    max_workers=workers,
+                    thread_name_prefix="wps-copy-check",
+                ) as pool:
+                    for start in range(0, len(items), workers):
+                        batch = items[start:start + workers]
+                        results.extend(pool.map(lambda pair: probe(*pair), batch))
         except WpsCloudError as exc:
             return {"ok": False, "reason": str(exc)}
 
