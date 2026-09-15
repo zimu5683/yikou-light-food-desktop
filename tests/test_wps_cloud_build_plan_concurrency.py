@@ -285,3 +285,65 @@ def test_unreadable_sheet_does_not_stop_the_others():
     assert [p.sheet for p in plans] == sheets
     assert plans[3].warnings
     assert not plans[0].warnings
+
+
+class _Boom(Exception):
+    """模拟 read_grid / sheets_info 里没被包装成 WpsCloudError 的意外异常。"""
+
+
+class _ExplodingCli(FakeCli):
+    """第 ``explode_at`` 次调用时抛非 WpsCloudError 的意外异常。"""
+
+    def __init__(self, grids, *, explode_at: int, **kwargs):
+        super().__init__(grids, **kwargs)
+        self.explode_at = explode_at
+
+    def _maybe_explode(self) -> None:
+        if len(self.calls) >= self.explode_at:
+            raise _Boom("接口返回了畸形字段")
+
+    def sheets_info(self, file_id):
+        result = super().sheets_info(file_id)
+        self._maybe_explode()
+        return result
+
+    def read_grid(self, file_id, ws, rf, rt, cf, ct, *, with_format=False):
+        result = super().read_grid(file_id, ws, rf, rt, cf, ct, with_format=with_format)
+        self._maybe_explode()
+        return result
+
+
+def _explode_run(workers, explode_at):
+    wps_cloud.WPS_PLAN_WORKERS = workers
+    _, tables, orders, _ = _scenario()
+    cli = _ExplodingCli({f"F{i}": _grid([(f"人{i}", "小", f"13800000000{i}")])
+                         for i in range(len(SHEETS))}, explode_at=explode_at)
+    with pytest.raises(_Boom, match="畸形字段"):
+        build_plan(cli, local_orders=orders, tables=tables, target=TARGET,
+                   ledger=None, address_order={}, sort_enabled=True)
+    return len(cli.calls)
+
+
+@pytest.mark.parametrize("explode_at", [1, 5, 9, 13, 18])
+def test_unexpected_exception_propagates_and_extra_calls_are_bounded(explode_at):
+    """非 WpsCloudError 的意外异常也必须原样抛出，且不能把剩下的表全读一遍。
+
+    串行版本出错即停；并发版本已有任务在途，最多多发 workers-1 张表的调用
+    （workers=2 → 最多 3 次）。这里锁死这个上界，防止「一次提交全部」导致
+    白耗近一整轮云端额度。
+    """
+    serial = _explode_run(1, explode_at)
+    parallel = _explode_run(2, explode_at)
+    workers = wps_cloud.WPS_PLAN_WORKERS
+    assert parallel <= serial + (workers - 1) * 3, f"多发过多：{serial} → {parallel}"
+    assert parallel < len(SHEETS) * 3 or explode_at >= len(SHEETS) * 3
+
+
+def test_unexpected_exception_is_never_swallowed():
+    """worker 线程里的非 WpsCloudError 必须能穿透线程池抛给调用方。"""
+    wps_cloud.WPS_PLAN_WORKERS = 2
+    _, tables, orders, _ = _scenario()
+    cli = _ExplodingCli({f"F{i}": _grid() for i in range(len(SHEETS))}, explode_at=4)
+    with pytest.raises(_Boom):
+        build_plan(cli, local_orders=orders, tables=tables, target=TARGET,
+                   ledger=None, address_order={}, sort_enabled=True)
