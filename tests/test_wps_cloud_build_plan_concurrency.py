@@ -347,3 +347,31 @@ def test_unexpected_exception_is_never_swallowed():
     with pytest.raises(_Boom):
         build_plan(cli, local_orders=orders, tables=tables, target=TARGET,
                    ledger=None, address_order={}, sort_enabled=True)
+
+
+@pytest.mark.parametrize("delay", [0.0, 0.02])
+@pytest.mark.parametrize("fail_id", ["F0", "F2"])
+def test_extra_calls_bounded_regardless_of_failure_timing(fail_id, delay):
+    """失败「耗时」不影响多发上界。
+
+    曾担心：云端秒失败时线程池会取消同批的兄弟任务，而 200ms 后才失败时
+    兄弟任务已经跑完 —— 两种时序下的多发调用量是否都还有界？实测「秒失败」与
+    「延迟失败」两种时序，多发一律 ≤ workers-1 张表 × 3 次。
+    """
+    workers = 2
+
+    def calls_for(worker_count: int) -> int:
+        wps_cloud.WPS_PLAN_WORKERS = worker_count
+        _, tables, orders, _ = _scenario()
+        cli = FakeCli({f"F{i}": _grid([(f"人{i}", "小", f"13800000000{i}")])
+                       for i in range(len(SHEETS))},
+                      fail_read={fail_id}, delay=delay)
+        with pytest.raises(WpsCloudError):
+            build_plan(cli, local_orders=orders, tables=tables, target=TARGET,
+                       ledger=None, address_order={}, sort_enabled=True)
+        return len(cli.calls)
+
+    serial = calls_for(1)
+    parallel = calls_for(workers)
+    assert parallel <= serial + (workers - 1) * 3, f"{serial} → {parallel}"
+    assert parallel < len(SHEETS) * 3, "不应把剩下的子表全部读完"
