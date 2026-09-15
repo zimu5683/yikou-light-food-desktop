@@ -82,6 +82,12 @@ export interface WpsStatus {
   weekday_number: number
   excel_path: string
   marker_enabled: boolean
+  /** 云表按地址顺序重排：总开关。 */
+  sort_enabled: boolean
+  /** 每张子表的地址顺序清单；空数组 = 该表按地址升序。 */
+  address_order: Record<string, string[]>
+  /** 出厂默认顺序（界面「恢复默认」用，避免前后端各写一份）。 */
+  address_order_defaults: Record<string, string[]>
   test_file_id?: string
   /** 测试模式下每张正式表对应的测试副本。 */
   test_tables?: Record<string, string>
@@ -161,6 +167,23 @@ export interface CaptchaRequest {
   image: string
 }
 
+export interface PendingAddressItem {
+  raw_address: string
+  order_numbers: string[]
+  campus: string
+  confidence: string
+  reason: string
+  suggested_point: string
+  candidates?: Record<string, number>
+}
+
+export interface AddressInputRequest {
+  id: string
+  title: string
+  message: string
+  items: PendingAddressItem[]
+}
+
 export interface UpdateAvailable {
   tag: string
   current: string
@@ -190,6 +213,7 @@ type BridgeEventBase =
   | { event: 'update:installed'; payload: { message: string } }
   | { event: 'decision'; payload: DecisionRequest }
   | { event: 'captcha'; payload: CaptchaRequest }
+  | { event: 'address_input'; payload: AddressInputRequest }
   | {
       event: 'events:dropped'
       payload: {
@@ -298,6 +322,10 @@ export interface WpsConfigPayload {
   test_file_id: string
   test_drive_id: string
   marker_enabled: boolean
+  /** 排序总开关；不带该字段时后端保持原值。 */
+  sort_enabled?: boolean
+  /** 每张子表的地址顺序（传数组）；空数组 = 该表按地址升序。 */
+  address_order?: Record<string, string[]>
   tables: Record<string, { file_id: string; drive_id?: string }>
   test_tables: Record<string, string>
 }
@@ -312,6 +340,7 @@ interface PywebviewApi {
   worker_alive(): Promise<boolean>
   resolve_decision(id: string, choice: string): Promise<{ ok: boolean }>
   resolve_captcha(id: string, code: string): Promise<{ ok: boolean }>
+  resolve_address_input(id: string, entries: Record<string, string>): Promise<{ ok: boolean }>
   choose_excel(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   new_template(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   check_browser(): Promise<{ ok: boolean }>

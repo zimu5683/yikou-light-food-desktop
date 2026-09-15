@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import url2pathname
 
 import pytest
 
-from app.webview_app import _frontend_target
+from app.webview_app import _configure_linux_input_method, _frontend_target
 
 
 def test_production_frontend_uses_file_uri() -> None:
@@ -47,6 +48,27 @@ def test_frozen_frontend_target_is_file_uri(monkeypatch, tmp_path: Path) -> None
     assert debug is False
     assert urlparse(target).scheme == "file"
     assert Path(url2pathname(unquote(urlparse(target).path))) == frozen_index
+
+
+def test_linux_input_method_gtk_module_is_filled_from_ibus(monkeypatch) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.delenv("GTK_IM_MODULE", raising=False)
+    monkeypatch.setenv("XMODIFIERS", "@im=ibus")
+    monkeypatch.delenv("QT_IM_MODULE", raising=False)
+
+    _configure_linux_input_method()
+
+    assert os.environ["GTK_IM_MODULE"] == "ibus"
+
+
+def test_linux_input_method_keeps_existing_gtk_module(monkeypatch) -> None:
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("GTK_IM_MODULE", "fcitx")
+    monkeypatch.setenv("XMODIFIERS", "@im=ibus")
+
+    _configure_linux_input_method()
+
+    assert os.environ["GTK_IM_MODULE"] == "fcitx"
 
 
 def test_main_self_check_imports_critical_modules(monkeypatch, capsys):

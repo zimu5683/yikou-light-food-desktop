@@ -22,6 +22,25 @@ WINDOW_TITLE = "一口轻食 - 订单处理"
 logger = logging.getLogger(__name__)
 
 
+def _configure_linux_input_method() -> None:
+    """GTK3 不会自动从 XMODIFIERS/QT_IM_MODULE 推断输入法。
+
+    打包后的 pywebview/WebKitGTK 里如果不显式设置 GTK_IM_MODULE，输入框只有
+    简单键盘输入，中文输入法的候选窗不会出现。这里按当前桌面环境里正在使用
+    的输入法框架补上 GTK 模块名（ibus/fcitx），不覆盖用户已有配置。
+    """
+    if not sys.platform.startswith("linux") or os.environ.get("GTK_IM_MODULE"):
+        return
+    hints = " ".join(
+        str(os.environ.get(key, ""))
+        for key in ("XMODIFIERS", "QT_IM_MODULE", "QT_IM_MODULES", "INPUT_METHOD")
+    ).lower()
+    if "fcitx" in hints:
+        os.environ["GTK_IM_MODULE"] = "fcitx"
+    elif "ibus" in hints:
+        os.environ["GTK_IM_MODULE"] = "ibus"
+
+
 def _frontend_target() -> tuple[str, bool]:
     """返回 (加载目标, 是否调试模式)。"""
     dev_server = os.environ.get("YIKOU_DEV_SERVER", "").strip()
@@ -49,6 +68,7 @@ def _frontend_target() -> tuple[str, bool]:
 
 
 def run() -> None:
+    _configure_linux_input_method()
     try:
         import webview
     except (ImportError, ValueError) as exc:

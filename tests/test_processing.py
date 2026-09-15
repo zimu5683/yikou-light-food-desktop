@@ -507,6 +507,110 @@ def test_run_job_writes_pending_addresses_after_certain_orders(tmp_path, monkeyp
     assert [item["order_numbers"] for item in items] == [["W2"], ["W1"]]
 
 
+def test_run_job_manual_pending_address_override_and_sort(tmp_path, monkeypatch):
+    """待确认地址可在写表前手动填写；填写后视为确定点并参与地址排序。"""
+    import json
+    import threading
+
+    from openpyxl import load_workbook
+
+    from app import automation as automod
+    from app.automation import run_job
+    from app.excel_templates import write_order_template
+
+    today = dt.date.today()
+    date_text = today.isoformat()
+    excel = tmp_path / "排单.xlsx"
+    report = tmp_path / "pending_addresses.json"
+    write_order_template(excel)
+
+    class FakeConfig:
+        excel_path = str(excel)
+        target_url = "https://example.com"
+        phone_number = "13900000000"
+        order_date = date_text
+        api_mode = True
+        element_timeout_ms = 8000
+        browser_mode = "auto"
+
+    addresses = {
+        "3": "浙江农林大学东湖校区 D2",
+        "2": "浙江农林大学东湖校区 5号教学楼-南门",
+        "1": "完全陌生地址",
+    }
+
+    def api_get(path: str) -> dict:
+        if "/channel/order?" in path and "pageNo=1" in path:
+            return {"data": {"list": [
+                {"id": oid, "pickNo": f"W{oid}", "storeId": "1",
+                 "created_at": f"{date_text} 10:00:00", "state": 6}
+                for oid in ("3", "2", "1")
+            ], "total": 3}}
+        for oid, address in addresses.items():
+            if f"/channel/order/{oid}" in path:
+                return {"data": {
+                    "id": oid,
+                    "address": {"contact": f"顾客{oid}", "mobile": "13800000000",
+                                "address": address},
+                    "goods": [{"name": "单点经济餐（午餐）", "num": 1}],
+                }}
+        return {"data": {}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def login(self):
+            pass
+
+        def get_json(self, path):
+            return api_get(path)
+
+    seen_items: list[dict] = []
+
+    def callback(items):
+        seen_items.extend(items)
+        raw = addresses["2"]
+        return {raw: "A5"}
+
+    monkeypatch.setattr(automod, "AdminApiClient", FakeClient)
+    monkeypatch.setattr(automod, "load_aliases", lambda: {})
+    monkeypatch.setattr(automod, "aliases_path", lambda: tmp_path / "address_aliases.json")
+    monkeypatch.setattr(
+        automod, "write_pending",
+        lambda items, target_date: report.write_text(
+            json.dumps({"target_date": str(target_date), "items": items}, ensure_ascii=False),
+            encoding="utf-8",
+        ) or report,
+    )
+
+    logs: list[str] = []
+    result = run_job(FakeConfig(), None, threading.Event(), lambda m: logs.append(m),
+                     password="pw", pending_address_callback=callback)
+
+    assert result["processed"] == 3
+    assert result["found"] == 3
+    assert result["address_pending"] == 1
+    assert result["address_pending_orders"] == ["W1"]
+    assert [item["order_numbers"] for item in seen_items] == [["W2"], ["W1"]] or [
+        item["order_numbers"] for item in seen_items] == [["W1"], ["W2"]]
+
+    wb = load_workbook(excel)
+    campus = wb["东湖中餐"]
+    rows = [(campus.cell(r, 1).value, campus.cell(r, 3).value)
+            for r in range(3, campus.max_row + 1) if campus.cell(r, 1).value]
+    assert rows == [("W2", "A5"), ("W3", "D2")], rows
+    review = wb["待确认地址"]
+    assert [review["A2"].value, review["C2"].value] == ["W1", addresses["1"]]
+    wb.close()
+
+    assert any("已按手动填写修正 1 个订单" in line for line in logs)
+    assert any(f"{addresses['2']} → A5" in line for line in logs)
+    items = json.loads(report.read_text(encoding="utf-8"))["items"]
+    assert [item["order_numbers"] for item in items] == [["W1"]]
+
+
+
 def test_pending_report_deduplicates_address_and_keeps_all_orders():
     from app.automation import _pending_report_items, _prepare_order_address
 
@@ -599,10 +703,10 @@ def test_sort_yixue_sub_sheet_order():
 
     wb = Workbook()
     ws = wb.active
-    _build_sheet(ws, ["医8号", "医3号", "医10号", "5号楼", "未识别点"], "医学院中餐")
+    _build_sheet(ws, ["医 8号", "医 3号", "医 10号", "医5号", "5号楼", "未识别点"], "医学院中餐")
     sort_campus_sub_sheets(wb)
-    # 医N号按数字升序在前，之后其他地址保持原相对顺序
-    assert _col_c(ws)[:4] == ["医3号", "医8号", "医10号", "5号楼"]
+    # 医 N号按数字升序在前（兼容旧写法 医N号），之后其他地址保持原相对顺序
+    assert _col_c(ws)[:5] == ["医 3号", "医5号", "医 8号", "医 10号", "5号楼"]
 
 
 def test_sort_leaves_weekday_sheet_untouched():

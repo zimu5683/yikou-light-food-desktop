@@ -62,6 +62,55 @@ def test_decision_timeout_unblocks_worker(tmp_path):
     assert bridge._decisions == {}
 
 
+def test_address_input_event_and_resolve(tmp_path):
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._interaction_timeout_s = 2.0
+    result: list[dict[str, str]] = []
+    items = [{"raw_address": "教学楼-南门", "order_numbers": ["W16", "W15"],
+              "campus": "东湖农林", "confidence": "unknown", "reason": "未识别",
+              "suggested_point": ""}]
+
+    worker = threading.Thread(
+        target=lambda: result.append(bridge._pending_address_input(items)),
+        daemon=True,
+    )
+    worker.start()
+    for _ in range(100):
+        event = next((e for e in list(bridge._event_log)
+                      if e.get("event") == "address_input"), None)
+        if event:
+            break
+        time.sleep(0.01)
+    assert event, "应发出 address_input 事件"
+    request_id = event["payload"]["id"]
+    assert event["payload"]["items"][0]["order_numbers"] == ["W16", "W15"]
+    assert bridge.resolve_address_input(request_id, {"教学楼-南门": "教5"}) == {"ok": True}
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert result == [{"教学楼-南门": "教5"}]
+    assert bridge._decisions == {}
+
+
+def test_address_input_timeout_returns_empty_mapping(tmp_path):
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._interaction_timeout_s = 0.05
+    result: list[dict[str, str]] = []
+
+    worker = threading.Thread(
+        target=lambda: result.append(bridge._pending_address_input([
+            {"raw_address": "x", "order_numbers": ["W1"], "campus": "未知",
+             "confidence": "unknown", "reason": "", "suggested_point": ""}])),
+        daemon=True,
+    )
+    worker.start()
+    worker.join(1.0)
+
+    assert not worker.is_alive()
+    assert result == [{}]
+    assert bridge._decisions == {}
+
+
 def test_stop_task_wakes_captcha_waiter(tmp_path):
     bridge = Bridge(config_path=str(tmp_path / "config.json"))
     bridge._worker = _AliveWorker()  # type: ignore[assignment]

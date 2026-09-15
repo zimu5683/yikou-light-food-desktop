@@ -651,6 +651,30 @@ def _pending_report_items(orders: list[OrderInfo]) -> list[dict[str, Any]]:
     return list(grouped.values())
 
 
+_MANUAL_CAMPUS_TO_BASE = {
+    "东湖农林": "东湖", "医学院": "医学院", "衣锦联建": "衣锦",
+}
+
+def _manual_address_base_sheet(order: OrderInfo, value: str) -> str:
+    """手动填写的地址优先按自身校区/点位判断，其次沿用订单原校区。"""
+    detected = get_address_base_sheet_name(value)
+    if detected:
+        return detected
+    if order.address_base_sheet:
+        return order.address_base_sheet
+    dp = order.metadata.get("delivery_point") or {}
+    base = _MANUAL_CAMPUS_TO_BASE.get(str(dp.get("campus") or ""), "")
+    if base:
+        return base
+    # 用户直接输入排单短名时，按点位自身推断校区。
+    compact = re.sub(r"\s+", "", value)
+    if re.fullmatch(r"[A-Da-d]\d{1,2}", compact):
+        return "东湖"
+    if re.fullmatch(r"医\d+号", compact):
+        return "医学院"
+    return ""
+
+
 def _load_order_workbook(excel_path: Path, loader: Callable[..., Any] | None = None) -> Any:
     if loader is None:
         from openpyxl import load_workbook
@@ -1036,11 +1060,14 @@ def _read_order(page: Any, code: str, timeout: int, locators: dict[str, Any] | N
 def run_job(config: Any, order_count: int | None, stop_event: Any, progress_callback: Callable[[str], Any] | None = None, password: str | None = None,
             order_decision_callback: Callable[[str, str], str] | None = None,
             save_decision_callback: Callable[[str], str] | None = None,
+            pending_address_callback: Callable[[list[dict[str, Any]]], dict[str, str]] | None = None,
             locators: dict[str, Any] | None = None,
             target_date: object = None) -> dict[str, Any]:
     """Process the newest W orders and append their meals to the workbook.
 
     ``order_count`` 为空或 0 时表示自动处理目标日期当天的全部订单。
+    ``pending_address_callback`` 在写入 Excel 前收到去重后的待确认地址，
+    返回 ``{原始地址: 用户填写的最终地址}``；返回空串/缺失的写法保留待确认流程。
     """
     configured_excel = getattr(config, "excel_path", None)
     if not configured_excel:
@@ -1203,6 +1230,48 @@ def run_job(config: Any, order_count: int | None, stop_event: Any, progress_call
                 pending_orders.append(order)
             else:
                 certain_orders.append(order)
+
+        # 写表前先让用户在对话框中手动填写待确认地址；确认后视为 high，
+        # 直接按最终地址写入对应校区表，后续地址排序会自动归位。
+        if pending_orders and pending_address_callback is not None and not stop_event.is_set():
+            pending_items = _pending_report_items(pending_orders)
+            _emit(progress_callback,
+                  f"检测到 {len(pending_items)} 种地址无法自动识别，等待手动填写…")
+            try:
+                overrides = pending_address_callback(pending_items)
+            except Exception as exc:
+                overrides = {}
+                _emit(progress_callback, f"手动填写地址已取消或失败：{exc}")
+            if not isinstance(overrides, dict):
+                overrides = {}
+            unresolved: list[OrderInfo] = []
+            resolved_count = 0
+            for order in pending_orders:
+                raw = (order.delivery_address or order.address or "").strip()
+                value = str(overrides.get(raw, "") or "").strip()
+                if not value:
+                    unresolved.append(order)
+                    continue
+                base = _manual_address_base_sheet(order, value)
+                if not base:
+                    unresolved.append(order)
+                    _emit(progress_callback,
+                          f"{order.order_no} 手动填写「{value}」无法判断校区，仍保留在待确认地址")
+                    continue
+                order.address = value
+                order.address_base_sheet = base
+                dp = order.metadata.setdefault("delivery_point", {})
+                dp.update({
+                    "point": value,
+                    "confidence": "high",
+                    "reason": "用户手动填写",
+                    "candidates": {value: 1},
+                })
+                certain_orders.append(order)
+                resolved_count += 1
+            pending_orders = unresolved
+            if resolved_count:
+                _emit(progress_callback, f"已按手动填写修正 {resolved_count} 个订单的地址")
 
         # 每次写入前先清空六张校区子表第 2 行后的旧数据，避免新旧混排；
         # 清空只发生在确认当天有订单要写之后（numbers 为空已提前返回）。

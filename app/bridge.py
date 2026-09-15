@@ -22,12 +22,15 @@ sequence 中间缺口和关键事件超限都会返回 ``events:dropped`` 告警
 - update:installed   {message}
 - decision           {id, kind, title, message, choices}
 - captcha            {id, image}
+- address_input      {id, title, message, items[{raw_address, order_numbers,
+                     campus, reason, suggested_point}]}
 - events:dropped     {dropped_count, first_available_sequence, message}
 """
 from __future__ import annotations
 
 import copy
 import datetime as _dt
+import json
 import os
 import secrets
 import sys
@@ -49,7 +52,7 @@ from .automation import (
     parse_target_date,
     run_job,
 )
-from .config import AppConfig, clamp_split_ratio
+from .config import AppConfig, clamp_split_ratio, default_wps_address_order
 from .credentials import (delete_password, delete_sss_password, get_password,
                           get_sss_password, set_password, set_sss_password)
 from .excel_templates import write_order_template, write_sss_template
@@ -90,7 +93,7 @@ class _InteractionCancelled(RuntimeError):
 @dataclass
 class _PendingInteraction:
     event: threading.Event
-    holder: list[str] = field(default_factory=list)
+    holder: list[Any] = field(default_factory=list)
     kind: str = ""
     created_at: float = 0.0
 
@@ -508,7 +511,8 @@ class Bridge:
         try:
             result = run_job(config, count, self._stop_event, lambda msg: self.log(msg), password=password,
                              order_decision_callback=self._order_decision,
-                             save_decision_callback=self._save_decision)
+                             save_decision_callback=self._save_decision,
+                             pending_address_callback=self._pending_address_input)
             self._finish_task(f"处理完成：已处理 {result.get('processed', '?')} 项，"
                               f"找到 {result.get('found', '?')} 项", result)
         except BrowserNotFoundError as exc:
@@ -616,9 +620,11 @@ class Bridge:
     # ------------------------------------------------------------------
     # js_api：阻塞式决策（旧 askyesnocancel 的异步等价物）
     # ------------------------------------------------------------------
-    def _interaction_default(self, kind: str) -> str:
+    def _interaction_default(self, kind: str) -> Any:
         if kind == "captcha":
             return ""
+        if kind == "address_input":
+            return {}
         if kind == "close_confirm":
             return "keep"
         if kind == "save_retry":
@@ -634,7 +640,7 @@ class Bridge:
             self._decisions[interaction_id] = entry
         return interaction_id, entry
 
-    def _wait_interaction(self, interaction_id: str, entry: _PendingInteraction, *, default: str) -> str:
+    def _wait_interaction(self, interaction_id: str, entry: _PendingInteraction, *, default: Any = "") -> Any:
         entry.event.wait(self._interaction_timeout_s)
         timed_out = False
         with self._push_lock:
@@ -672,7 +678,7 @@ class Bridge:
         decision_id, entry = self._register_interaction(kind)
         self._emit_event("decision", {"id": decision_id, "kind": kind, "title": title,
                                 "message": message, "choices": choices})
-        return self._wait_interaction(decision_id, entry, default=self._interaction_default(kind))
+        return str(self._wait_interaction(decision_id, entry, default=self._interaction_default(kind)))
 
     def resolve_decision(self, decision_id: str, choice: str) -> dict[str, Any]:
         with self._push_lock:
@@ -713,6 +719,44 @@ class Bridge:
                 entry.holder.append(str(code))
                 entry.event.set()
         return {"ok": entry is not None}
+
+    def _request_address_input(self, items: list[dict[str, Any]]) -> dict[str, str]:
+        """向 UI 发起待确认地址填写，阻塞等待返回 {原始地址: 最终地址}。"""
+        request_id, entry = self._register_interaction("address_input")
+        self._emit_event("address_input", {
+            "id": request_id,
+            "title": "地址待确认",
+            "message": "以下地址无法自动识别，请输入要写入表格的最终地址；留空则保持原待确认流程。",
+            "items": items,
+        })
+        result = self._wait_interaction(request_id, entry,
+                                        default=self._interaction_default("address_input"))
+        values: Any = result
+        if isinstance(result, str):
+            try:
+                values = json.loads(result)
+            except (TypeError, ValueError):
+                values = {}
+        if not isinstance(values, dict):
+            return {}
+        cleaned: dict[str, str] = {}
+        for key, value in values.items():
+            text = str(value or "").strip()
+            if text:
+                cleaned[str(key)] = text
+        return cleaned
+
+    def resolve_address_input(self, input_id: str, entries: Any) -> dict[str, Any]:
+        """前端提交待确认地址输入；entries 为 {原始地址: 最终地址} 或 JSON 字符串。"""
+        with self._push_lock:
+            entry = self._decisions.pop(str(input_id), None)
+            if entry is not None:
+                entry.holder.append(entries)
+                entry.event.set()
+        return {"ok": entry is not None}
+
+    def _pending_address_input(self, items: list[dict[str, Any]]) -> dict[str, str]:
+        return self._request_address_input(items)
 
     def _save_decision(self, error: str) -> str:
         return self._request_decision(
@@ -830,6 +874,11 @@ class Bridge:
             cfg.wps_test_tables = normalize_wps_test_tables(payload.get("test_tables"))
         if "marker_enabled" in payload:
             cfg.wps_marker_enabled = bool(payload.get("marker_enabled"))
+        if "sort_enabled" in payload:
+            cfg.wps_sort_enabled = bool(payload.get("sort_enabled"))
+        if "address_order" in payload:
+            from .config import normalize_wps_address_order
+            cfg.wps_address_order = normalize_wps_address_order(payload.get("address_order"))
         if "tables" in payload:
             from .config import normalize_wps_tables
             cfg.wps_tables = normalize_wps_tables(payload.get("tables"))
@@ -869,6 +918,13 @@ class Bridge:
             "excel_path": str(cfg.excel_path) if cfg.excel_path else "",
             "tables": [],
             "marker_enabled": bool(cfg.wps_marker_enabled),
+            "sort_enabled": bool(cfg.wps_sort_enabled),
+            "address_order": {sheet: list(order)
+                              for sheet, order in (cfg.wps_address_order or {}).items()},
+            # 出厂默认顺序（界面「恢复默认」用；避免前后端各写一份）
+            "address_order_defaults": {
+                sheet: list(order)
+                for sheet, order in default_wps_address_order().items()},
         }
         try:
             cli = self._wps_cli()
@@ -947,6 +1003,8 @@ class Bridge:
                                ledger=SyncLedger(),
                                marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
                                run_date=_dt.date.today(),
+                               address_order=cfg.wps_address_order,
+                               sort_enabled=cfg.wps_sort_enabled,
                                log=self.log)
         except WpsCloudError as exc:
             return {"ok": False, "reason": str(exc)}
@@ -989,9 +1047,12 @@ class Bridge:
                                ledger=ledger,
                                marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
                                run_date=_dt.date.today(),
+                               address_order=cfg.wps_address_order,
+                               sort_enabled=cfg.wps_sort_enabled,
                                log=self.log)
             self.log(f"[云同步] 目标日期 {target.isoformat()}，"
-                     f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}")
+                     f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}"
+                     + ("；按地址顺序重排整表" if cfg.wps_sort_enabled else "；已关闭排序"))
             if not any(p.target_col for p in plans):
                 self.log("[云同步] 所有表都没有找到目标日期列，未写入任何内容", "WARN")
             result = apply_plan(cli, plans, ledger=ledger,
@@ -1015,6 +1076,9 @@ class Bridge:
                 elif status == "skipped":
                     # 协作者还没加当天的列属于正常状态，用 INFO 而非 WARN。
                     self.log(f"[云同步] — {item['sheet']}：{item.get('reason', '跳过')}")
+                if item.get("sort_mismatch"):
+                    self.log(f"[云同步] {item['sheet']}：云端实际排序位置与预测略有出入，"
+                             f"已按实际行号写入（数据无误）", "WARN")
             level = "OK" if result["failed"] == 0 else "ERROR"
             self.log(f"[云同步] 完成：更新 {summary['to_update']} 人、新增 {summary['to_append']} 人、"
                      f"已完成 {summary['unchanged']} 人"

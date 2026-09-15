@@ -5,15 +5,45 @@
  * - 默认开启「测试模式」，只写测试文件，绝不碰正式排单表；
  * - 写入前必须先点「预览」，看清"会改谁、改成几"再确认上传；
  * - 总餐次写的是本地餐次的**绝对值**，因此重复上传不会翻倍；
+ * - 「地址排序」按子表维护列B 的顺序：新增客户先插到第 3、4 行之间再整表重排；
  * - 任何失败都只记日志，不影响本地排单任务。
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { ChevronDown, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Field, TextInput } from '@/components/fields'
 import { useApp } from '@/hooks/appContext'
 import { api, isApiReady, type WpsCopyCheck, type WpsResult, type WpsStatus } from '@/lib/bridge'
 import { cn } from '@/lib/utils'
+
+/** 地址排序涉及的 6 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
+const ADDRESS_SHEETS = [
+  '东湖中餐',
+  '衣锦中餐',
+  '医学院中餐',
+  '东湖晚餐',
+  '衣锦晚餐',
+  '医学院晚餐',
+] as const
+
+const ADDRESS_PLACEHOLDER = '一行一个地址，从上到下就是排列顺序；留空 = 按地址升序排列（医学院用这种）'
+
+/** 多行文本 → 顺序数组：按行拆分、去首尾空白、丢掉空行。 */
+function splitAddressLines(raw: string): string[] {
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '')
+}
+
+/** 地址清单输入框：样式与 TextInput 一致（底色 secondary，聚焦转卡片色）。 */
+const addressTextareaClass = cn(
+  'mt-1 w-full resize-y rounded-[4px] border border-transparent bg-secondary px-2.5 py-1.5',
+  'font-mono text-xs leading-relaxed transition-colors outline-none',
+  'placeholder:text-ink-faint focus-visible:border-ring focus-visible:bg-card',
+  'focus-visible:ring-[3px] focus-visible:ring-ring/50',
+)
 
 export function CloudForm() {
   const { config } = useApp()
@@ -26,6 +56,15 @@ export function CloudForm() {
   const [testMode, setTestMode] = useState(config?.wps_test_mode ?? true)
   const [cliPath, setCliPath] = useState(config?.wps_cli_path ?? '')
   const [marker, setMarker] = useState(config?.wps_marker_enabled ?? true)
+  // 地址排序：真实值来自 wps_status（bridge_ready 的 config 里不带这两个字段），
+  // 排序开关后端默认开启，先按默认值渲染、拉到状态后被覆盖。
+  const [sortEnabled, setSortEnabled] = useState(true)
+  const [addressOrder, setAddressOrder] = useState<Record<string, string[]>>({})
+  const [orderOpen, setOrderOpen] = useState(false)
+  // 编辑中的原始文本：直接回写 addressOrder 会让行尾回车被立刻吞掉，无法换行。
+  const [orderDraft, setOrderDraft] = useState<Record<string, string>>({})
+  // 本地清单有未保存改动时，不要被刷新回来的远端值覆盖。
+  const orderDirty = useRef(false)
   const loaded = useRef(false)
 
   const refresh = useCallback(async () => {
@@ -34,6 +73,8 @@ export function CloudForm() {
     try {
       const next = await api().wps_status()
       setStatus(next)
+      setSortEnabled(next.sort_enabled)
+      if (!orderDirty.current) setAddressOrder(next.address_order ?? {})
     } catch {
       /* 状态查询失败不打扰用户 */
     } finally {
@@ -51,9 +92,10 @@ export function CloudForm() {
     void refresh()
   }, [config, refresh])
 
-  function save(partial: Record<string, unknown>) {
-    if (!isApiReady()) return
-    api()
+  /** 保存云同步配置（返回是否成功；现有调用方忽略返回值）。 */
+  function save(partial: Record<string, unknown>): Promise<boolean> {
+    if (!isApiReady()) return Promise.resolve(false)
+    return api()
       .save_wps_config({
         enabled,
         test_mode: testMode,
@@ -62,12 +104,40 @@ export function CloudForm() {
         test_file_id: config?.wps_test_file_id ?? '',
         test_drive_id: config?.wps_test_drive_id ?? '',
         marker_enabled: marker,
+        sort_enabled: sortEnabled,
+        address_order: addressOrder,
         tables: config?.wps_tables ?? {},
         test_tables: config?.wps_test_tables ?? {},
         ...partial,
       })
-      .then(() => refresh())
-      .catch(() => {})
+      .then((result) => {
+        orderDirty.current = false
+        void refresh()
+        return result?.ok !== false
+      })
+      .catch(() => false)
+  }
+
+  /** 保存地址排序：把本地清单（含未保存改动）整份写回配置。 */
+  async function onSaveOrder() {
+    setMessage('')
+    const ok = await save({ sort_enabled: sortEnabled, address_order: addressOrder })
+    setMessage(ok ? '地址顺序已保存' : '地址顺序保存失败，详见日志')
+  }
+
+  /** 恢复出厂默认顺序：只改本地 state，点「保存顺序」才落盘。 */
+  function onRestoreOrderDefaults() {
+    const next: Record<string, string[]> = {}
+    for (const sheet of ADDRESS_SHEETS) {
+      // status 里没返回默认值（旧后端）时退回当前值（= 不变化）；
+      // 注意不能用 `|| []` 兜底：医学院的默认值本身就是空数组。
+      const fallback = status?.address_order_defaults?.[sheet] ?? addressOrder[sheet] ?? []
+      next[sheet] = [...fallback]
+    }
+    setAddressOrder(next)
+    setOrderDraft({})
+    orderDirty.current = true
+    setMessage('已恢复为出厂默认顺序，点「保存顺序」后写入配置')
   }
 
   const onPreview = useCallback(async () => {
@@ -132,6 +202,10 @@ export function CloudForm() {
 
   const summary = preview?.summary
   const pending = summary ? summary.to_update + summary.to_append : 0
+  /** 地址清单非空（= 已手工指定顺序）的子表数量；空清单表示按地址升序。 */
+  const addressConfigured = ADDRESS_SHEETS.filter(
+    (sheet) => (addressOrder[sheet] ?? []).length > 0,
+  ).length
   const authText = !status
     ? '状态未知'
     : !status.cli_found
@@ -206,6 +280,91 @@ export function CloudForm() {
           placeholder="自动查找"
         />
       </Field>
+
+      <div className="mb-3.5 rounded-md border px-3 py-2.5">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[13px] font-medium">地址排序{sortEnabled ? '（已开启）' : ''}</p>
+            <p className="text-[11px] text-muted-foreground">
+              开启后：新增客户时先把订单插到第 3、4 行之间，上好底色，再按下面的顺序把整张表重排
+            </p>
+          </div>
+          <Switch
+            checked={sortEnabled}
+            onCheckedChange={(v) => {
+              setSortEnabled(v)
+              save({ sort_enabled: v })
+            }}
+          />
+        </div>
+
+        <button
+          type="button"
+          className="mt-2 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+          onClick={() => setOrderOpen((open) => !open)}
+        >
+          {orderOpen ? (
+            <ChevronDown className="size-3.5" />
+          ) : (
+            <ChevronRight className="size-3.5" />
+          )}
+          {orderOpen
+            ? '收起地址顺序'
+            : `展开地址顺序（已指定 ${addressConfigured}/6 张子表）`}
+        </button>
+
+        {orderOpen ? (
+          <div className="mt-2.5">
+            {ADDRESS_SHEETS.map((sheet) => {
+              const items = addressOrder[sheet] ?? []
+              return (
+                <div key={sheet} className="mb-2.5 last:mb-0">
+                  <p className="text-[11px] font-medium">
+                    {sheet}
+                    <span className="ml-1 font-normal text-muted-foreground">
+                      （{items.length > 0 ? `${items.length} 个地址` : '留空 = 按地址升序'}）
+                    </span>
+                  </p>
+                  <textarea
+                    rows={4}
+                    spellCheck={false}
+                    placeholder={ADDRESS_PLACEHOLDER}
+                    className={addressTextareaClass}
+                    value={orderDraft[sheet] ?? items.join('\n')}
+                    onChange={(e) => {
+                      const raw = e.target.value
+                      // 编辑期间保留原始文本（含空行），规整后的结果同步进 state。
+                      setOrderDraft((prev) => ({ ...prev, [sheet]: raw }))
+                      setAddressOrder((prev) => ({ ...prev, [sheet]: splitAddressLines(raw) }))
+                      orderDirty.current = true
+                    }}
+                    onBlur={() =>
+                      // 失焦时丢掉草稿，让输入框回到"已规整"的内容（空行被清掉）。
+                      setOrderDraft((prev) => {
+                        if (!(sheet in prev)) return prev
+                        const next = { ...prev }
+                        delete next[sheet]
+                        return next
+                      })
+                    }
+                  />
+                </div>
+              )
+            })}
+            <div className="mt-2.5 flex flex-wrap gap-2">
+              <Button variant="outline" size="sm" onClick={onRestoreOrderDefaults}>
+                恢复默认
+              </Button>
+              <Button size="sm" onClick={onSaveOrder}>
+                保存顺序
+              </Button>
+            </div>
+            <p className="mt-1.5 text-[11px] text-muted-foreground">
+              列表里没有的地址一律排到最后；「恢复默认」只改这里的内容，点「保存顺序」才写入配置。
+            </p>
+          </div>
+        ) : null}
+      </div>
 
       {status?.tables && status.tables.length > 0 ? (
         <div className="mb-3.5 rounded-md border px-3 py-2.5 text-[11px] text-muted-foreground">

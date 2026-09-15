@@ -35,9 +35,60 @@ DEFAULT_WPS_TABLES: Dict[str, Dict[str, str]] = {
 }
 
 
+# 云端表「列B（地址）」的规定顺序（用户 2026-09-15 口述）。
+# 列表里没有的地址一律排到表格最后面；**空列表 = 按地址自然升序**（医学院用这种）。
+DEFAULT_ADDRESS_ORDER: Dict[str, list] = {
+    "东湖中餐": (["小", "大西"]
+               + [f"A{i}" for i in range(1, 7)]
+               + [f"b{i}" for i in range(1, 13)]
+               + [f"C{i}" for i in range(1, 13)]
+               + [f"D{i}" for i in range(1, 13)]),
+    "东湖晚餐": (["小", "大西"]
+               + [f"A{i}" for i in range(1, 7)]
+               + [f"b{i}" for i in range(1, 13)]
+               + [f"C{i}" for i in range(1, 13)]
+               + [f"D{i}" for i in range(1, 13)]),
+    "衣锦中餐": ["外卖柜", "校门口"],
+    "衣锦晚餐": ["外卖柜", "校门口"],
+    "医学院中餐": [],
+    "医学院晚餐": [],
+}
+
+
 def default_wps_production_tables() -> Dict[str, Dict[str, str]]:
     """正式排单表的 file_id（当前暂停使用，仅作切回备份）。"""
     return {sheet: dict(conf) for sheet, conf in DEFAULT_WPS_PRODUCTION_TABLES.items()}
+
+
+def default_wps_address_order() -> Dict[str, list]:
+    """返回地址顺序默认值的副本（避免多个实例共享同一 list）。"""
+    return {sheet: list(order) for sheet, order in DEFAULT_ADDRESS_ORDER.items()}
+
+
+def normalize_wps_address_order(value: Any,
+                                base: Optional[Dict[str, Any]] = None
+                                ) -> Dict[str, list]:
+    """规整「地址排序清单」：{子表名: [地址, ...]}。
+
+    规则与 normalize_wps_tables 一致：以 ``base``（默认=出厂默认）为底，
+    只覆盖传入值里出现的子表；**显式传空列表是有效值**（= 该表按地址升序），
+    因此不能用"空即忽略"的写法，必须按键判断。
+    """
+    result = {sheet: list(order) for sheet, order in (base or default_wps_address_order()).items()}
+    if not isinstance(value, dict):
+        return result
+    for sheet, order in value.items():
+        if not isinstance(sheet, str) or not sheet.strip():
+            continue
+        name = sheet.strip()
+        if isinstance(order, str):
+            items = order.splitlines()
+        elif isinstance(order, (list, tuple)):
+            items = list(order)
+        else:
+            continue
+        result[name] = [str(item).strip() for item in items if str(item or "").strip()]
+    return result
 
 
 def default_wps_test_tables() -> Dict[str, str]:
@@ -191,6 +242,10 @@ class AppConfig:
     wps_target_hour_end: int = 10
     # 是否写协作者通讯记号（备注列右侧第 2 列的周几数字）；测试模式下一律不写。
     wps_marker_enabled: bool = True
+    # 新增客户时是否按「列B 地址顺序」重排整张表（见 DEFAULT_ADDRESS_ORDER）。
+    wps_sort_enabled: bool = True
+    # {子表名: [地址, ...]}；空列表 = 该表按地址自然升序。
+    wps_address_order: Dict[str, Any] = field(default_factory=default_wps_address_order)
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -232,6 +287,8 @@ class AppConfig:
                  wps_target_hour_start: int = 20,
                  wps_target_hour_end: int = 10,
                  wps_marker_enabled: bool = True,
+                 wps_sort_enabled: bool = True,
+                 wps_address_order: Optional[Dict[str, Any]] = None,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -305,6 +362,8 @@ class AppConfig:
         self.wps_target_hour_start = max(0, min(23, start))
         self.wps_target_hour_end = max(0, min(23, end))
         self.wps_marker_enabled = bool(wps_marker_enabled)
+        self.wps_sort_enabled = bool(wps_sort_enabled)
+        self.wps_address_order = normalize_wps_address_order(wps_address_order)
         self.config_path = config_path
         # Snapshot used by ``save`` to distinguish "this instance never touched
         # the field" from "another thread/process wrote a newer value".

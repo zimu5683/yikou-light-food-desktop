@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,8 @@ class FakeCli:
         self.writes: list[dict] = []
         self.inserts: list[tuple[int, int]] = []
         self.format_ops: list[list[dict]] = []
+        self.sorts: list[dict] = []
+        self.deleted_columns: list[tuple[int, int]] = []
         self.path = "/fake/kdocs-cli"
 
     def sheets_info(self, file_id: str):
@@ -84,6 +87,61 @@ class FakeCli:
 
     def write_format_ops(self, file_id, worksheet_id, ops):
         self.format_ops.append([dict(op) for op in ops])
+
+    @staticmethod
+    def _col_index(letter: str) -> int:
+        value = 0
+        for char in str(letter).upper():
+            value = value * 26 + (ord(char) - 64)
+        return value - 1
+
+    def sort_range(self, file_id, worksheet_id, *, range_ref, key, order="asc",
+                   header=False, key2=None, order2=None):
+        """模拟云端原地排序：按辅助列**稳定**排序区域内所有列。
+
+        真实接口承诺"保留格式与公式、等键保持源顺序"，这里至少要把"行整体搬动、
+        所有列一起走"这条语义模拟对 —— 单元格错位是最危险的失败模式。
+        """
+        import re as _re
+        self.sorts.append({"range": range_ref, "key": key, "order": order,
+                           "header": header})
+        match = _re.match(r"^([A-Z]+)(\d+):([A-Z]+)(\d+)$", str(range_ref))
+        assert match, f"排序区域格式非法：{range_ref}"
+        c0 = self._col_index(match.group(1))
+        r0 = int(match.group(2))
+        c1 = self._col_index(match.group(3))
+        r1 = int(match.group(4))
+        first = r0 - 1 + (1 if header else 0)          # 0-based 首行
+        last = r1 - 1                                   # 0-based 末行
+        key_col = self._col_index(key)
+
+        def sort_key(row: int):
+            raw = str(self.grid.get((row, key_col), "") or "").strip()
+            # 空键排最后；键是零填充字符串，字典序即数值序
+            return (1, "") if not raw else (0, raw)
+
+        reverse = str(order).lower() == "desc"
+        rows = sorted(range(first, last + 1), key=sort_key, reverse=reverse)
+        block = {(r, c): v for (r, c), v in self.grid.items()
+                 if first <= r <= last and c0 <= c <= c1}
+        for r in range(first, last + 1):
+            for c in range(c0, c1 + 1):
+                self.grid.pop((r, c), None)
+        for offset, src in enumerate(rows):
+            for c in range(c0, c1 + 1):
+                if (src, c) in block:
+                    self.grid[(first + offset, c)] = block[(src, c)]
+
+    def delete_columns(self, file_id, worksheet_id, *, column, rows):
+        """删除一整列（左移）；排序辅助列的收尾清理。"""
+        self.deleted_columns.append((column, rows))
+        col = column - 1
+        shifted = {}
+        for (r, c), v in self.grid.items():
+            if c == col:
+                continue
+            shifted[(r, c - 1 if c > col else c)] = v
+        self.grid = shifted
 
     def authenticated(self) -> bool:
         return True
@@ -179,28 +237,33 @@ def test_person_key_normalizes_phone():
 # ----------------------------------------------------------------------
 
 def _plan(cli, orders, target=dt.date(2026, 9, 11), ledger=None, marker=True,
-          run_date=None):
+          run_date=None, address_order=None, sort=True):
     tables = {"东湖中餐": {"file_id": "F1"}}
     return build_plan(cli, local_orders={"东湖中餐": orders}, tables=tables,
                       target=target, ledger=ledger, marker_enabled=marker,
-                      run_date=run_date)
+                      run_date=run_date,
+                      address_order={} if address_order is None else address_order,
+                      sort_enabled=sort)
 
 
-def test_new_customer_is_appended():
+def test_new_customer_is_inserted_below_header():
+    """新客户插到第 3 行与第 4 行之间（关闭排序时就是第 4 行）。"""
     cli = FakeCli(make_grid(BASE_HEADER, [
         {0: "Ichi", 2: "111", 7: "3"},
     ]))
     orders = [CloudOrder("东湖中餐", "新人", "小", "222", "中餐", "经济", 6)]
-    plans = _plan(cli, orders)
+    plans = _plan(cli, orders, sort=False)
     changes = plans[0].changes
     assert len(changes) == 1 and changes[0].kind == "new"
-    assert changes[0].total_after == 6 and changes[0].row == 4   # 追加到第 4 行
+    assert changes[0].total_after == 6 and changes[0].row == 4
+    assert [b.position for b in plans[0].insert_blocks] == [4]
 
 
 def test_existing_customer_total_is_absolute_not_additive():
     """总餐次写的是本地值本身，不是"云端 + 本地"（否则重复跑会翻倍）。"""
     cli = FakeCli(make_grid(BASE_HEADER, [
-        {0: "张", 2: "111", 4: "1", 7: "6"},
+        # 真实老行：类型/餐种/已出餐/剩余餐都有值，所以不需要"补全"
+        {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6", 8: "=SUM(D3)", 9: "=H3-I3"},
     ]))
     orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
     change = _plan(cli, orders)[0].changes[0]
@@ -409,72 +472,60 @@ def _grouped_grid():
     ]))
 
 
-def test_new_customers_insert_after_address_group():
-    """新客户插到自己地址组的末尾，而不是表尾；下方已有内容整体下移。"""
+def test_new_customers_insert_as_single_block_at_row4():
+    """所有新客户合成一块，统一插到第 3 行与第 4 行之间。"""
     cli = _grouped_grid()
     orders = [
         CloudOrder("东湖中餐", "新人小", "小", "999", "中餐", "经济", 2),
         CloudOrder("东湖中餐", "新人西", "大西", "888", "中餐", "经济", 1),
     ]
-    plan = _plan(cli, orders)[0]
-    blocks = {b.position: b for b in plan.insert_blocks}
-    assert set(blocks) == {5, 6}, "大西组末行=4 → 插在第 5 行前；小组末行=5 → 插在第 6 行前"
-    assert blocks[5].first_row == 5 and blocks[6].first_row == 7
+    plan = _plan(cli, orders, sort=False)[0]
+    assert [(b.position, b.count, b.first_row) for b in plan.insert_blocks] == [(4, 2, 4)]
     rows = {c.name: c.row for c in plan.changes}
-    assert rows == {"新人西": 5, "新人小": 7}
+    # plan.changes 只包含本地排单表里的人；张/李/王 不在本地表里，看最终表格
+    assert rows == {"新人小": 4, "新人西": 5}
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
-    assert cli.grid[(3, 0)] == "李"            # 大西组在插入点之前，不动
-    assert cli.grid[(5, 0)] == "王"            # 小组的王被下移到第 6 行
-    assert cli.grid[(4, 0)] == "新人西" and cli.grid[(6, 0)] == "新人小"
+    names = [cli.grid.get((r, 0)) for r in range(2, 8)]
+    assert names == ["张", "新人小", "新人西", "李", "王", None], f"实际 {names}"
 
 
-def test_new_customer_row_is_complete():
-    """新客户行必须填齐：姓名/地址/电话/类型/餐种/总餐次/日期格。
-
-    真实事故：初版只写了姓名/地址/电话与日期格，漏了「类型」和「餐种」，
-    追加出来的人在云端缺了餐别信息。
-    """
-    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 2: "111", 7: "3"}]))
-    orders = [CloudOrder("东湖中餐", "新人", "D2", "222", "中餐", "豪华", 6)]
-    plans = _plan(cli, orders)
-    row = plans[0].changes[0].row
-    apply_plan(cli, plans, ledger=None, marker_enabled=False)
-
-    header = {c: v for (r, c), v in cli.grid.items() if r == 1}
-    got = {header[c]: cli.grid[(row - 1, c)]
-           for c in sorted(header) if (row - 1, c) in cli.grid}
-    assert got["名字"] == "新人"
-    assert got["地址"] == "D2"
-    assert got["电话"] == "222"
-    assert got["类型"] == "中餐"
-    assert got["餐种"] == "豪华"
-    assert got["总餐次"] == "6"
-    assert got["9.11 周五"] == "1"
-
-
-def test_existing_customer_below_insertion_is_written_at_shifted_row():
-    """插入会让下方的老客户整体下移：他们的写入行号必须跟着位移，否则会写错行。"""
+def test_sort_reorders_whole_table_by_address_order():
+    """按列B 的规定顺序重排整张表；清单外的地址排到最后面；组内老行在新行之前。"""
     cli = FakeCli(make_grid(BASE_HEADER, [
-        {0: "张", 1: "小", 2: "111", 7: "3"},
-        {0: "王", 1: "小", 2: "333", 7: "5"},
-        {0: "李", 1: "大西", 2: "222", 7: "4"},
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+        {0: "李", 1: "小", 2: "222", 7: "3"},
+        {0: "王", 1: "学三", 2: "333", 7: "3"},
     ]))
-    orders = [
-        CloudOrder("东湖中餐", "新人小", "小", "999", "中餐", "经济", 2),
-        CloudOrder("东湖中餐", "李", "大西", "222", "中餐", "经济", 6),   # 云端 4 餐 → 需更新
-    ]
-    plan = _plan(cli, orders)[0]
-    by_name = {c.name: c for c in plan.changes}
-    assert by_name["李"].kind == "existing" and by_name["李"].row == 6
+    order = {"东湖中餐": ["小", "大西", "A1"]}
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新人", "大西", "444", "中餐", "经济", 1)],
+                 address_order=order)[0]
+    rows = {c.name: c.row for c in plan.changes}
+    assert rows == {"新人": 5}
+    assert any("学三" in w and "最后面" in w for w in plan.warnings)
+    assert plan.sort_range and plan.sort_key_col
+
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
-    assert cli.grid[(5, 7)] == "6", "李下移到第 6 行，总餐次应写在新行号上"
-    assert cli.grid[(5, 4)] == "1", "李下移到第 6 行，日期格应写在新行号上"
-    assert cli.grid[(4, 0)] == "新人小", "新客户插在小组末尾（原李的位置）"
+    names = [cli.grid.get((r, 0)) for r in range(2, 6)]
+    assert names == ["李", "张", "新人", "王"], f"实际顺序 {names}"
+    assert cli.grid[(4, 1)] == "大西", "新人的地址跟着行一起搬到新位置"
 
 
-def test_address_alias_and_case_insensitive_group_match():
-    """本地「小西」按别名进云端「小」组（地址也按云端写法落表）；
-    「B2」忽略大小写匹配云端「b2」组，但地址按本地原样写。"""
+def test_empty_order_list_sorts_addresses_naturally():
+    """医学院那种「按列B升序」：自然数序 —— 医2号排在医10号之前。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "甲", 1: "医10号", 2: "111", 7: "3"},
+        {0: "乙", 1: "医2号", 2: "222", 7: "3"},
+        {0: "丙", 1: "医1号", 2: "333", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新", "医2号", "444", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": []})[0]
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    names = [cli.grid.get((r, 0)) for r in range(2, 6)]
+    assert names == ["丙", "乙", "新", "甲"], f"实际顺序 {names}"
+
+
+def test_address_alias_and_case_insensitive_match():
+    """本地「小西」按别名进云端「小」组；「B2」忽略大小写匹配，并按清单标准写法落表。"""
     cli = FakeCli(make_grid(BASE_HEADER, [
         {0: "张", 1: "小", 2: "111", 7: "3"},
         {0: "李", 1: "b2", 2: "222", 7: "4"},
@@ -483,30 +534,155 @@ def test_address_alias_and_case_insensitive_group_match():
         CloudOrder("东湖中餐", "黄", "小西", "18377144245", "中餐", "经济", 1),
         CloudOrder("东湖中餐", "陈章依", "B2", "15395721282", "中餐", "豪华", 1),
     ]
-    plan = _plan(cli, orders)[0]
-    rows = {c.name: c.row for c in plan.changes}
+    plan = _plan(cli, orders, address_order={"东湖中餐": ["小", "b2"]})[0]
     addrs = {c.name: c.address for c in plan.changes}
-    # 黄插到小组末（原第 3 行后）= 第 4 行；李(b2) 被挤到第 5 行；
-    # 陈章依插到 b2 组末（李原在第 4 行后）= 第 6 行（要算上黄那一行的位移）。
-    assert rows == {"黄": 4, "陈章依": 6}
-    assert addrs == {"黄": "小", "陈章依": "B2"}
-    assert not [w for w in plan.warnings if "地址组" in w]
+    assert addrs == {"黄": "小", "陈章依": "b2"}
+    assert not [w for w in plan.warnings if "不在排序清单" in w]
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
-    assert cli.grid[(3, 1)] == "小" and cli.grid[(5, 1)] == "B2"
-    assert cli.grid[(4, 0)] == "李", "李(b2) 被黄的插入挤到第 5 行"
+    names = [cli.grid.get((r, 0)) for r in range(2, 6)]
+    assert names == ["张", "黄", "李", "陈章依"], f"实际顺序 {names}"
+    assert cli.grid[(5, 1)] == "b2", "本地写 B2，云端按清单落成 b2"
 
 
-def test_unknown_address_appends_to_table_end_with_warning():
+def test_unknown_address_goes_to_table_end_with_warning():
     cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 1: "小", 2: "111", 7: "3"}]))
     orders = [CloudOrder("东湖中餐", "路人", "食堂", "555", "中餐", "经济", 1)]
-    plan = _plan(cli, orders)[0]
-    assert any("食堂" in w for w in plan.warnings)
-    change = plan.changes[0]
-    assert change.row == 4 and "追加到表尾" in change.detail
-    block = plan.insert_blocks[0]
-    assert block.append_only, "表尾追加不需要调用插入行接口"
+    plan = _plan(cli, orders, address_order={"东湖中餐": ["小"]})[0]
+    assert any("食堂" in w and "最后面" in w for w in plan.warnings)
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
-    assert cli.grid[(3, 0)] == "路人"
+    assert cli.grid[(2, 0)] == "张" and cli.grid[(3, 0)] == "路人", "清单外的人排在表尾"
+
+
+def test_helper_column_is_written_then_deleted():
+    """排序用辅助列：写在所有内容列右侧，排序后整列删掉（右侧不留垃圾）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "b2", 2: "111", 7: "3"},
+        {0: "李", 1: "小", 2: "222", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新", "小", "999", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": ["小", "b2"]})[0]
+    assert cli.sheets_info("F1")[0]["colTo"] + 1 < plan.sort_key_col, "辅助列在内容列右侧"
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.sorts and cli.sorts[0]["key"] == wc.column_name(plan.sort_key_col)
+    assert cli.sorts[0]["header"] is False, "第 3 行起排序，首行不是表头"
+    assert cli.deleted_columns == [(plan.sort_key_col, plan.last_data_row)]
+    left = [v for v in cli.grid.values() if re.fullmatch(r"\d{4}", str(v))]
+    assert not left, f"辅助列没清干净：{left}"
+
+
+def test_sort_failure_rolls_back_inserted_rows():
+    """排序失败时行还没被搬动，可以把插进去的新行整块删掉。"""
+    class NoSortCli(FakeCli):
+        def sort_range(self, *_a, **_k):
+            raise WpsCloudError("模拟排序失败")
+
+    cli = NoSortCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+        {0: "王", 1: "小", 2: "222", 7: "3"},
+    ]))
+    result = apply_plan(cli, _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "999",
+                                                    "中餐", "经济", 1)],
+                                   address_order={"东湖中餐": ["小", "大西"]}),
+                        ledger=None, marker_enabled=False)
+    assert result["failed"] == 1
+    assert cli.inserts, "确实调用过插入行接口"
+    assert [cli.grid.get((r, 0)) for r in range(2, 4)] == ["张", "王"], "回滚后恢复原状"
+
+
+def test_write_failure_after_sort_does_not_delete_rows():
+    """排序成功后写入失败：**不回滚删行**（新行已散落到各地址组，删行会删错人）。"""
+    class FailAfterSortCli(FakeCli):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sorted = False
+
+        def sort_range(self, *args, **kwargs):
+            super().sort_range(*args, **kwargs)
+            self.sorted = True
+
+        def write_cells(self, file_id, worksheet_id, cells):
+            if self.sorted:
+                raise WpsCloudError("模拟排序后写入失败")
+            return super().write_cells(file_id, worksheet_id, cells)
+
+    cli = FailAfterSortCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+    ]))
+    result = apply_plan(cli, _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "999",
+                                                    "中餐", "经济", 1)],
+                                   address_order={"东湖中餐": ["小", "大西"]}),
+                        ledger=None, marker_enabled=False)
+    assert result["failed"] == 1
+    assert cli.sorts, "排序已经发生"
+    names = [cli.grid.get((r, 0)) for r in range(2, 5)]
+    assert "新人" in names, f"新行不能被删掉（实际 {names}）"
+
+
+def test_actual_sort_result_wins_over_prediction():
+    """云端排序结果与本地预测不一致时，按**实际行号**写入并标记 sort_mismatch。"""
+    class ShuffleCli(FakeCli):
+        """故意按降序排，模拟"云端排法与本地预测不一致"。"""
+
+        def sort_range(self, file_id, worksheet_id, **kwargs):
+            # 故意按**降序**排（与本地的升序预测不同），模拟"云端排法与预测不一致"
+            kwargs["order"] = "desc"
+            super().sort_range(file_id, worksheet_id, **kwargs)
+
+    cli = ShuffleCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+        {0: "王", 1: "小", 2: "222", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 1),
+                       CloudOrder("东湖中餐", "王", "小", "222", "中餐", "经济", 3)],
+                 address_order={"东湖中餐": ["小", "大西"]})[0]
+    result = apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert result["written"] == 1
+    assert result["sheets"][0]["sort_mismatch"] is True
+    for change in plan.changes:
+        row = change.row
+        assert cli.grid.get((row - 1, 0)) == change.name, \
+            f"{change.name} 的写入行号与姓名不符（第 {row} 行）"
+
+
+def test_existing_customer_written_at_post_sort_row():
+    """整表重排后，老客户的总餐次/日期格必须写在他们的**新**行号上。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "b2", 2: "111", 7: "3"},
+        {0: "李", 1: "小", 2: "222", 7: "3"},
+    ]))
+    orders = [
+        CloudOrder("东湖中餐", "李", "小", "222", "中餐", "经济", 6),      # 老客户，3 → 6
+        CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 1),
+    ]
+    plan = _plan(cli, orders, address_order={"东湖中餐": ["小", "b2"]})[0]
+    rows = {c.name: c.row for c in plan.changes}
+    assert rows == {"新人": 4, "李": 3}
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.grid[(2, 0)] == "李" and cli.grid[(2, 7)] == "6" and cli.grid[(2, 4)] == "1"
+    assert cli.grid[(4, 0)] == "张" and (4, 4) not in cli.grid, "张没有日期格，别写错行"
+
+
+def test_missing_meal_columns_are_completed():
+    """半成品行自愈：老客户缺类型/餐种/公式时补齐（上次中断后的补救）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 1: "小", 2: "111", 7: "6"}]))
+    orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "豪华", 6)]
+    plan = _plan(cli, orders, sort=False)[0]
+    change = plan.changes[0]
+    assert change.fill_type and change.fill_kind and change.fill_formula
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.grid[(2, 5)] == "中餐" and cli.grid[(2, 6)] == "豪华"
+    assert cli.grid[(2, 8)] == "=SUM(D3:E3)" and cli.grid[(2, 9)] == "=H3-I3"
+
+
+def test_sort_disabled_keeps_new_rows_on_top():
+    """排序开关关闭：新行留在第 4 行起，不做任何重排（应急模式）。"""
+    cli = _grouped_grid()
+    orders = [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 1)]
+    plan = _plan(cli, orders, sort=False)[0]
+    assert plan.sort_key_col == 0 and plan.sort_range == "" and not plan.sort_enabled
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    names = [cli.grid.get((r, 0)) for r in range(2, 6)]
+    assert names == ["张", "新人", "李", "王"], f"实际顺序 {names}"
 
 
 def test_marker_column_detected_from_existing_weekday_number():
@@ -533,6 +709,52 @@ def test_marker_value_is_run_day_not_target_day():
                           run_date=dt.date(2026, 9, 11)),
                ledger=None, marker_enabled=True)
     assert cli.grid[(1, 16)] == "6", "写回协作者原记号位（Q 列），值更新为运行日的周几"
+
+
+def test_date_region_stops_before_first_structural_column():
+    """日期列区间 = 电话右侧 ~ 第一个结构列左侧（衣锦中餐有 114 个日期列，同理）。"""
+    assert wc.date_region({"phone": 4, "type": 11, "kind": 12, "total": 13,
+                           "served": 14, "left": 15, "remark": 16}) == (5, 10)
+    wide = {"phone": 4, "type": 118, "kind": 119, "total": 120,
+            "served": 121, "left": 122, "remark": 123}
+    assert wc.date_region(wide) == (5, 117)
+    assert wc.date_region({"phone": 4}) == (5, wc.MAX_SCAN_COL)
+
+
+def test_collaborator_marker_column_is_not_a_date_column():
+    """协作者写在备注右侧的「9.11 周五」是标记，不是日期列。
+
+    真实缺陷：date_cols 原来扫描整行表头，把标记列也算进去，
+    新行的「已出餐」公式因此变成 =SUM(D:E:M)（多统计了标记列）。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老人", 1: "小", 2: "111", 7: "3"}]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "222", "中餐", "经济", 1)],
+                 sort=False)[0]
+    assert plan.date_cols == [4, 5], f"实际 {plan.date_cols}（13 是协作者的标记列）"
+    assert any("已忽略日期区间外的日期样式格" in w for w in plan.warnings)
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    row = plan.changes[0].row
+    assert cli.grid[(row - 1, 8)] == f"=SUM(D{row}:E{row})", "公式不能含标记列"
+    assert cli.grid[(1, 12)] == "9.11 周五", "协作者的标记格一个字节都不能动"
+
+
+def test_target_date_is_not_written_into_marker_column():
+    """当天没有真实日期列时，宁可不写，也不能把 1 写进协作者的标记格。"""
+    header = dict(BASE_HEADER)
+    header.pop(4)                       # 去掉真正的 9.11 列，只留备注右侧的标记
+    cli = FakeCli(make_grid(header, [{0: "张", 2: "111", 7: "6"}]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)])[0]
+    assert plan.target_col == 0
+    assert any("没有 9.11" in w for w in plan.warnings)
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.grid[(1, 12)] == "9.11 周五", "协作者的标记格必须原样不动"
+
+
+def test_marker_column_guard_avoids_date_like_cell():
+    """记号兜底位是备注+3：备注+2 被协作者的日期标记占着。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)])[0]
+    assert plan.marker_col == 14        # 备注列 11 + 3
 
 
 def test_apply_plan_skips_marker_in_test_mode_call():
@@ -598,7 +820,9 @@ def test_write_cells_batches_under_api_limit():
     # 25 个新客户 × 9 格（基础字段、日期格、两条公式）= 225 格
     orders = [CloudOrder("东湖中餐", f"新{i}", "D2", f"1390000{i:04d}", "中餐", "经济", 1)
               for i in range(25)]
-    result = apply_plan(cli, _plan(cli, orders), ledger=None, marker_enabled=False)
+    # 关闭排序：本用例只验证分批，25 人 × 9 格 = 225 格
+    result = apply_plan(cli, _plan(cli, orders, sort=False), ledger=None,
+                        marker_enabled=False)
     assert len(calls) >= 2, "175 格必须拆成多批"
     assert sum(len(b) for b in calls) == 25 * 9
     assert result["written"] == 1 and result["failed"] == 0
@@ -615,8 +839,10 @@ def test_apply_plan_writes_marker_when_enabled():
     cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
     orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
     apply_plan(cli, _plan(cli, orders), ledger=None, marker_enabled=True)
-    # 备注列（第 11 列 = index 10）+ 2 = 第 13 列（index 12），第 2 行
-    assert cli.grid[(1, 12)] == str(weekday_number(dt.date(2026, 9, 11)))
+    # 备注列（第 11 列 = index 10）+ 3 = 第 14 列（index 13），第 2 行；
+    # 备注+2（index 12）是协作者的日期标记，绝不能被写
+    assert cli.grid[(1, 13)] == str(weekday_number(dt.date(2026, 9, 11)))
+    assert cli.grid[(1, 12)] == "9.11 周五"
 
 
 def test_second_run_writes_nothing():
@@ -759,3 +985,32 @@ def test_formula_cells_for_new_rows_use_dynamic_date_columns():
         {"row": 34, "col": 13, "value": "=SUM(D34:I34)"},
         {"row": 34, "col": 14, "value": "=L34-M34"},
     ]
+
+
+def test_empty_cloud_table_starts_at_first_data_row():
+    """空表（还没有任何人）直接写第 3 行起：不插行、不留空行、不排序。"""
+    cli = FakeCli(make_grid(BASE_HEADER, []))
+    plans = _plan(cli, [CloudOrder("东湖中餐", "首单", "小", "123", "中餐", "经济", 6)],
+                  address_order={"东湖中餐": ["小"]})
+    plan = plans[0]
+    assert plan.changes[0].row == 3
+    assert plan.insert_blocks and plan.insert_blocks[0].append_only
+    apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert cli.inserts == [], "空表不需要调用插入行接口"
+    assert cli.grid[(2, 0)] == "首单" and cli.grid[(2, 4)] == "1"
+
+
+def test_interior_blank_row_is_not_dumped_at_table_end():
+    """表中间的空行（分组之间的分隔行）要留在原分组里，不能被排序甩到表尾。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "甲", 1: "小", 2: "111", 7: "3"},
+        {0: "乙", 1: "小", 2: "222", 7: "3"},
+        {11: "分隔行"},                       # 第 5 行：没有姓名，只有别列内容
+        {0: "丙", 1: "大西", 2: "333", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "999", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": ["小", "大西"]})[0]
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    names = [cli.grid.get((r, 0)) for r in range(2, 7)]
+    assert names == ["甲", "乙", "新人", None, "丙"], f"实际 {names}"
+    assert cli.grid.get((5, 11)) == "分隔行", "分隔行留在小组之后、大西之前"

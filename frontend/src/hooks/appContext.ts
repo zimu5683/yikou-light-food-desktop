@@ -6,6 +6,7 @@
  */
 import { createContext, useContext } from 'react'
 import {
+  type AddressInputRequest,
   type AppState,
   type CaptchaRequest,
   type DecisionRequest,
@@ -41,6 +42,7 @@ export interface AppStateBundle {
   logs: LogRow[]
   decision: DecisionRequest | null
   captcha: CaptchaRequest | null
+  addressInput: AddressInputRequest | null
   updateProgress: UpdateProgress | null
   workerAlive: boolean
   mode: TaskMode
@@ -60,6 +62,7 @@ export interface AppStateBundle {
   clearLogs: () => void
   resolveDecision: (id: string, choice: string) => void
   resolveCaptcha: (id: string, code: string) => void
+  resolveAddressInput: (id: string, entries: Record<string, string>) => void
 }
 
 export const AppContext = createContext<AppStateBundle | null>(null)

@@ -51,10 +51,25 @@ CELL_MARK = "1"
 FIRST_DATA_ROW = 3
 HEADER_ROW = 2
 TITLE_ROW = 1
-# 通讯记号默认偏移：备注列右边第 2 列
-MARKER_OFFSET = 2
+# 通讯记号默认偏移：备注列右边第 3 列。
+# （备注+2 实测被协作者的「9.14 周一」日期标记占用，兜底位置必须让开）
+MARKER_OFFSET = 3
 # 通讯记号的合法数字（周几：周日=1 … 周六=7）。用于在表头行里认出记号位。
 MARKER_VALUES = range(1, 8)
+# 结构列（除姓名/地址/电话/日期以外的固定列）。
+# **日期列只允许出现在「电话列」与「第一个结构列」之间** —— 备注右侧是协作者
+# 写日期标记的区域（实测 6 张表都在备注+2），绝不能当成日期列：
+# 否则新行的「已出餐」公式会把它统计进去，甚至把目标日期的 1 写进协作者的格子。
+STRUCT_COLUMN_KEYS = ("type", "kind", "total", "served", "left", "remark")
+# 排序辅助列的列号上限：真实排单表最宽也就 200 多列，异常宽说明 used range 有问题，
+# 此时宁可不排序，也不要对几万列的区域发排序请求。
+MAX_SORT_COL = 1000
+# 排序键零填充宽度：接口可能把数字按文本比较（"10" < "2"），补零后字典序即数值序。
+SORT_KEY_WIDTH = 4
+# 同一个地址组内：已有行在前（+0），本次新增行在后（+1），空行垫底（+2）。
+SORT_FLAG_EXISTING = 0
+SORT_FLAG_NEW = 1
+SORT_FLAG_BLANK = 2
 # 本地排单路线名 -> 云端地址组的写法（协作者习惯，实测 2026-09-12 目标表）。
 # 命中别名时：插入到云端组的末尾，且地址格按云端写法落表。
 ADDRESS_ALIASES = {"小西": "小"}
@@ -112,7 +127,7 @@ class Change:
     kind: str               # existing / new
     name: str
     phone: str
-    row: int                # 云端行号（new 为追加行号）
+    row: int                # 云端行号（排序后要写入的行号）
     delta: int              # 总餐次差值（want - before），0 表示已一致
     target_col: int         # 目标日期列（1-based）
     total_before: int = 0
@@ -123,20 +138,29 @@ class Change:
     meal_type: str = ""     # 类型：中餐 / 晚餐
     meal_kind: str = ""     # 餐种：经济 / 豪华
     detail: str = ""
+    # 补全标记：云端这些格子目前是空的，本次要补上（防止上次中断留下半成品行）
+    fill_type: bool = False
+    fill_kind: bool = False
+    fill_formula: bool = False
+    # 新客户**排序前**所在的物理行号：排序前要写的东西（姓名/地址/电话/类型/餐种、
+    # 底色）必须写在这里，否则会覆盖掉别人（排序后行号在那时还属于其他人）。
+    # 放在最后，避免影响按位置构造 Change 的老代码。
+    insert_row: int = 0
 
     @property
     def needs_write(self) -> bool:
-        return (not self.target_ok) or self.total_after != self.total_before
+        return ((not self.target_ok) or self.total_after != self.total_before
+                or self.fill_type or self.fill_kind or self.fill_formula)
 
 
 @dataclass
 class InsertBlock:
-    """一批要插入云端的新客户行（按地址组聚在一起）。
+    """一批要插入云端的新客户行。
 
-    ``position`` 是**原始坐标**里"插到这一行之前"（即地址组末行 + 1）；
-    ``first_row`` 是计入所有插入位移后的实际起始行号（写入/校验都用它）。
-    ``append_only`` 为 True 表示就是表尾追加，不需要调用插入行接口
-    （写单元格时接口会自动把表扩出来）。
+    2026-09-15 起流程改为：**所有新客户合成一块，统一插到第 3 行与第 4 行之间**，
+    再按列B 的地址顺序把整张表重排（见 ``SheetPlan.sort_*``）。
+    ``position`` 是「插到这一行之前」（固定 = 4）；``append_only`` 表示表里本来
+    就没有数据行，直接写第 4 行起即可，不需要调用插入行接口。
     """
 
     position: int
@@ -165,11 +189,28 @@ class SheetPlan:
     format_rows: list[int] = field(default_factory=list)
     # 参考行的逐列底色 {1-based 列: "#AARRGGBB"}（build_plan 里一次性读好并缓存）
     format_fills: dict[int, str] = field(default_factory=dict)
-    # 新客户插入块（按 position 升序）；老客户行号已计入位移
+    # 新客户插入块（统一一块：插到第 4 行之前）；老客户行号已计入排序结果
     insert_blocks: list[InsertBlock] = field(default_factory=list)
     # 协作者通讯记号列（1-based）；0 = 没找到
     marker_col: int = 0
     date_cols: list[int] = field(default_factory=list)
+    # ---- 排序（新增客户时按列B 的地址顺序重排整张表）----
+    # 本次是否真的执行了「插到第 4 行 + 整表重排」
+    sort_enabled: bool = False
+    # 排序键辅助列（1-based）；0 = 本次不排序
+    sort_key_col: int = 0
+    # 排序区域，形如 ``A3:GS142``
+    sort_range: str = ""
+    # 每个数据行的排序键：{(排序前不能用的) 行号: 键值}
+    row_keys: dict[int, int] = field(default_factory=dict)
+    # 预测的排序后行号：{(姓名, 电话): 行号}
+    final_rows: dict[tuple[str, str], int] = field(default_factory=dict)
+    # 实际排序结果与预测不一致（真机 sort_range 行为异常）
+    sort_mismatch: bool = False
+    # 排序后数据区的最后一行（1-based）
+    last_data_row: int = 0
+    # 不在地址清单里的地址（预览里提示"会排到表尾"）
+    unknown_addresses: list[str] = field(default_factory=list)
 
     @property
     def applied(self) -> bool:
@@ -229,17 +270,113 @@ def _address_key(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "")).casefold()
 
 
+def canonical_address(raw: Any, order: Sequence[str] = ()) -> str:
+    """落表时用的地址写法：先过别名（本地「小西」= 云端「小」），
+    再按清单里的标准写法统一（本地写「B5」→ 落「b5」；匹配忽略大小写与空格）。"""
+    text = str(raw or "").strip()
+    text = ADDRESS_ALIASES.get(text, text)
+    key = _address_key(text)
+    for item in order:
+        if _address_key(item) == key:
+            return str(item).strip()
+    return text
+
+
+_NATURAL_CHUNK = re.compile(r"(\d+)")
+
+def natural_key(text: Any) -> tuple:
+    """自然序排序键：「医2号」排在「医10号」之前（数字按数值比，不按字典序）。
+
+    返回可比较的元组：文本块用 (0, 文本)，数字块用 (1, 数值)。
+    """
+    chunks: list[tuple[int, Any]] = []
+    for piece in _NATURAL_CHUNK.split(str(text or "")):
+        if not piece:
+            continue
+        if piece.isdigit():
+            chunks.append((1, int(piece)))
+        else:
+            chunks.append((0, piece.casefold()))
+    return tuple(chunks)
+
+
+def build_address_ranks(order: Sequence[str],
+                        addresses: Iterable[str]) -> tuple[dict[str, int], int]:
+    """算出「归一化地址 -> 名次」，名次越小越靠前。
+
+    ``order`` 非空：按清单顺序排名，清单里没有的一律 ``len(order)``（排表尾）；
+    ``order`` 为空：对出现过的地址按**自然序**升序排名（医学院用这种）。
+    返回 ``(名次表, 表尾名次)``。
+    """
+    normalized = [_address_key(addr) for addr in order if str(addr).strip()]
+    if normalized:
+        ranks = {addr: idx for idx, addr in enumerate(normalized)}
+        return ranks, len(normalized)
+    distinct = sorted({_address_key(a) for a in addresses if _address_key(a)}, key=natural_key)
+    return {addr: idx for idx, addr in enumerate(distinct)}, len(distinct)
+
+
+def sort_key_value(rank: int, flag: int) -> int:
+    """复合排序键：地址名次为主，同组内已有行（0）在前、新增行（1）在后。"""
+    return rank * 10 + flag
+
+
+def format_sort_key(value: int) -> str:
+    """零填充成定宽字符串 —— 接口若按文本排序，字典序也必须等于数值序。"""
+    return f"{value:0{SORT_KEY_WIDTH}d}"
+
+
+def sort_key_column(*, sheet_col_to: int, extra_cols: Iterable[int] = ()) -> int:
+    """选排序辅助列：一定落在该表**所有内容列右侧**。
+
+    排序范围必须覆盖所有有内容的列，否则右侧那些列不会跟着行一起移动，
+    行与列就错位了。放在最后使用列的右边一格，天然满足这个条件。
+    """
+    last = max([int(sheet_col_to or 0), 1, *[int(c or 0) for c in extra_cols]])
+    return last + 1
+
+
+def date_region(columns: Mapping[str, int],
+                *, fallback_hi: int = MAX_SCAN_COL) -> tuple[int, int]:
+    """日期列允许出现的区间 ``(lo, hi)``（1-based 闭区间）。
+
+    规则：从**电话列的右一列**开始，到**第一个结构列（类型/餐种/总餐次/已出餐/
+    剩余餐/备注）的左一列**结束。备注右侧是协作者写「9.14 周一」标记的区域，
+    把它排除掉才不会把标记列当成日期列。
+    """
+    lo = int(columns.get("phone") or 3) + 1
+    struct = [int(columns[key]) for key in STRUCT_COLUMN_KEYS if columns.get(key)]
+    hi = (min(struct) - 1) if struct else int(fallback_hi)
+    if hi < lo:
+        hi = lo - 1
+    return lo, hi
+
+
+def date_headers(header: Mapping[int, str], lo: int, hi: int) -> list[tuple[int, str]]:
+    """表头里落在日期区间内的日期样式格，返回 ``[(1-based 列, 原文)]``。"""
+    found: list[tuple[int, str]] = []
+    for col in sorted(header):
+        column = int(col) + 1
+        if lo <= column <= hi and parse_date_header(header[col]):
+            found.append((column, str(header[col])))
+    return found
+
+
 def find_marker_column(header: Mapping[int, str], remark_col: int) -> int:
     """定位协作者通讯记号列（返回 1-based 列号，找不到用兜底位置）。
 
     优先：备注列右侧第一个内容为 1~7 整数的格子 —— 那是协作者**正在用**的
-    记号位（实测它会随协作方式变化：东湖中餐在备注+3 的 Q 列，不能写死偏移）。
-    兜底：备注列右边第 2 列（2026-09 上旬 6 张表的实测位置）。
+    记号位（实测它会随协作方式变化，不能写死偏移）。
+    兜底：备注列右边第 3 列（备注+2 已被协作者的日期标记占用）。
+    **护栏**：找到的格子若本身是「9.14 周一」这类日期样式，说明那是协作者的
+    标记列，宁可不用也不覆盖 —— 此时返回兜底位置。
     """
     for col in sorted(header):
         if col + 1 <= remark_col:
             continue
         text = str(header[col]).strip()
+        if parse_date_header(text):
+            continue
         if text.isdigit() and int(text) in MARKER_VALUES:
             return col + 1
     return remark_col + MARKER_OFFSET
@@ -651,6 +788,19 @@ class KdocsCli:
                 "row_from": row - 1, "row_to": row - 1 + count - 1}],
             "shift_type": "shift_up"})
 
+    def delete_columns(self, file_id: str, worksheet_id: int, *,
+                       column: int, rows: int) -> None:
+        """删除一整列（排序辅助列的收尾清理）。``column`` 为 1-based 列号。
+
+        辅助列一定在该表所有内容列的右侧，所以左移删除不会动到任何数据。
+        """
+        self._run("sheet", "delete-range-data", params={
+            "file_id": file_id, "worksheet_id": worksheet_id,
+            "range_data": [{
+                "col_from": column - 1, "col_to": column - 1,
+                "row_from": 0, "row_to": max(0, rows - 1)}],
+            "shift_type": "shift_left"})
+
     def write_format_ops(self, file_id: str, worksheet_id: int,
                          ops: Sequence[Mapping[str, Any]]) -> None:
         """批量写格式操作（opType=format），按接口单次上限自动分批。"""
@@ -716,9 +866,18 @@ def _find_column(header: Mapping[int, str], names: Sequence[str]) -> int | None:
 
 
 def find_target_column(header: Mapping[int, str],
-                       target: _dt.date) -> tuple[int, str] | None:
-    """在表头里找目标日期的列（只比对月.日）。"""
+                       target: _dt.date,
+                       *, col_from: int = 1, col_to: int = MAX_SCAN_COL
+                       ) -> tuple[int, str] | None:
+    """在表头里找目标日期的列（只比对月.日），**限定在日期区间内**。
+
+    必须限定区间：协作者的标记格里也写着「9.14 周一」，若不设限，在当天还没有
+    真实日期列时会命中标记列，把 1 写进协作者的格子。
+    """
     for col in sorted(header):
+        column = int(col) + 1
+        if not (col_from <= column <= col_to):
+            continue
         parsed = parse_date_header(header[col])
         if parsed and parsed == (target.month, target.day):
             return col, str(header[col])
@@ -758,12 +917,18 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
                ledger: SyncLedger | None,
                marker_enabled: bool = True,
                run_date: _dt.date | None = None,
+               address_order: Mapping[str, Sequence[str]] | None = None,
+               sort_enabled: bool = True,
                log: Callable[[str], Any] | None = None) -> list[SheetPlan]:
     """只读云端，生成写入计划（不写任何东西）。
 
     ``run_date``：运行日（通讯记号写的是**运行日**的周几，不是目标日期 ——
     实测目标表：周四晚跑记号 5、周五晚跑记号 6）。缺省退回目标日期。
+
+    ``address_order``：``{子表名: [地址, ...]}``，列B 的规定顺序；空列表表示
+    按地址自然升序。``sort_enabled``：新增客户时是否重排整张表。
     """
+    order_map = address_order or {}
     plans: list[SheetPlan] = []
     for sheet, orders in local_orders.items():
         conf = tables.get(sheet)
@@ -779,6 +944,9 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
             plans.append(plan)
             continue
         worksheet_id = int(infos[0].get("sheetId") or 1)
+        # 真实的「最后使用列」（1-based）——排序辅助列要放在它右边，不能用被
+        # MAX_SCAN_COL 截断过的读取范围。
+        real_col_to = int(infos[0].get("colTo") or 0) + 1
         row_to, col_to = scan_bounds(infos[0])
         grid = cli.read_grid(plan.file_id, worksheet_id, 0, row_to, 0, col_to)
         plan.append_row = max(plan.append_row, 0)
@@ -802,15 +970,31 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
             "left": col_or(HEADER_LEFT, 0),
             "remark": col_or(HEADER_REMARK, 0),
         }
-        found = find_target_column(header, target)
-        if not found:
+        # 日期列区间：电话右侧 ~ 第一个结构列左侧。
+        # 区间外（备注右侧）的日期样式格子是协作者的标记，只提示、不参与统计。
+        date_lo, date_hi = date_region(plan.columns)
+        stray_dates = [(int(col) + 1, str(text)) for col, text in header.items()
+                       if int(col) + 1 > date_hi and parse_date_header(text)]
+        if stray_dates:
+            shown = "、".join(f"{column_name(c)}{HEADER_ROW}「{t}」"
+                             for c, t in stray_dates[:2])
             plan.warnings.append(
-                f"云端表里没有 {target.month}.{target.day} 这一列，请确认协作者是否已加好当天的列")
+                f"已忽略日期区间外的日期样式格 {shown}（判定为协作者的标记列，不参与统计）")
+        found = find_target_column(header, target, col_from=date_lo, col_to=date_hi)
+        if not found:
+            note = ("（注意：备注右侧那些『9.14 周一』样式的格子是协作者的标记列，"
+                    "不会当成日期列）" if stray_dates else "")
+            plan.warnings.append(
+                f"云端表里没有 {target.month}.{target.day} 这一列，"
+                f"请确认协作者是否已加好当天的列{note}")
             plans.append(plan)
             continue
         plan.target_col, plan.target_header = found[0] + 1, found[1]
-        plan.date_cols = [col + 1 for col, text in header.items()
-                          if parse_date_header(text)]
+        plan.date_cols = [column for column, _text in date_headers(header, date_lo, date_hi)]
+        if not plan.date_cols:
+            plan.warnings.append("日期区间里一个日期列都没读到，已拒绝写入")
+            plans.append(plan)
+            continue
 
         # 结构性校验：表头必须能读出姓名、电话、类型、餐种、总餐次。
         # 缺任何一项通常意味着表头被人改乱了（例如某列表头被覆盖成了日期），
@@ -842,19 +1026,23 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
                 people.setdefault(key, row + 1)
         plan.append_row = last_used + 1
 
-        # 地址组末行：{组名归一化: 该组最后一行的 1-based 行号}。
-        # 协作者按地址分区维护表格，新客户要插到自己地址组的末尾（实测目标表），
-        # 而不是一律追加到表尾 —— 这就是用户说的"排序"。
-        group_end: dict[str, int] = {}
+        # 数据行（有姓名的行）与逐行地址 —— 排序要用。
+        # 只认「有姓名」的行：表尾若有合计/说明之类的非人员行，不参与排序。
         addr_col = plan.columns.get("address") or 0
+        data_rows: list[int] = []                       # 1-based，升序
+        address_of: dict[int, str] = {}                 # 行号 -> 地址原文
+        for (row, col), text in grid.items():
+            if row < FIRST_DATA_ROW - 1 or col != plan.columns["name"] - 1:
+                continue
+            if not str(text).strip():
+                continue
+            data_rows.append(row + 1)
+        data_rows = sorted(set(data_rows))
         if addr_col:
-            for (row, col), text in grid.items():
-                if row >= FIRST_DATA_ROW - 1 and col == addr_col - 1:
-                    key = _address_key(text)
-                    if key:
-                        group_end[key] = max(group_end.get(key, 0), row + 1)
+            for row in data_rows:
+                address_of[row] = str(grid.get((row - 1, addr_col - 1), "") or "").strip()
 
-        # 通讯记号列：优先认协作者正在用的 1~7 数字格，找不到用备注+2 兜底。
+        # 通讯记号列：优先认协作者正在用的 1~7 数字格，找不到用备注+3 兜底。
         if plan.columns.get("remark"):
             plan.marker_col = find_marker_column(header, plan.columns["remark"])
 
@@ -912,7 +1100,24 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
                 want = order.meals
                 change = Change(kind="existing", name=order.name, phone=order.phone,
                                 row=row, delta=want - before, target_col=plan.target_col,
-                                total_before=before, total_after=want, target_ok=already)
+                                total_before=before, total_after=want, target_ok=already,
+                                address=str(order.address or "").strip(),
+                                meal_type=order.meal_type, meal_kind=order.meal_kind)
+                # 半成品行自愈：上次中断可能留下缺「类型/餐种/公式」的行，本次补齐。
+                type_col = plan.columns.get("type") or 0
+                kind_col = plan.columns.get("kind") or 0
+                served_col = plan.columns.get("served") or 0
+                left_col = plan.columns.get("left") or 0
+                change.fill_type = bool(
+                    type_col and order.meal_type
+                    and not str(grid.get((row - 1, type_col - 1), "")).strip())
+                change.fill_kind = bool(
+                    kind_col and order.meal_kind
+                    and not str(grid.get((row - 1, kind_col - 1), "")).strip())
+                change.fill_formula = bool(
+                    served_col and left_col and plan.date_cols
+                    and not str(grid.get((row - 1, served_col - 1), "")).strip()
+                    and not str(grid.get((row - 1, left_col - 1), "")).strip())
                 if want == before:
                     change.detail = "总餐次已一致"
                 elif want < before:
@@ -923,58 +1128,110 @@ def build_plan(cli: KdocsCli, *, local_orders: Mapping[str, Sequence[CloudOrder]
             else:
                 new_orders.append(order)
 
-        # 新客户按「地址组末尾」分块；找不到组（含空地址、别名也未命中）退回表尾。
-        blocks: dict[int, list[tuple[CloudOrder, str]]] = {}
-        for order in new_orders:
-            raw = str(order.address or "").strip()
-            written_addr = raw
-            group_key = _address_key(raw)
-            end_row = group_end.get(group_key)
-            if not end_row and raw in ADDRESS_ALIASES:
-                written_addr = ADDRESS_ALIASES[raw]
-                end_row = group_end.get(_address_key(written_addr))
-            position = end_row + 1 if end_row else 0     # 插在组末行的下一行前
-            if position:
-                if position > last_used:          # 组就在表尾：等价于追加
-                    position = plan.append_row
-            else:
-                if raw:
-                    plan.warnings.append(
-                        f"云端没有「{raw}」地址组，{order.name} 追加到表尾第 "
-                        f"{plan.append_row} 行")
-                position = plan.append_row
-            blocks.setdefault(position, []).append((order, written_addr))
+        # ---- 新增客户：统一插到第 3 行与第 4 行之间，再按列B 顺序重排整张表 ----
+        order_list = [str(item).strip() for item in (order_map.get(sheet) or [])]
+        written: list[tuple[CloudOrder, str]] = [
+            (order, canonical_address(order.address, order_list)) for order in new_orders]
 
-        # 逐块定最终行号：块按位置升序，块内经济在前、豪华在后（各自保持本地顺序，
-        # 与协作者在目标表里的排法一致 —— 金黄行放在组尾更好认）。
-        offset = 0
-        for position in sorted(blocks):
-            members = sorted(blocks[position],
-                             key=lambda item: str(item[0].meal_kind).strip() == "豪华")
-            first_row = position + offset
-            for idx, (order, written_addr) in enumerate(members):
-                row = first_row + idx
-                append_only = position >= plan.append_row
-                change = Change(kind="new", name=order.name, phone=order.phone,
-                                row=row, delta=order.meals,
-                                target_col=plan.target_col,
-                                total_before=0, total_after=order.meals,
-                                target_ok=False,
-                                address=written_addr, meal_type=order.meal_type,
-                                meal_kind=order.meal_kind,
-                                detail=(f"追加到表尾第 {row} 行" if append_only else
-                                        f"插入到第 {row} 行（「{written_addr}」组末尾）"))
-                plan.changes.append(change)
-                people[person_key(order.name, order.phone)] = row
+        ranks, tail_rank = build_address_ranks(
+            order_list, [*address_of.values(), *(addr for _o, addr in written)])
+        unknown = sorted({addr for addr in
+                          [*address_of.values(), *(a for _o, a in written)]
+                          if _address_key(addr) and _address_key(addr) not in ranks})
+        plan.unknown_addresses = unknown[:5]
+        for addr in unknown[:5]:
+            plan.warnings.append(f"地址「{addr}」不在排序清单里，将排到表格最后面")
+        if len(unknown) > 5:
+            plan.warnings.append(f"…另有 {len(unknown) - 5} 个清单外地址，同样排到表尾")
+
+        new_count = len(written)
+        # 有老数据时插到第 4 行之前（第 3 行是第一行数据，不动它）；
+        # 空表直接写第 3 行起，不留空行。
+        first_insert_row = (FIRST_DATA_ROW + 1) if data_rows else FIRST_DATA_ROW
+        plan.insert_blocks = []
+        if new_count:
             plan.insert_blocks.append(InsertBlock(
-                position=position, count=len(members), first_row=first_row,
-                address=members[0][1], append_only=append_only))
-            offset += len(members)
-        # 插入会让下方已有内容整体下移，老客户的写入行号要补上位移。
+                position=first_insert_row, count=new_count, first_row=first_insert_row,
+                address="", append_only=not data_rows))
+
+        # 排序辅助列：放在该表所有内容列右侧，排序范围才能覆盖全部列（否则会错位）。
+        # 表里本来没有数据行时无需排序（没什么可排的）。
+        sort_on = bool(sort_enabled and new_count and data_rows)
+        helper_col = 0
+        if sort_on:
+            helper_col = sort_key_column(
+                sheet_col_to=real_col_to,
+                extra_cols=[plan.marker_col, plan.columns.get("remark") or 0])
+            if helper_col > MAX_SORT_COL:
+                plan.warnings.append(
+                    f"表格宽度异常（最后使用列 {real_col_to}，辅助列 {helper_col}），本次跳过排序")
+                sort_on = False
+
+        # 预测排序结果（稳定排序：等键保持源顺序，与云端 range-sort 的承诺一致）。
+        # 排序前的物理顺序 = 新行（第 4 行起）+ 已有行（原有先后）。
+        # 注意：插到"第 4 行之前"时**第 3 行不动**，第 4 行及以下才整体下移。
+        def pre_insert_row(row: int) -> int:
+            return row if row < first_insert_row else row + new_count
+
+        entries: list[tuple[int, int]] = []
+        if sort_on:
+            for idx, (_order, addr) in enumerate(written):
+                rank = ranks.get(_address_key(addr), tail_rank)
+                entries.append((sort_key_value(rank, SORT_FLAG_NEW), first_insert_row + idx))
+            # 表中间的空行（没有姓名的行，通常是分组之间的空行）：跟着**上一行**的
+            # 地址组走、排在那组最后 —— 否则空行会被排序甩到整张表的末尾。
+            name_rows = set(data_rows)
+            scan_last = data_rows[-1] if data_rows else FIRST_DATA_ROW - 1
+            first_rank = (ranks.get(_address_key(address_of.get(data_rows[0], "")), tail_rank)
+                          if data_rows else tail_rank)
+            carried = first_rank
+            for row in range(FIRST_DATA_ROW, scan_last + 1):
+                if row in name_rows:
+                    carried = ranks.get(_address_key(address_of.get(row, "")), tail_rank)
+                flag = SORT_FLAG_EXISTING if row in name_rows else SORT_FLAG_BLANK
+                entries.append((sort_key_value(carried, flag), pre_insert_row(row)))
+            ordered = sorted(entries, key=lambda item: item[0])
+            plan.row_keys = {pre_row: key for key, pre_row in entries}
+            final_row_of: dict[int, int] = {
+                pre_row: FIRST_DATA_ROW + idx for idx, (_key, pre_row) in enumerate(ordered)}
+            plan.last_data_row = FIRST_DATA_ROW + len(ordered) - 1
+            plan.sort_key_col = helper_col
+            plan.sort_range = (f"A{FIRST_DATA_ROW}:"
+                               f"{column_name(helper_col)}{plan.last_data_row}")
+        else:
+            # 不排序：新行留在第 4 行起，第 4 行及以下的已有行整体下移 new_count 行。
+            final_row_of = {pre_insert_row(row): pre_insert_row(row) for row in data_rows}
+            for idx in range(new_count):
+                final_row_of[first_insert_row + idx] = first_insert_row + idx
+            plan.last_data_row = FIRST_DATA_ROW + len(data_rows) + new_count - 1
+
         for change in existing_changes:
-            change.row += sum(b.count for b in plan.insert_blocks
-                              if b.position <= change.row)
+            change.row = final_row_of.get(pre_insert_row(change.row), change.row)
+            plan.final_rows[person_key(change.name, change.phone)] = change.row
+
+        for idx, (order, addr) in enumerate(written):
+            pre_row = first_insert_row + idx
+            row = final_row_of.get(pre_row, pre_row)
+            if sort_on:
+                where = f"排到第 {row} 行（地址「{addr}」）"
+            elif new_count:
+                where = f"插到第 {row} 行（本次未排序）"
+            else:
+                where = f"追加到第 {row} 行"
+            change = Change(kind="new", name=order.name, phone=order.phone,
+                            row=row, delta=order.meals,
+                            target_col=plan.target_col,
+                            insert_row=pre_row,
+                            total_before=0, total_after=order.meals,
+                            target_ok=False,
+                            address=addr, meal_type=order.meal_type,
+                            meal_kind=order.meal_kind,
+                            detail=where, fill_formula=True)
+            plan.changes.append(change)
+            plan.final_rows[person_key(order.name, order.phone)] = row
         plan.changes = existing_changes + plan.changes
+        if sort_on:
+            plan.sort_enabled = True
         plans.append(plan)
     return plans
 
@@ -1013,6 +1270,17 @@ def format_plan(plans: Iterable[SheetPlan]) -> str:
         lines.append(head)
         for warning in plan.warnings:
             lines.append(f"    ⚠ {warning}")
+        new_count = sum(1 for c in plan.changes if c.kind == "new")
+        if new_count:
+            if plan.sort_enabled:
+                lines.append(
+                    f"    本次新增 {new_count} 人：先插到第 {FIRST_DATA_ROW + 1} 行起，"
+                    f"再按地址顺序重排整张表"
+                    f"（第 {FIRST_DATA_ROW}~{plan.last_data_row} 行）")
+            else:
+                lines.append(
+                    f"    本次新增 {new_count} 人：插到第 {FIRST_DATA_ROW + 1} 行起"
+                    f"（已关闭排序，新行会留在表格最上面）")
         for change in plan.changes:
             if change.kind == "new":
                 lines.append(f"    + 新增 {change.name}（{change.phone}）"
@@ -1054,12 +1322,47 @@ def _rollback_inserts(cli: KdocsCli, plan: SheetPlan, worksheet_id: int,
     emit(f"[云同步] {plan.sheet}：已回滚 {len(inserted)} 处插入，云端恢复原状")
 
 
+def read_person_rows(cli: KdocsCli, plan: SheetPlan, worksheet_id: int, *,
+                     last_row: int) -> dict[tuple[str, str], int]:
+    """回读「姓名+电话」列，返回 ``{(姓名, 电话): 行号}``（1-based）。
+
+    整表排序后人行号全变了，必须靠这个重新定位到每个人的新行号。
+    只读 3 列，一次调用。
+    """
+    name_col = plan.columns.get("name") or 1
+    phone_col = plan.columns.get("phone") or max(name_col + 1, 3)
+    lo, hi = min(name_col, phone_col), max(name_col, phone_col)
+    row_from = FIRST_DATA_ROW if last_row >= FIRST_DATA_ROW else FIRST_DATA_ROW
+    grid = cli.read_grid(plan.file_id, worksheet_id,
+                         row_from - 1, max(last_row, row_from) - 1, lo - 1, hi - 1)
+    index: dict[tuple[str, str], int] = {}
+    for (row, col), text in grid.items():
+        if col != name_col - 1 or not str(text).strip():
+            continue
+        phone = grid.get((row, phone_col - 1), "")
+        index.setdefault(person_key(text, phone), row + 1)
+    return index
+
+
 def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                ledger: SyncLedger | None = None,
                marker_enabled: bool = True,
                log: Callable[[str], Any] | None = None) -> dict[str, Any]:
-    """按计划写入云端；写入后回读校验；成功才更新账本。"""
-    emit = log or (lambda _msg: None)
+    """按计划写入云端；写入后回读校验；成功才更新账本。
+
+    单张表的执行顺序（2026-09-15 起）：
+      1. 新客户统一插到第 3 行与第 4 行之间；
+      2. 写新行的姓名/地址/电话/类型/餐种（与行号无关，排序后跟着行走）；
+      3. 上新行底色（经济餐照抄模板、豪华餐整行金黄）；
+      4. 写排序辅助列 → range-sort 按地址顺序重排整表 → 删掉辅助列；
+      5. 回读列A~C，按（姓名,电话）重新定位每个人的**排序后行号**；
+      6. 写日期格/总餐次/已出餐剩余餐公式/通讯记号；
+      7. 回读校验 + 记账本。
+
+    回滚红线：**只有排序之前**的失败才回滚（把插进去的行删掉）；排序一旦成功，
+    新行已散落到各地址组里，此时删行会删错人 —— 只告警，让用户重传（重复执行安全）。
+    """
+    emit = log or (lambda _msg, _level="INFO": None)
     result: dict[str, Any] = {"sheets": [], "written": 0, "failed": 0}
     for plan in plans:
         if not plan.target_col:
@@ -1074,26 +1377,154 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             continue
         worksheet_id = int(infos[0].get("sheetId") or 1)
 
-        # 1) 插入新客户行（位置升序）。表尾块不用插 —— 写单元格会自动把表扩出来。
-        #    插入会让下方内容（含公式）整体下移，这是"新客户进地址组"的关键。
+        # 1) 插入新客户行：统一一块，插到第 3 行与第 4 行之间。
+        #    表里本来没有数据行时不插（写单元格会自动把表扩出来）。
         inserted: list[tuple[int, int]] = []          # (first_row, count)，回滚用
-        try:
-            for block in sorted(plan.insert_blocks, key=lambda b: b.position):
-                if block.append_only:
-                    continue
+        new_changes = [c for c in plan.changes if c.kind == "new"]
+        block = plan.insert_blocks[0] if plan.insert_blocks else None
+        if block and not block.append_only:
+            try:
                 cli.insert_rows(plan.file_id, worksheet_id,
                                 row=block.first_row, count=block.count)
                 inserted.append((block.first_row, block.count))
                 emit(f"[云同步] {plan.sheet}：已在第 {block.first_row} 行前插入 "
-                     f"{block.count} 行（「{block.address}」组末尾）")
-        except WpsCloudError as exc:
-            _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
-            emit(f"[云同步] {plan.sheet} 插入新行失败：{exc}")
-            result["sheets"].append({"sheet": plan.sheet, "status": "failed",
-                                     "reason": f"插入新行失败：{exc}"})
-            result["failed"] += 1
-            continue
+                     f"{block.count} 行（新客户）")
+            except WpsCloudError as exc:
+                emit(f"[云同步] {plan.sheet} 插入新行失败：{exc}")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": f"插入新行失败：{exc}"})
+                result["failed"] += 1
+                continue
 
+        # 2) 排序前先写"与行号无关"的整行信息：排序后这些值会跟着行走。
+        #    必须写在 insert_row（排序前的物理行），不能写 change.row（那是排序后
+        #    的目标行号，此刻还属于别人）。
+        base_cells: list[dict[str, Any]] = []
+        for change in new_changes:
+            at = change.insert_row or change.row
+            base_cells.append({"row": at, "col": plan.columns["name"],
+                               "value": change.name})
+            if plan.columns.get("address"):
+                base_cells.append({"row": at, "col": plan.columns["address"],
+                                   "value": change.address})
+            base_cells.append({"row": at, "col": plan.columns["phone"],
+                               "value": change.phone})
+            if plan.columns.get("type") and change.meal_type:
+                base_cells.append({"row": at, "col": plan.columns["type"],
+                                   "value": change.meal_type})
+            if plan.columns.get("kind") and change.meal_kind:
+                base_cells.append({"row": at, "col": plan.columns["kind"],
+                                   "value": change.meal_kind})
+        if base_cells:
+            try:
+                cli.write_cells(plan.file_id, worksheet_id, base_cells)
+            except WpsCloudError as exc:
+                _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
+                emit(f"[云同步] {plan.sheet} 新客户行写入失败：{exc}")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": str(exc)})
+                result["failed"] += 1
+                continue
+
+        # 3) 上底色：新客户行跟着原数据行的字体/对齐；经济餐照抄模板底色（黄带位置
+        #    与老行一致）；**豪华餐整行金黄**。所有操作合并后分批，25 个新行只花
+        #    1~2 次调用。格式失败不影响数据写入结论。
+        if new_changes:
+            col_lo = plan.columns.get("name") or 1
+            col_hi = plan.columns.get("remark") or (col_lo + 12)
+            try:
+                spec = learn_row_format(cli, plan.file_id, worksheet_id,
+                                        col_from=col_lo, col_to=col_hi,
+                                        rows=[r for r in plan.format_rows if r],
+                                        cached_fills=plan.format_fills)
+                if spec:
+                    econ = [c.insert_row or c.row for c in new_changes
+                            if str(c.meal_kind).strip() != "豪华"]
+                    lux = [c.insert_row or c.row for c in new_changes
+                           if str(c.meal_kind).strip() == "豪华"]
+                    ops = build_format_ops(spec, econ_rows=econ, lux_rows=lux,
+                                           col_from=col_lo, col_to=col_hi)
+                    cli.write_format_ops(plan.file_id, worksheet_id, ops)
+                    emit(f"[云同步] {plan.sheet}：{len(new_changes)} 个新客户已套用"
+                         f"表格原有格式（字体/对齐、经济餐照抄模板底色"
+                         + ("、豪华餐整行金黄" if lux else "") + "）")
+                else:
+                    emit(f"[云同步] {plan.sheet}：读不到参考行格式，跳过格式设置")
+            except WpsCloudError as exc:
+                emit(f"[云同步] {plan.sheet}：格式设置失败（数据已写入）：{exc}")
+
+        # 4) 排序：写排序键（辅助列，在该表所有内容列右侧）→ 云端原地排序 → 删辅助列。
+        if plan.sort_key_col and plan.row_keys:
+            key_cells = [{"row": row, "col": plan.sort_key_col,
+                          "value": format_sort_key(key)}
+                         for row, key in sorted(plan.row_keys.items())]
+            try:
+                cli.write_cells(plan.file_id, worksheet_id, key_cells)
+                cli.sort_range(plan.file_id, worksheet_id, range_ref=plan.sort_range,
+                               key=column_name(plan.sort_key_col), order="asc",
+                               header=False)
+            except WpsCloudError as exc:
+                # 排序还没生效（行还在原位）→ 插进去的新行可以整块删掉
+                _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
+                emit(f"[云同步] {plan.sheet} 按地址排序失败：{exc}")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": f"按地址排序失败：{exc}"})
+                result["failed"] += 1
+                continue
+            emit(f"[云同步] {plan.sheet}：已按地址顺序重排第 {FIRST_DATA_ROW}~"
+                 f"{plan.last_data_row} 行")
+            try:
+                cli.delete_columns(plan.file_id, worksheet_id,
+                                   column=plan.sort_key_col, rows=plan.last_data_row)
+            except WpsCloudError as exc:
+                emit(f"[云同步] {plan.sheet}：排序辅助列（第 {plan.sort_key_col} 列）"
+                     f"删除失败，表右侧可能残留一排排序键：{exc}", "WARN")
+                try:
+                    cli.write_cells(plan.file_id, worksheet_id, [
+                        {"row": row, "col": plan.sort_key_col, "value": ""}
+                        for row in sorted(plan.row_keys)])
+                except WpsCloudError:
+                    pass
+
+        # 5) 重定位：整表重排后人行号全变了，必须回读（姓名,电话）重新定位。
+        #    定位失败就停手（不猜行号），此时只写了新行信息与底色，重传一次即可。
+        if plan.sort_enabled:
+            try:
+                actual_rows = read_person_rows(cli, plan, worksheet_id,
+                                               last_row=plan.last_data_row)
+            except WpsCloudError as exc:
+                emit(f"[云同步] {plan.sheet} 排序后无法重新定位人员行号，已停止写入"
+                     f"（请重新上传，重复执行安全）：{exc}", "ERROR")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": f"排序后回读失败：{exc}"})
+                result["failed"] += 1
+                continue
+            missing = [c for c in plan.changes
+                       if person_key(c.name, c.phone) not in actual_rows]
+            if missing:
+                names = "、".join(c.name for c in missing[:5])
+                emit(f"[云同步] {plan.sheet} 排序后定位不到这些人：{names}，已停止写入",
+                     "ERROR")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": f"排序后定位不到：{names}"})
+                result["failed"] += 1
+                continue
+            drift = 0
+            for change in plan.changes:
+                key = person_key(change.name, change.phone)
+                row = actual_rows[key]
+                if plan.final_rows.get(key, row) != row:
+                    drift += 1
+                    if drift <= 3:
+                        emit(f"[云同步] {plan.sheet}：{change.name} 实际排在第 {row} 行，"
+                             f"与预测不符（按实际行号写入）", "WARN")
+                change.row = row
+            if drift:
+                plan.sort_mismatch = True
+                emit(f"[云同步] {plan.sheet}：{drift} 人的实际行号与预测不同"
+                     f"（已按实际行号写入，不影响数据正确性）", "WARN")
+
+        # 6) 其余写入：日期格 / 总餐次 / 公式 / 通讯记号
         cells: list[dict[str, Any]] = []
         pending: list[Change] = []
         for change in plan.changes:
@@ -1103,65 +1534,38 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             if change.total_after != change.total_before and plan.columns.get("total"):
                 cells.append({"row": change.row, "col": plan.columns["total"],
                               "value": change.total_after})
-            if change.kind == "new":
-                # 新客户整行都要填：姓名/地址/电话 + 类型/餐种 +（总餐次在上方）
-                cells.append({"row": change.row, "col": plan.columns["name"], "value": change.name})
-                if plan.columns.get("address"):
-                    cells.append({"row": change.row, "col": plan.columns["address"],
-                                  "value": change.address})
-                cells.append({"row": change.row, "col": plan.columns["phone"], "value": change.phone})
-                if plan.columns.get("type") and change.meal_type:
+            if change.kind == "existing":
+                if change.fill_type and plan.columns.get("type"):
                     cells.append({"row": change.row, "col": plan.columns["type"],
                                   "value": change.meal_type})
-                if plan.columns.get("kind") and change.meal_kind:
+                if change.fill_kind and plan.columns.get("kind"):
                     cells.append({"row": change.row, "col": plan.columns["kind"],
                                   "value": change.meal_kind})
             if not change.target_ok:
                 cells.append({"row": change.row, "col": change.target_col, "value": CELL_MARK})
         formula_cells = formula_cells_for_new_rows(
             plan, [c.row for c in pending if c.kind == "new"])
+        # 半成品行自愈：老客户缺公式的也补上（同一套公式）
+        formula_cells.extend(formula_cells_for_new_rows(
+            plan, [c.row for c in pending if c.kind == "existing" and c.fill_formula]))
         cells.extend(formula_cells)
         if marker_enabled and plan.marker_col:
             cells.append({"row": HEADER_ROW, "col": plan.marker_col,
                           "value": str(plan.weekday_number)})
         if not cells:
+            # 没有任何待写内容（本次也没新客户，否则一定有格子要写）
             result["sheets"].append({"sheet": plan.sheet, "status": "noop"})
             continue
         try:
             cli.write_cells(plan.file_id, worksheet_id, cells)
         except WpsCloudError as exc:
-            _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
-            emit(f"[云同步] {plan.sheet} 写入失败：{exc}")
+            note = "（表已按地址重排，请重新上传；重复执行是安全的）" if plan.sort_enabled else ""
+            emit(f"[云同步] {plan.sheet} 写入失败：{exc}{note}", "ERROR")
             result["sheets"].append({"sheet": plan.sheet, "status": "failed",
                                      "reason": str(exc)})
             result["failed"] += 1
             continue
 
-        # 格式：新客户行跟着原数据行的字体/对齐；经济餐照抄模板底色（黄带位置
-        # 与老行一致）；**豪华餐整行金黄**。所有操作合并后分批，25 个新行只花
-        # 1~2 次调用。格式失败不影响数据写入结论。
-        new_rows = [c for c in pending if c.kind == "new"]
-        if new_rows:
-            col_lo = plan.columns.get("name") or 1
-            col_hi = plan.columns.get("remark") or (col_lo + 12)
-            try:
-                spec = learn_row_format(cli, plan.file_id, worksheet_id,
-                                        col_from=col_lo, col_to=col_hi,
-                                        rows=[r for r in plan.format_rows if r],
-                                        cached_fills=plan.format_fills)
-                if spec:
-                    econ = [c.row for c in new_rows if str(c.meal_kind).strip() != "豪华"]
-                    lux = [c.row for c in new_rows if str(c.meal_kind).strip() == "豪华"]
-                    ops = build_format_ops(spec, econ_rows=econ, lux_rows=lux,
-                                           col_from=col_lo, col_to=col_hi)
-                    cli.write_format_ops(plan.file_id, worksheet_id, ops)
-                    emit(f"[云同步] {plan.sheet}：{len(new_rows)} 个新客户已套用"
-                         f"表格原有格式（字体/对齐、经济餐照抄模板底色"
-                         + ("、豪华餐整行金黄" if lux else "") + "）")
-                else:
-                    emit(f"[云同步] {plan.sheet}：读不到参考行格式，跳过格式设置")
-            except WpsCloudError as exc:
-                emit(f"[云同步] {plan.sheet}：格式设置失败（数据已写入）：{exc}")
         # 回读校验：逐格核对，而不是只抽查首尾行。
         # （曾出现过"只抽查末尾行、恰好该行原本就是 1"导致的假阳性。）
         rows_written = sorted({int(c["row"]) for c in cells if int(c["row"]) >= FIRST_DATA_ROW})
@@ -1195,7 +1599,13 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             if formula_cells:
                 formula_back = cli.read_formulas(
                     plan.file_id, worksheet_id, lo, hi, c_lo, c_hi)
+            name_col = plan.columns.get("name") or 0
             for change in pending:
+                if name_col:
+                    got_name = str(back.get((change.row - 1, name_col - 1), "")).strip()
+                    if got_name != str(change.name).strip():
+                        problems.append(f"第 {change.row} 行应为「{change.name}」，"
+                                        f"实际「{got_name}」")
                 got_mark = str(back.get((change.row - 1, plan.target_col - 1), "")).strip()
                 if got_mark != CELL_MARK:
                     problems.append(f"{change.name}: 目标列应为 {CELL_MARK}，实际 {got_mark!r}")
@@ -1223,7 +1633,9 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             entries = {f"{c.name}\u0000{c.phone}": c.total_after for c in pending}
             ledger.record(plan.target_date.isoformat(), plan.file_id, entries)
         result["sheets"].append({"sheet": plan.sheet, "status": "ok",
-                                 "cells": len(cells), "people": len(pending)})
+                                 "cells": len(cells), "people": len(pending),
+                                 "sorted": bool(plan.sort_enabled),
+                                 "sort_mismatch": bool(plan.sort_mismatch)})
         result["written"] += 1
     if ledger is not None:
         try:

@@ -21,6 +21,7 @@ import {
   isApiReady,
   onBridgeEvent,
   pullBridgeEvents,
+  type AddressInputRequest,
   type AppState,
   type CaptchaRequest,
   type DecisionRequest,
@@ -51,6 +52,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [logs, setLogs] = useState<LogRow[]>([])
   const [decision, setDecision] = useState<DecisionRequest | null>(null)
   const [captcha, setCaptcha] = useState<CaptchaRequest | null>(null)
+  const [addressInput, setAddressInput] = useState<AddressInputRequest | null>(null)
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const [updateAvailable, setAvailableState] = useState<UpdateAvailable | null>(null)
   const [mode, setMode] = useState<TaskMode>('order')
@@ -114,6 +116,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           setStatus(event.payload.state)
           break
         case 'task:done':
+          setAddressInput(null)
           if (event.payload.stopped) {
             toast.info('任务已停止')
           } else if (event.payload.partial) {
@@ -123,6 +126,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
           break
         case 'task:error':
+          setAddressInput(null)
           toast.error(event.payload.message, { duration: 8000 })
           break
         case 'update:available':
@@ -161,6 +165,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
           break
         case 'captcha':
           setCaptcha(event.payload)
+          break
+        case 'address_input':
+          setAddressInput(event.payload)
           break
       }
     },
@@ -273,6 +280,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     api().resolve_captcha(id, code).catch(() => {})
   }, [])
 
+  const resolveAddressInput = useCallback((id: string, entries: Record<string, string>) => {
+    setAddressInput(null)
+    api().resolve_address_input(id, entries).catch(() => {})
+  }, [])
+
   const value = useMemo<AppStateBundle>(
     () => ({
       ready,
@@ -285,6 +297,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       logs,
       decision,
       captcha,
+      addressInput,
       updateProgress,
       workerAlive: status === 'running' || status === 'stopping',
       mode,
@@ -304,11 +317,13 @@ export function AppProvider({ children }: { children: ReactNode }) {
       clearLogs,
       resolveDecision,
       resolveCaptcha,
+      resolveAddressInput,
     }),
     [ready, mocked, version, status, frozen, config, passwords, logs, decision,
-      updateProgress, mode, captcha, startOrder, startSss, stopTask, chooseExcel,
+      updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask, chooseExcel,
       newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
-      openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha],
+      openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
+      resolveAddressInput],
   )
 
   const updateAvailableValue = useMemo(

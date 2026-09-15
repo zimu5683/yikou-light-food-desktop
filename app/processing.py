@@ -202,7 +202,7 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
 
     东湖：大西 → 小/小西 → A/B/C/D（按数字升序）→ 其他；
     衣锦：校门口 → 外卖柜 → 其他；
-    医学院：医N号（按数字升序）→ 其他。
+    医学院：医 N号（按数字升序；兼容旧写法 医N号）→ 其他。
     """
     value = str(address or "").strip()
     if not value:
@@ -225,7 +225,7 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
             return (1, 0, 0)
         return (9, 0, 0)
     if campus == "医学院":
-        match = re.fullmatch(r"医(\d{1,3})号", value)
+        match = re.fullmatch(r"医\s*(\d{1,3})号", value)
         if match:
             return (0, int(match.group(1)), 0)
         return (9, 0, 0)

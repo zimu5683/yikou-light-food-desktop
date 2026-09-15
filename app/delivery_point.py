@@ -4,11 +4,14 @@
 拼接，写法非常杂乱：混入人名、手机号、房间号、街道名、繁体、重复拼写等。
 排单时人工只关心「放到哪个取餐点」。
 
-输出口径（2026-09-11 按店主最新要求调整）：
+输出口径（2026-09-14 按店主最新要求调整）：
 - 东湖农林：B 区楼码小写（``B6`` → ``b6``），A/C/D 区维持大写；
-  小西门/西南门输出 ``小``，大西门仍输出 ``大西``；
+  小西门/西南门输出 ``小``，裸写 ``西门``、``大西门`` 均输出 ``大西``；
+  仅写 ``D区``/``D门`` 时默认 ``D2``（``D区1号楼`` → ``D1``）；
+  ``D1``/``D2`` 同时出现时也取 ``D2``；
   命名点输出文字（学三/学14/教2/图书馆/国重楼…）。
-- 医学院：宿舍楼输出 ``医{N}号``（如 医5号/医6号）。
+- 医学院：宿舍楼输出 ``医 N号``（如 医 5号/医 6号，医与数字之间有空格）；
+  ``12/34/56/78`` 等相邻楼号写法取每对中的单号（12→1、三四→3、五六→5、七八→7）。
 - 楼与校门并存时放宿舍楼下，取楼码不取校门（prefer_gate_when_both=False）。
 
 规则层负责剥前缀、抽楼码/校门/命名点，能自动覆盖绝大多数订单；无法自动
@@ -31,8 +34,8 @@ DORM_ZONES = ("A", "B", "C", "D")
 DORM_UPPER = True
 DORM_LOWER_ZONES = ("B",)
 
-# 医学院楼号命名模板：医{N}号。
-YIXUE_BUILDING_TMPL = "医{n}号"
+# 医学院楼号命名模板：医 N号（医与数字之间保留一个空格）。
+YIXUE_BUILDING_TMPL = "医 {n}号"
 
 # 校门别名 → 标准点位（店主最新口径：小西门统一写“小”）。
 GATE_POINT = {
@@ -40,7 +43,7 @@ GATE_POINT = {
     "西南门": "小",
     "小西门": "小",
     "大西门": "大西",
-    "西门": "大西",      # 单独"西门"更靠近大西，命中即 medium 复核
+    "西门": "大西",      # 裸写“西门”按最新口径直接填写大西，无需复核
 }
 
 # 词面即可作取餐点名的命名建筑/别名 → 标准点名。
@@ -71,12 +74,35 @@ _RE_PLACE = re.compile(
 _RE_CAMPUS_SUFFIX = re.compile(r"(?:东湖|临安)校区|东湖校|临安校")
 _RE_GATE = re.compile(r"(西南1门|西南门|小西门|大西门|西门)")
 _RE_BLDG = re.compile(r"(?<![A-Za-z0-9])([A-Za-z])(\d{1,2})(?![A-Za-z0-9])")
+# D 区含糊写法：D区/D门 后跟楼号（D区1号楼→D1）；以及 D1 紧挨 D区/D门 的写法。
+_RE_D_AREA = re.compile(r"(?<![A-Za-z0-9])[Dd]\s*(?:区|门)")
+_RE_D_AREA_BUILDING = re.compile(
+    r"(?<![A-Za-z0-9])[Dd]\s*(?:区|门)\s*(\d{1,2})\s*号楼?")
+_RE_D_BEFORE_AREA = re.compile(
+    r"(?<![A-Za-z0-9])[Dd]\s*(\d{1,2})\s*(?=[Dd]\s*(?:区|门))")
+# D1/D2 连写或由顿号/斜杠/和字连接：D1D2、D1、D2、D1/D2 等，按住户口径取 D2。
+_RE_D_BOTH = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?:[Dd]\s*1\s*(?:[、,，/和及\-—~～]\s*)?[Dd]\s*2"
+    r"|[Dd]\s*2\s*(?:[、,，/和及\-—~～]\s*)?[Dd]\s*1)"
+    r"(?![0-9])")
 _RE_NUM_BLDG = re.compile(
     r"(?<![A-Za-z0-9一二三四五六七八九十])([一二三四五六七八九十]+|\d{1,2})"
     r"\s*号?\s*(?:宿舍|寝室|栋|号楼|学生宿舍)"
 )
 _RE_DORM_DASH = re.compile(r"(宿舍|寝室)(?:楼)?\s*(\d{1,2})\s*[-—]\s*\d{2,3}")
 _RE_CABINET = re.compile(r"柜|架空层|楼下|外卖柜|美団|美团")
+# 医学院相邻楼号写法：12/34/56/78、一二十...、1、2/1-2 等，按住户口径取每对中的单号。
+_MEDICAL_PAIR_RE = re.compile(
+    r"(?<![A-Za-z0-9一二三四五六七八九十])"
+    r"([1一]\s*[、,，/和及\-—~～]?\s*[2二]"
+    r"|[3三]\s*[、,，/和及\-—~～]?\s*[4四]"
+    r"|[5五]\s*[、,，/和及\-—~～]?\s*[6六]"
+    r"|[7七]\s*[、,，/和及\-—~～]?\s*[8八])"
+    r"\s*号?\s*(?:宿舍|寝室|栋|号楼|学生宿舍|楼)"
+)
+_CN_MED_DIGITS = str.maketrans("一二三四五六七八", "12345678")
+_MEDICAL_PAIR_NUMBERS = {"12": 1, "34": 3, "56": 5, "78": 7}
 
 _NAMED_HITS = {kw: pt for kw, pt in NAMED_POINTS.items()}
 
@@ -88,6 +114,7 @@ DEFAULT_ALIASES = {
 # 旧点位写法 → 最新排单口径。小西短名和自动识别结果都在返回前统一。
 _POINT_RENAMES = {"小西": "小"}
 _B_ZONE_CODE = re.compile(r"^B(\d{1,2})$")
+_YIXUE_CODE = re.compile(r"^医\s*(\d{1,3})号$")
 
 
 def _format_dorm_letter(zone: str) -> str:
@@ -97,12 +124,15 @@ def _format_dorm_letter(zone: str) -> str:
 
 
 def _canonical_point_name(point: str) -> str:
-    """统一校门/楼码显示：小西→小，B6→b6。"""
+    """统一点位显示：小西→小，B6→b6，医5号→医 5号。"""
     text = str(point or "")
     text = _POINT_RENAMES.get(text, text)
     match = _B_ZONE_CODE.fullmatch(text)
     if match:
         return f"b{match.group(1)}"
+    match = _YIXUE_CODE.fullmatch(text)
+    if match:
+        return f"医 {int(match.group(1))}号"
     return text
 
 
@@ -118,6 +148,13 @@ def _cn_to_int(text: str) -> Optional[int]:
             ones = CN_DIGITS[tail] if tail else 0
             return tens * 10 + ones
     return None
+
+
+def _medical_pair_number(text: str) -> Optional[int]:
+    """把“12/三四/1、2”等相邻楼号写法压成单号：12→1，34→3…"""
+    compact = str(text or "").translate(_CN_MED_DIGITS)
+    compact = re.sub(r"[^1-8]", "", compact)
+    return _MEDICAL_PAIR_NUMBERS.get(compact)
 
 
 def _clean(value: str) -> str:
@@ -152,13 +189,38 @@ def _extract_candidates(body: str, campus: str) -> tuple[dict[str, int], bool, b
         kw = _canonical_point_name(kw)
         cands[kw] = cands.get(kw, 0) + 1
 
+    # D 区含糊写法先单独拆出来：D区1号楼→D1，D1D区→D1；后面的通用
+    # “N号楼”不再重复识别 D区N号楼，避免产出无意义的“1号楼”。
+    d_area_span: tuple[int, int] | None = None
+    d_area_building = ""
+    d_area_match = _RE_D_AREA_BUILDING.search(body)
+    if campus not in ("医学院", "衣锦联建") and d_area_match:
+        d_area_span = d_area_match.span()
+        d_area_building = f"D{int(d_area_match.group(1))}"
+
     # 字母楼栋码（东湖宿舍区 A/B/C/D）
     for m in _RE_BLDG.finditer(body):
         zone, no = m.group(1), m.group(2)
         if zone.upper() in DORM_ZONES:
             add(f"{_format_dorm_letter(zone)}{no}")
-    # 数字楼：医学院宿舍用「医N号」；东湖出现"学院楼 N 号"之类不带字母则仍按楼号。
+    # D1/D2 连写也要进候选，最终由正常流程统一取 D2。
+    if campus not in ("医学院", "衣锦联建") and _RE_D_BOTH.search(body):
+        add("D1")
+        add("D2")
+    # 医学院相邻楼号对：12/34/56/78 → 1/3/5/7，优先于普通数字楼识别。
+    med_pair_spans: list[tuple[int, int]] = []
+    if campus == "医学院":
+        for m in _MEDICAL_PAIR_RE.finditer(body):
+            pair_num = _medical_pair_number(m.group(1))
+            if pair_num is not None:
+                add(YIXUE_BUILDING_TMPL.format(n=pair_num))
+                med_pair_spans.append(m.span())
+    # 数字楼：医学院宿舍用「医 N号」；东湖出现"学院楼 N 号"之类不带字母则仍按楼号。
     for m in _RE_NUM_BLDG.finditer(body):
+        if d_area_span and m.start() < d_area_span[1] and m.end() > d_area_span[0]:
+            continue
+        if any(m.start() < span[1] and m.end() > span[0] for span in med_pair_spans):
+            continue
         raw = m.group(1)
         num = _cn_to_int(raw) if not raw.isdigit() else int(raw)
         if num is None or not (0 < num <= 40):
@@ -167,6 +229,17 @@ def _extract_candidates(body: str, campus: str) -> tuple[dict[str, int], bool, b
             add(YIXUE_BUILDING_TMPL.format(n=num))
         else:
             add(f"{num}号楼")
+    # D 区补点：D区1号楼→D1；D1D区→D1；只有 D区/D门 →按最新口径默认 D2。
+    if campus not in ("医学院", "衣锦联建"):
+        if d_area_building:
+            add(d_area_building)
+        else:
+            d_before_area = _RE_D_BEFORE_AREA.search(body)
+            if d_before_area:
+                add(f"D{int(d_before_area.group(1))}")
+            elif _RE_D_AREA.search(body) and not any(
+                    re.fullmatch(r"D\d{1,2}", key) for key in cands):
+                add("D2")
     # 命名点（词面即点名）
     for kw, pt in _NAMED_HITS.items():
         if kw in body:
@@ -199,7 +272,7 @@ def _pick_primary(cands: dict[str, int], prefer_gate_when_both: bool) -> tuple[s
     if len(ordered) == 1:
         return ordered[0][1], "唯一候选"
     gates = {k for k in cands if k in GATE_POINT.values()}
-    bldgs = [k for k in cands if re.fullmatch(r"[A-Da-d]\d{1,2}|\d{1,2}号楼|医\d+号", k)]
+    bldgs = [k for k in cands if re.fullmatch(r"[A-Da-d]\d{1,2}|\d{1,2}号楼|医\s*\d+号", k)]
     if gates and bldgs:
         if prefer_gate_when_both:
             return next(iter(gates)), "门与楼共存，默认取门"
@@ -249,6 +322,14 @@ def normalize_delivery_point(
     body = _clean(raw)
     cands, has_cabinet, named_college = _extract_candidates(body, campus)
 
+    # D1、D2 同时出现时按住户口径统一取 D2，不再进入人工待确认。
+    if "D1" in cands and "D2" in cands:
+        return {
+            "campus": campus, "point": "D2", "confidence": "high",
+            "reason": "D1/D2同时出现，按口径取D2", "raw_address": raw,
+            "candidates": dict(cands), "cabinet": has_cabinet,
+        }
+
     if not cands and body in {"大西", "小西", "小", "校门口", "外卖柜"}:
         point = _canonical_point_name(body)
         return {
@@ -273,16 +354,6 @@ def normalize_delivery_point(
         }
     if len(cands) == 1:
         point = _canonical_point_name(next(iter(cands)))
-        # A bare "西门" is ambiguous in the real data; explicit 大/小西门
-        # and 西南门 remain high-confidence aliases.
-        has_explicit_gate = bool(re.search(r"大西门|小西门|西南1?门", body))
-        if (point == "大西" and not has_explicit_gate
-                and re.search(r"(?<![大小])西门", body)):
-            return {
-                "campus": campus, "point": point, "confidence": "medium",
-                "reason": "泛称西门，待人工确认", "raw_address": raw,
-                "candidates": dict(cands), "cabinet": has_cabinet,
-            }
         return {
             "campus": campus, "point": point, "confidence": "high",
             "reason": "唯一候选", "raw_address": raw,
