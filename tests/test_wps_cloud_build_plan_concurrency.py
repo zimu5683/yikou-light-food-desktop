@@ -223,34 +223,19 @@ def test_single_sheet_uses_sequential_path():
 # ----------------------------------------------------------------------
 # 并发确实生效 / 并发度保守
 # ----------------------------------------------------------------------
+# 说明：这里**刻意不做墙钟断言**。
+# 第 13 轮 CI 实测发现 macOS runner 上 time.sleep(0.03) 实际要花 60~130ms，
+# 于是「并发耗时 < N × delay × 0.9」这种看似稳妥的**下界**断言也会假失败
+# （实测 10 次读 / 4 并发跑了 0.579s，而下界只有 0.300s）。
+# 结论：**CI 上任何依赖墙钟的断言都不可靠**；并发的证据改用确定性的
+# 「同时在途的请求数」，见下面的 overlap 测试。
 def test_reads_actually_overlap():
-    _, cli, _ = _run(2, delay=0.05)
-    assert cli.max_inflight >= 2, "并发度没有生效"
+    """并发的**确定性**证据：同一时刻有 ≥2 个请求在途（不依赖任何计时）。"""
+    _, cli, sheets = _run(2, delay=0.05)
 
-
-def test_concurrency_beats_the_serial_floor(tmp_path, monkeypatch):
-    """并发必须快于「完全串行」的**理论下界**，而不是去比两次墙钟测量值。
-
-    ⚠️ 原先这条是「并发实测 < 串行实测 × 0.75」，在 CI 上**假失败过**：
-    macOS runner 上 2 路并发的收益被线程启动开销吃掉，实测串行 0.473s /
-    并发 0.404s（仅 1.17x），达不到 1.33x。墙钟比值天生不稳，不能作为断言。
-
-    改成与**理论下界**比较：共 N 次读、每次 sleep `delay`，完全串行至少要
-    ``N × delay``；并发只要 6 个波次就是 ``6 × delay``，留足余量后仍然
-    能证明「确实重叠了」。真正的确定性证据是隔壁的
-    ``test_reads_actually_overlap``（断言同时在途的请求数 ≥ 2）。
-    """
-    delay = 0.03
-    t0 = time.perf_counter()
-    _, cli, _ = _run(2, delay=delay)
-    parallel = time.perf_counter() - t0
-
-    reads = len(cli.calls)
-    serial_floor = reads * delay
-    assert reads >= 6, "读数太少，这条测试没有意义"
-    assert parallel < serial_floor * 0.9, (
-        f"并发 {parallel:.3f}s 没有明显快于串行下界 {serial_floor:.3f}s"
-        f"（{reads} 次读 / 每次 {delay}s）")
+    assert len(cli.calls) == len(sheets) * 3, "先把读数钉住"
+    assert cli.max_inflight >= 2, "并发度没有生效，仍在串行读"
+    assert cli.max_inflight <= 2, "同时在途数不该超过配置的并发度"
 
 
 def test_default_workers_stay_conservative_for_rate_limit():
