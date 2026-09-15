@@ -10,7 +10,8 @@ import pytest
 from app.artifact_store import (DEFAULT_POLICY, CompactionPolicy,
                                 apply_compaction, archive_files,
                                 directory_footprint, enforce_budget,
-                                managed_paths, plan_compaction, snapshot_groups)
+                                managed_footprint, managed_paths,
+                                plan_compaction, snapshot_groups)
 
 # 测试用的小预算：触发线 80 KiB、目标 60 KiB。
 # 证据组约 20 KiB（其中 PNG 不可压、HTML/TXT 可压），因此 fresh_keep=2 的硬下限
@@ -420,6 +421,48 @@ def test_report_summary_mentions_savings(tmp_path):
 def test_report_summary_mentions_dry_run(tmp_path):
     _many(tmp_path, 8)
     assert "预演" in enforce_budget(tmp_path, SMALL, dry_run=True).summary()
+
+
+def test_managed_footprint_ignores_unmanaged_files(tmp_path):
+    """预算是「受管产物」的预算，webview 缓存等不该算进来。"""
+    root = tmp_path / "cfg"
+    (root / "logs").mkdir(parents=True)
+    (root / "logs" / "20260901_010000_000000_定位失败.html").write_bytes(b"h" * 100)
+    (root / "update.log").write_bytes(b"l" * 50)
+    # 管不了的大文件：不该计入预算。
+    (root / "webview").mkdir()
+    (root / "webview" / "cache.bin").write_bytes(b"c" * 5_000_000)
+    (root / "config.json").write_bytes(b"k" * 1000)
+
+    assert directory_footprint(root) > 5_000_000
+    assert managed_footprint(root) == 150
+
+
+def test_huge_unmanaged_files_never_trigger_compaction(tmp_path):
+    """只有 webview 缓存超标时，绝不能因此删掉证据。"""
+    root = tmp_path / "cfg"
+    (root / "logs").mkdir(parents=True)
+    for stamp in ("20260901_010000_000000", "20260901_020000_000000"):
+        (root / "logs" / f"{stamp}_定位失败.html").write_bytes(b"evidence" * 10)
+    (root / "webview").mkdir()
+    (root / "webview" / "cache.bin").write_bytes(b"c" * 20_000_000)
+
+    report = enforce_budget(root, SMALL)
+
+    assert not report.triggered
+    assert report.applied == []
+    # 两条证据原封不动。
+    assert len(list((root / "logs").glob("*_定位失败.html"))) == 2
+
+
+def test_report_and_plan_use_managed_footprint(tmp_path):
+    root = tmp_path / "cfg"
+    (root / "logs").mkdir(parents=True)
+    _snapshot(root, "20260901_010000_000000")
+    before = managed_footprint(root)
+    report = enforce_budget(root, SMALL)
+    assert report.before_bytes == before
+    assert report.after_bytes == managed_footprint(root)
 
 
 def test_report_summary_is_honest_when_nothing_is_compressible(tmp_path):

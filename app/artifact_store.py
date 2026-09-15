@@ -9,7 +9,8 @@
 它们对排查问题很有用，但长期使用会无限增长，最终拖慢启动、占满磁盘，也让
 「把现场交给别人看」变得不现实。本模块实现「预算 + 逼近触发 + 自适应压缩」：
 
-1. 量出受管产物的总占用；
+1. 量出受管产物的总占用（``managed_footprint``：**只算上面两类**，不含
+   ``webview/``、``config.json`` 等既管不了也不该管的文件）；
 2. **只有总占用逼近阈值**（默认 100 MiB 的 ``trigger_ratio``）才动手，避免每次
    启动都做无用功；一旦触发就压到 ``target_ratio`` 以下，留出滞回余量；
 3. 按「信息损失从小到大」执行：轮转超大日志 → 把最旧的证据三元组**无损**打包
@@ -228,6 +229,21 @@ def managed_paths(root: Path) -> tuple[Path, Path]:
     return logs, logs / ARCHIVE_DIRNAME
 
 
+def managed_footprint(root: Path) -> int:
+    """只统计**受管产物**的占用：``logs/``（含 ``archive/``）与 ``update.log``。
+
+    刻意不用整个用户配置目录：``webview/``（WebKit 的 localStorage/缓存）、
+    ``config.json``、``wps_sync_state.json`` 等既不在本模块的处置范围内，也**不该
+    计入预算**——否则一笔压不下去的占用会让程序误判"超标"，进而删掉本可保留的
+    证据却永远达不成目标。
+    """
+    logs_dir, _ = managed_paths(root)
+    total = directory_footprint(logs_dir)
+    for name in MANAGED_LOGS:
+        total += _file_size(Path(root) / name)
+    return total
+
+
 @dataclass(frozen=True)
 class SnapshotGroup:
     """同一次页面定位失败产生的证据文件集合。"""
@@ -333,7 +349,7 @@ def plan_compaction(
     """
     root = Path(root)
     logs_dir, archive_dir = managed_paths(root)
-    footprint = directory_footprint(root) if current_bytes is None else current_bytes
+    footprint = managed_footprint(root) if current_bytes is None else current_bytes
 
     if footprint <= policy.trigger_bytes:
         return []
@@ -600,7 +616,7 @@ def enforce_budget(
     实际收益就立即停止，不会空转。``dry_run`` 只规划不动手。
     """
     target_root = Path(root) if root is not None else user_data_dir()
-    before = directory_footprint(target_root)
+    before = managed_footprint(target_root)
     report = CompactionReport(
         root=target_root, policy=policy,
         before_bytes=before, after_bytes=before,
@@ -630,7 +646,7 @@ def enforce_budget(
         report.applied.extend(applied)
         report.failed.extend(failed)
 
-        measured = directory_footprint(target_root)
+        measured = managed_footprint(target_root)
         if measured >= current:
             # 没有任何收益（例如文件被占用），停止以免空转。
             current = measured
