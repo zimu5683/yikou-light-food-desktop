@@ -77,7 +77,9 @@ def _start_context_compaction() -> None:
         try:
             from .artifact_store import enforce_budget
             report = enforce_budget()
-            if report.triggered:
+            # 逐条动作由 enforce_budget 自己记录；这里只在「确实做了事」或
+            # 「压不进预算」时补一条摘要，避免重复刷同样的行。
+            if report.applied or report.over_budget:
                 logger.info("上下文自适应压缩：%s", report.summary())
         except Exception:  # pragma: no cover - 整理失败绝不影响启动
             logger.debug("上下文压缩失败", exc_info=True)

@@ -656,6 +656,7 @@ def enforce_budget(
             break
 
     report.after_bytes = current
-    if report.applied or report.failed:
-        logger.info("上下文自适应压缩：%s", report.summary())
+    if report.failed:
+        logger.warning("上下文自适应压缩有 %d 项失败：%s",
+                       len(report.failed), report.summary())
     return report
