@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import type { AddressInputRequest } from '@/lib/bridge'
 import { statusLabel, useApp } from '@/hooks/appContext'
 import { cn } from '@/lib/utils'
+import { formatLogMsg, isOrderSummary, splitOrderSummary } from '@/lib/format'
 
 const LEVEL_CLASS: Record<string, string> = {
   OK: 'text-success',
@@ -17,6 +18,13 @@ const LEVEL_CLASS: Record<string, string> = {
   ERROR: 'text-destructive',
 }
 
+/**
+ * 状态徽章文案与「是否在跑」。
+ *
+ * 留在组件里而不搬进 `@/lib/format`：它依赖 `statusLabel`，而 `statusLabel` 所在的
+ * `@/hooks/appContext` 用了 `@/` 别名导入，Node 的测试运行器解析不了 —— 搬过去会让
+ * `format.ts` 无法被测试直接 import。真正的文案映射本来就在 appContext 里。
+ */
 function statusBadgeMeta(status: string): { label: string; live: boolean } {
   return { label: statusLabel(status as never), live: status === 'running' }
 }
@@ -222,21 +230,8 @@ function InlineAddressInput({
 }
 
 /** 订单摘要行（W8 | 李 | 电话 | 地址 | 餐品）→ 每字段一行 */
-function isOrderSummary(msg: string): boolean {
-  // automation 的 _format_order_summary 用全角“｜”连接字段
-  return /^W\d+\s*[｜|]/.test(msg)
-}
-
-function formatLogMsg(msg: string): string {
-  if (!isOrderSummary(msg)) return msg
-  return msg
-    .split(/[｜|]/)
-    .map((part) => part.trim())
-    .join('\n')
-}
-
 function OrderSummaryText({ msg }: { msg: string }) {
-  const parts = msg.split(/[｜|]/).map((part) => part.trim())
+  const parts = splitOrderSummary(msg)
   return (
     <span className="block">
       {parts.map((part, i) => (

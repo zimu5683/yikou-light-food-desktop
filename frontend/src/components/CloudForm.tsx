@@ -16,6 +16,7 @@ import { Field, TextInput } from '@/components/fields'
 import { useApp } from '@/hooks/appContext'
 import { api, isApiReady, type WpsCopyCheck, type WpsResult, type WpsStatus } from '@/lib/bridge'
 import { cn } from '@/lib/utils'
+import { splitAddressLines } from '@/lib/format'
 
 /** 地址排序涉及的 6 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
 const ADDRESS_SHEETS = [
@@ -30,13 +31,6 @@ const ADDRESS_SHEETS = [
 const ADDRESS_PLACEHOLDER = '一行一个地址，从上到下就是排列顺序；留空 = 按地址升序排列（医学院用这种）'
 
 /** 多行文本 → 顺序数组：按行拆分、去首尾空白、丢掉空行。 */
-function splitAddressLines(raw: string): string[] {
-  return raw
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '')
-}
-
 /** 地址清单输入框：样式与 TextInput 一致（底色 secondary，聚焦转卡片色）。 */
 const addressTextareaClass = cn(
   'mt-1 w-full resize-y rounded-[4px] border border-transparent bg-secondary px-2.5 py-1.5',

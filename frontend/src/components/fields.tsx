@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { cn } from '@/lib/utils'
+import { formatISO, sameDay, startOfMonth } from '@/lib/format'
 
 export interface FieldState {
   state?: 'neutral' | 'valid' | 'invalid'
@@ -183,22 +184,6 @@ export function Stepper({
 }
 
 const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'] as const
-
-function startOfMonth(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), 1)
-}
-
-function sameDay(a: Date, b: Date): boolean {
-  return (
-    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
-  )
-}
-
-function formatISO(d: Date): string {
-  const mm = String(d.getMonth() + 1).padStart(2, '0')
-  const dd = String(d.getDate()).padStart(2, '0')
-  return `${d.getFullYear()}-${mm}-${dd}`
-}
 
 /** 日期选择：只允许今天或过去日期（与旧版 _DatePickerPopup 语义一致），可清空 */
 export function DateField({

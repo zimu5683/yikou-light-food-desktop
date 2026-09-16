@@ -26,10 +26,7 @@ import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/
 import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
 import { api, isApiReady, type OrderFormPayload, type SssFormPayload } from '@/lib/bridge'
 import { cn } from '@/lib/utils'
-
-function modeError(fields: FieldErrors | null, key: string): string | undefined {
-  return fields?.[key]?.message
-}
+import { modeError } from '@/lib/format'
 
 export function TaskPanel() {
   const { mode, setMode, workerAlive, config } = useApp()
