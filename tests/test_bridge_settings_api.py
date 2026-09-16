@@ -167,18 +167,12 @@ def test_tables_and_address_order_go_through_normalizers(tmp_path):
     assert bridge._config.wps_address_order["衣锦中餐"] == ["外卖柜", "校门口"]
 
 
-def test_partial_tables_payload_resets_other_sheets_to_factory_defaults(tmp_path):
-    """⚠️ 记录一个**潜在隐患**（既有行为，未改动）：
+def test_partial_tables_payload_keeps_the_other_sheets(tmp_path):
+    """**用户已确认的行为变更**：部分回传 tables 时，没提到的子表**保持原样**。
 
-    ``tables`` 与 ``address_order`` 走的是 ``normalize_*(payload.get(...))``，
-    而 ``normalize_*`` 在没传 ``base`` 时以**出厂默认**为底 —— 不是以**当前配置**为底。
-    于是只要界面回传的 tables 是**部分的**，没提到的子表就会被**重置成出厂 file_id**，
-    用户自定义过的表 ID 会被静默丢弃。
-
-    对比：同一个方法里其它字段用的是「缺键则保留原值」的白名单语义，两者并不一致。
-    当前前端回传的是完整列表（``wps_status()["tables"]``），所以实际不会触发；
-    但若哪天改成「只发改动项」，这里就会丢配置。**是否修正需要用户决策**
-    （改成 ``base=cfg.wps_tables`` 是有意为之的行为变更，不在「功能不变」范围内）。
+    原先以「出厂默认」为底，只回传一张表会把其余子表的用户自定义 file_id
+    **静默重置**成出厂值（第 17 轮实测复现过）。现在改为以**当前配置**为底，
+    与同一个方法里其它字段的「缺键保留原值」白名单语义一致了。
     """
     bridge = _bridge(tmp_path)
     cfg = bridge._config
@@ -188,9 +182,20 @@ def test_partial_tables_payload_resets_other_sheets_to_factory_defaults(tmp_path
     bridge.save_wps_config({"tables": {"东湖中餐": "NEW_ID"}})
 
     assert cfg.wps_tables["东湖中餐"] == {"file_id": "NEW_ID"}
-    # 没提到的子表被拉回出厂默认（而不是保留 CUSTOM_YJ）
-    assert cfg.wps_tables["衣锦中餐"]["file_id"] != "CUSTOM_YJ"
-    assert len(cfg.wps_tables) == 6, "出厂默认的 6 张表都会补回来"
+    assert cfg.wps_tables["衣锦中餐"] == {"file_id": "CUSTOM_YJ"}, "没提到的子表不能被重置"
+    assert len(cfg.wps_tables) == 2, "不该把出厂默认的其它表补回来"
+
+
+def test_partial_address_order_payload_keeps_the_other_sheets(tmp_path):
+    """地址顺序同理：只改一张表的顺序，不该动到别的表。"""
+    bridge = _bridge(tmp_path)
+    cfg = bridge._config
+    cfg.wps_address_order = {"衣锦中餐": ["我的顺序"], "东湖中餐": ["小", "大西"]}
+
+    bridge.save_wps_config({"address_order": {"衣锦中餐": "外卖柜"}})
+
+    assert cfg.wps_address_order["衣锦中餐"] == ["外卖柜"]
+    assert cfg.wps_address_order["东湖中餐"] == ["小", "大西"], "别的表不该被动"
 
 
 def test_config_is_persisted(tmp_path):

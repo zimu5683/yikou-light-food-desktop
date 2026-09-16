@@ -955,10 +955,14 @@ class Bridge:
             cfg.wps_sort_enabled = bool(payload.get("sort_enabled"))
         if "address_order" in payload:
             from .config import normalize_wps_address_order
-            cfg.wps_address_order = normalize_wps_address_order(payload.get("address_order"))
+            # 以**当前配置**为底：界面只回传部分子表时，没提到的子表保持原样。
+            # （原实现以出厂默认为底，会把用户自定义的表 ID/地址顺序静默重置。）
+            cfg.wps_address_order = normalize_wps_address_order(
+                payload.get("address_order"), base=cfg.wps_address_order)
         if "tables" in payload:
             from .config import normalize_wps_tables
-            cfg.wps_tables = normalize_wps_tables(payload.get("tables"))
+            cfg.wps_tables = normalize_wps_tables(
+                payload.get("tables"), base=cfg.wps_tables)
         try:
             cfg.save()
         except OSError:

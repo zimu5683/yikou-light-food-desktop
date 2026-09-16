@@ -297,8 +297,10 @@ class AppConfig:
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
         # url/phone/browser are compatibility aliases used by the GUI.
-        self.target_url = url if url is not None else target_url
-        self.phone_number = phone if phone is not None else phone_number
+        # 这几个字段都要**去首尾空格**：电话与账号同时是系统密钥链里的账号名，
+        # 带空格的 " 138 " 与 "138" 会被当成两个不同账号，导致「密码明明存过却取不到」。
+        self.target_url = str(url if url is not None else target_url or "").strip()
+        self.phone_number = str(phone if phone is not None else phone_number or "").strip()
         # ``Path("")`` resolves to the current directory and used to pass the
         # GUI's existence check on a fresh install.  ``None`` is an unambiguous
         # representation of "no workbook selected".
@@ -316,19 +318,22 @@ class AppConfig:
         self.order_count = order_count
         self.split_ratio = clamp_split_ratio(split_ratio)
         self.sss_url = sss_url
-        self.sss_account = sss_account
+        # 与 phone_number 同理：sss_account 也是密钥链里的账号名。
+        self.sss_account = str(sss_account or "").strip()
         self.sss_excel_path = Path(sss_excel_path) if sss_excel_path else None
         # 只接受 wps / excel 两个取值；其它（含旧配置缺字段）一律按云端模式。
         source = str(sss_order_source or "").strip().lower()
         self.sss_order_source = "excel" if source == "excel" else "wps"
-        self.sss_product_name = sss_product_name or "轻食"
-        self.sss_common_address = sss_common_address or "嗯哼"
+        # 先 strip 再判空：纯空白要当成「没填」，回落到默认值而不是把空格提交上去。
+        self.sss_product_name = str(sss_product_name or "").strip() or "轻食"
+        self.sss_common_address = str(sss_common_address or "").strip() or "嗯哼"
         self.sss_store_name = sss_store_name or "一口轻食"
         self.sss_use_fixed_address = bool(sss_use_fixed_address)
         self.sss_fixed_lnt = float(sss_fixed_lnt)
         self.sss_fixed_lat = float(sss_fixed_lat)
         self.sss_fixed_area_code = sss_fixed_area_code or "330110"
-        self.sss_fixed_address_detail = sss_fixed_address_detail or "浙江农林大学东湖校区"
+        self.sss_fixed_address_detail = (
+            str(sss_fixed_address_detail or "").strip() or "浙江农林大学东湖校区")
         self.sss_dry_run = bool(sss_dry_run)
         self.sss_preflight = bool(sss_preflight)
         self.sss_store_id = int(sss_store_id) if sss_store_id not in (None, "") else None

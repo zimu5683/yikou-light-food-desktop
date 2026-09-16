@@ -66,21 +66,35 @@ def test_empty_survives_a_save_load_roundtrip_as_the_default(field, default, tmp
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("field", ["sss_product_name", "sss_common_address",
                                    "sss_fixed_address_detail", "phone_number",
-                                   "target_url"])
-def test_whitespace_only_values_are_preserved_not_trimmed(field):
-    """记录实际行为：这些字段**只做 falsy 判断，不做 strip**。
+                                   "target_url", "sss_account"])
+def test_surrounding_whitespace_is_trimmed(field):
+    """**用户已确认的行为变更**：这些字段现在会自动去掉首尾空格。
 
-    所以 ``"   "`` 是「有值」的，会原样保留。副作用值得知道：``phone_number`` 同时是
-    系统密钥链的账号名，``" 138 "`` 与 ``"138"`` 会**被当成两个不同的账号**去取密码。
-    这不是缺陷（唯一写入口是界面输入框），但写下来免得后人误以为这里有去空白保护。
+    原先是「只做 falsy 判断、不 strip」，于是 ``" 138 "`` 会被原样保留 —— 而
+    ``phone_number`` / ``sss_account`` 同时是**系统密钥链里的账号名**，
+    带空格的写法与不带空格会被当成两个不同账号，导致「密码明明存过却取不到」。
     """
-    assert getattr(AppConfig(**{field: "   "}), field) == "   "
+    assert getattr(AppConfig(**{field: "  x  "}), field) == "x"
 
 
-def test_order_date_is_the_one_field_that_does_get_trimmed():
-    """对照组：``order_date`` 走的是 ``str(x or "").strip()``，确实会裁剪。
+@pytest.mark.parametrize("field", ["sss_product_name", "sss_common_address",
+                                   "sss_fixed_address_detail"])
+def test_whitespace_only_falls_back_to_the_default(field):
+    """纯空白现在等于「没填」→ 回落到默认值（而不是把空格提交上去）。"""
+    assert getattr(AppConfig(**{field: "   "}), field) == dict(FALSY_FALLBACKS)[field]
 
-    把这处**不一致**也钉住 —— 它说明「裁不裁剪」是按字段各写的，不是统一规则。
+
+@pytest.mark.parametrize("field", ["phone_number", "target_url", "sss_account"])
+def test_whitespace_only_becomes_empty_for_plain_text_fields(field):
+    """这几个没有默认值可回落，去完空格就是空串。"""
+    assert getattr(AppConfig(**{field: "   "}), field) == ""
+
+
+def test_order_date_is_also_trimmed():
+    """``order_date`` 一直就是 ``str(x or "").strip()``。
+
+    （早先这里写的是「唯一会裁剪的字段」；用户确认的行为变更之后，电话号码、账号、
+    商品名、常用地址、固定地址详情等也一并去空格了，所以它不再是特例。）
     """
     assert AppConfig(order_date="  2026-09-16  ").order_date == "2026-09-16"
     assert AppConfig(order_date=None).order_date == ""
