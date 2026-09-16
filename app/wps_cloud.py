@@ -65,6 +65,10 @@ STRUCT_COLUMN_KEYS = ("type", "kind", "total", "served", "left", "remark")
 # 排序辅助列的列号上限：真实排单表最宽也就 200 多列，异常宽说明 used range 有问题，
 # 此时宁可不排序，也不要对几万列的区域发排序请求。
 MAX_SORT_COL = 1000
+# 排序前的“右侧边界探测”宽度（列数）。辅助列放在「已扫描到的最后一个有内容的列」
+# 右边，这一带必须为空，否则说明有内容落在 MAX_SCAN_COL 之外 —— 那样排序区覆盖不到它，
+# 排序后行与列就会错位，必须拒绝排序而不是硬排。
+SORT_PROBE_WIDTH = 40
 # 排序键零填充宽度：接口可能把数字按文本比较（"10" < "2"），补零后字典序即数值序。
 SORT_KEY_WIDTH = 4
 # 同一个地址组内：已有行在前（+0），本次新增行在后（+1），空行垫底（+2）。
@@ -212,6 +216,8 @@ class SheetPlan:
     sort_key_col: int = 0
     # 排序区域，形如 ``A3:GS142``
     sort_range: str = ""
+    # 排序区实际覆盖到的最后一列（1-based）；写入前由 ``probe_sort_area`` 探测确认
+    sort_probe_col: int = 0
     # 每个数据行的排序键：{(排序前不能用的) 行号: 键值}
     row_keys: dict[int, int] = field(default_factory=dict)
     # 预测的排序后行号：{(姓名, 电话): 行号}
@@ -347,6 +353,66 @@ def sort_key_column(*, sheet_col_to: int, extra_cols: Iterable[int] = ()) -> int
     """
     last = max([int(sheet_col_to or 0), 1, *[int(c or 0) for c in extra_cols]])
     return last + 1
+
+
+def effective_last_col(reported: int, *,
+                       scan_width: int = MAX_SCAN_COL) -> int:
+    """把 ``sheetsInfo.colTo`` 换算成可用的「最后使用列」（1-based）。
+
+    为什么不能无条件相信它：那是 WPS 记的 used range 右下角，一旦表格被"整列/到最右列"
+    的操作碰过（本程序自己就会用 ``col_to: 16383`` 删行），它就会停在网格最右列 ——
+    实测东湖中餐返回 16383，而真实内容只到第 22 列。据此算出的辅助列是 16385，
+    超过 ``MAX_SORT_COL``，排序会被静默跳过（这正是"东湖中餐排不了序"的根因）。
+
+    规则：报出来的宽度**没超过我们真正读过的范围**时照用（它更保守，辅助列能离内容
+    更远、不会碰到内容右侧的边框/底色）；超过读取范围（``MAX_SCAN_COL``）说明它是
+    "整列污染"的产物，此时退回读取宽度，边界由 :func:`probe_sort_area` 兜底。
+    """
+    reported = max(1, int(reported or 0))
+    return reported if reported <= max(1, int(scan_width)) else max(1, int(scan_width))
+
+
+def content_last_col(grid: Mapping[tuple[int, int], Any], fallback: int) -> int:
+    """已读到的内容里**最后一个有内容的列**（1-based）；没有内容时用 ``fallback``。"""
+    last = 0
+    for row, col in grid:
+        try:
+            column = int(col) + 1
+        except (TypeError, ValueError):
+            continue
+        if column > last:
+            last = column
+    return max(int(fallback or 0), last, 1)
+
+
+def probe_sort_area(cli: "KdocsCli", plan: SheetPlan, worksheet_id: int, *,
+                    col_from: int, row_to: int,
+                    width: int = SORT_PROBE_WIDTH) -> tuple[bool, str]:
+    """确认「辅助列右边的这一带」是空的 —— 排序区必须覆盖到表里所有内容。
+
+    ``col_from`` 必须从 **辅助列 + 1** 开始：辅助列自己就装着本次要写的排序键，
+    把它一起读进来会误判成"右侧还有内容"。``content_last_col`` 只能看见
+    ``MAX_SCAN_COL`` 以内读到的内容；若表在更右边还有东西（异常 used range 通常
+    就是这个原因），排序区就覆盖不到那些列，排序后行会与它们错位。这里往右探一条
+    窄带：发现任何内容就返回 ``False``，调用方拒绝排序。
+
+    只读、只发一次请求；``read_grid`` 的键是 0-based 坐标，因此定位不依赖接口顺序。
+    """
+    col_to = min(MAX_SORT_COL, int(plan.sort_key_col) + max(0, int(width) - 1),
+                 16383)
+    if col_to <= int(col_from):
+        return True, ""
+    try:
+        grid = cli.read_grid(plan.file_id, worksheet_id, FIRST_DATA_ROW - 1,
+                             int(row_to), int(col_from) - 1, col_to)
+    except WpsCloudError:
+        # 探测本身失败不该阻断排序：按"没探到"处理（旧行为），只留一条提示。
+        return True, ""
+    if not grid:
+        return True, ""
+    row, col = min(grid, key=lambda key: (int(key[1]), int(key[0])))
+    return False, (f"{column_name(int(col) + 1)}{int(row) + 1}「"
+                   f"{str(grid[(row, col)])[:12]}」")
 
 
 def date_region(columns: Mapping[str, int],
@@ -997,9 +1063,6 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
         plan.warnings.append("云端文件不可读或不是在线表格")
         return plan
     worksheet_id = int(infos[0].get("sheetId") or 1)
-    # 真实的「最后使用列」（1-based）——排序辅助列要放在它右边，不能用被
-    # MAX_SCAN_COL 截断过的读取范围。
-    real_col_to = int(infos[0].get("colTo") or 0) + 1
     row_to, col_to = scan_bounds(infos[0])
     grid = cli.read_grid(plan.file_id, worksheet_id, 0, row_to, 0, col_to)
     plan.append_row = max(plan.append_row, 0)
@@ -1209,13 +1272,26 @@ def _build_sheet_plan(cli: KdocsCli, *, sheet: str, orders: Sequence[CloudOrder]
     sort_on = bool(sort_enabled and new_count and data_rows)
     helper_col = 0
     if sort_on:
+        # 宽度必须以**接口报的 used range** 为准，不能只看读到的内容：内容右侧的
+        # 边框/底色即使没有文字也属于"表格内容"，辅助列插在那里会把它们推走。
+        reported_last = max(1, int(infos[0].get("colTo") or 0) + 1)
+        real_last_col = max(effective_last_col(reported_last),
+                            content_last_col(grid, col_to + 1))
         helper_col = sort_key_column(
-            sheet_col_to=real_col_to,
+            sheet_col_to=real_last_col,
             extra_cols=[plan.marker_col, plan.columns.get("remark") or 0])
         if helper_col > MAX_SORT_COL:
+            # used range 报得离谱（整列污染）或表真的过宽：无法保证排序区覆盖全部列，
+            # 宁可不排序，也不要把行与列排错位。
             plan.warnings.append(
-                f"表格宽度异常（最后使用列 {real_col_to}，辅助列 {helper_col}），本次跳过排序")
+                f"表格宽度异常（接口报最后使用列 {reported_last}，辅助列 {helper_col}），"
+                "本次跳过排序：新客户会留在表格最上面")
             sort_on = False
+    elif new_count and not sort_enabled:
+        plan.warnings.append(
+            "已按设置关闭排序：新客户留在表格最上面，不会按地址归位")
+    elif new_count and not data_rows:
+        plan.warnings.append("表里还没有数据行，本次只写入新客户，无需排序")
 
     # 预测排序结果（稳定排序：等键保持源顺序，与云端 range-sort 的承诺一致）。
     # 排序前的物理顺序 = 新行（第 4 行起）+ 已有行（原有先后）。
@@ -1565,6 +1641,22 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
 
         # 4) 排序：写排序键（辅助列，在该表所有内容列右侧）→ 云端原地排序 → 删辅助列。
         if plan.sort_key_col and plan.row_keys:
+            # 4a) 排序区必须覆盖表里**所有**内容列：辅助列右边若还有内容，说明它在
+            #     读取范围（MAX_SCAN_COL）之外，排序会让行与那些列错位。此时拒绝排序并
+            #     回滚插入 —— 宁可不排序，也不能把表排坏。
+            safe, found_at = probe_sort_area(
+                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+            if not safe:
+                _rollback_inserts(cli, plan, worksheet_id, inserted, emit)
+                reason = (f"第 {plan.sort_key_col} 列右侧（{found_at}）还有内容，"
+                          "排序区覆盖不到它，已放弃排序以免行与列错位")
+                emit(f"[云同步] {plan.sheet}：{reason}；新客户行已回滚，"
+                     "请先清理该列内容后重新上传", "ERROR")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": reason})
+                result["failed"] += 1
+                continue
             key_cells = [{"row": row, "col": plan.sort_key_col,
                           "value": format_sort_key(key)}
                          for row, key in sorted(plan.row_keys.items())]
@@ -1583,6 +1675,19 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
                 continue
             emit(f"[云同步] {plan.sheet}：已按地址顺序重排第 {FIRST_DATA_ROW}~"
                  f"{plan.last_data_row} 行")
+            # 4b) 排序后复查一次：确实错位了就不要继续往这些行写数据。
+            safe, found_at = probe_sort_area(
+                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+            if not safe:
+                emit(f"[云同步] {plan.sheet}：排序后第 {plan.sort_key_col} 列右侧出现内容"
+                     f"（{found_at}），说明排序区未覆盖全部列，已停止写入后续数据。"
+                     "表已重排，请重新上传（重复执行安全）", "ERROR")
+                result["sheets"].append({
+                    "sheet": plan.sheet, "status": "failed",
+                    "reason": f"排序区未覆盖全部列（右侧有内容：{found_at}）"})
+                result["failed"] += 1
+                continue
             try:
                 cli.delete_columns(plan.file_id, worksheet_id,
                                    column=plan.sort_key_col, rows=plan.last_data_row)
@@ -1742,9 +1847,15 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
             # 账本仅作留痕/审计：记录本次写入后每人的总餐次与目标日期格状态
             entries = {f"{c.name}\u0000{c.phone}": c.total_after for c in pending}
             ledger.record(plan.target_date.isoformat(), plan.file_id, entries)
+        sort_skipped = ""
+        if new_changes and not plan.sort_enabled:
+            # 具体原因（设置里关了排序 / 表格结构检查没过）由 plan.warnings 给出，
+            # 这里只保证"确实没排序"这件事在日志里有一句醒目的话。
+            sort_skipped = "本次未按地址重排整表：新客户留在表格最上面，原因见上方警告"
         result["sheets"].append({"sheet": plan.sheet, "status": "ok",
                                  "cells": len(cells), "people": len(pending),
                                  "sorted": bool(plan.sort_enabled),
+                                 "sort_skipped": sort_skipped,
                                  "sort_mismatch": bool(plan.sort_mismatch)})
         result["written"] += 1
     if ledger is not None:

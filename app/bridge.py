@@ -1149,6 +1149,10 @@ class Bridge:
                 if status == "ok":
                     detail = item.get("reason") or f"{item.get('people', 0)} 人"
                     self.log(f"[云同步] ✔ {item['sheet']}：{detail}", "OK")
+                    if item.get("sort_skipped"):
+                        # 排序被跳过时新客户没有按地址归位，必须在日志里点名，
+                        # 否则只会在预览里表现为一行小字（用户曾因此以为"排序失效"）。
+                        self.log(f"[云同步] ⚠ {item['sheet']}：{item['sort_skipped']}", "WARN")
                 elif status == "verify_failed":
                     self.log(f"[云同步] ✘ {item['sheet']}：写入后回读校验未通过"
                              f"（{'; '.join(item.get('problems', [])[:3])}）", "ERROR")

@@ -612,6 +612,80 @@ def test_helper_column_is_written_then_deleted():
     assert not left, f"辅助列没清干净：{left}"
 
 
+# ----------------------------------------------------------------------
+# used range 被"整列污染"的表（东湖中餐实测 colTo=16383）必须照样能排序
+# ----------------------------------------------------------------------
+
+class BogusWidthCli(FakeCli):
+    """``sheetsInfo.colTo`` 报成网格最右列（16383），真实内容只有十来列。"""
+
+    def sheets_info(self, file_id: str):
+        info = dict(super().sheets_info(file_id)[0])
+        info["colTo"] = 16383
+        return [info]
+
+
+def test_bogus_used_range_does_not_disable_sorting():
+    """接口把 used range 报成 16383 时，排序不能被静默跳过。
+
+    这是"东湖中餐排不了序"的回归测试：旧实现直接拿 colTo 当最后使用列，
+    算出辅助列 16385 > MAX_SORT_COL，于是 sort_on 被关掉，新客户留在表格最上面。
+    """
+    cli = BogusWidthCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+        {0: "李", 1: "小", 2: "222", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新", "小", "999", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": ["小", "大西"]})[0]
+
+    assert plan.sort_enabled, f"应当排序；warnings={plan.warnings}"
+    assert not [w for w in plan.warnings if "宽度异常" in w]
+    # 辅助列落在"读取范围"右侧（东湖中餐真实内容只到第 22 列，读取上限 200），
+    # 关键是它必须是一个**能一起排序**的合理列号，而不是 16385。
+    assert plan.sort_key_col <= wc.MAX_SCAN_COL + 2, "辅助列必须落在可排序范围内"
+    assert plan.sort_key_col > plan.columns["remark"], "辅助列必须在备注右侧"
+    assert wc.column_name(plan.sort_key_col) in plan.sort_range
+
+    result = apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert result["failed"] == 0, result["sheets"]
+    names = [cli.grid.get((r, 0)) for r in range(2, 5)]
+    # 小 组：老客户李在前、本次新增的「新」在后；大西 组的张排在其后
+    assert names == ["李", "新", "张"], f"实际顺序 {names}"
+
+
+def test_sort_refuses_when_content_sits_past_the_scan_range():
+    """辅助列右边还有内容（在读取范围之外）时拒绝排序，并回滚插入 —— 绝不排错位。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+        {0: "李", 1: "小", 2: "222", 7: "3"},
+    ]))
+    # 在第 60 列（辅助列右侧）塞一个"看不见的"内容，模拟读取范围外还有东西
+    cli.grid[(2, 59)] = "范围外"
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新", "小", "999", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": ["小", "大西"]})[0]
+    assert plan.sort_enabled
+
+    result = apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert result["failed"] == 1
+    assert not cli.sorts, "探测不通过时不该真的发排序请求"
+    assert "右侧" in result["sheets"][0]["reason"]
+    names = [cli.grid.get((r, 0)) for r in range(2, 5)]
+    assert names == ["张", "李", None], f"插入的新行必须被回滚，实际 {names}"
+
+
+def test_probe_skips_the_helper_column_itself():
+    """探测从辅助列右边一格开始：辅助列里的排序键不算"右侧还有内容"。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "大西", 2: "111", 7: "3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "新", "小", "999", "中餐", "经济", 1)],
+                 address_order={"东湖中餐": ["小", "大西"]})[0]
+    cli.grid[(2, plan.sort_key_col - 1)] = "0000"      # 假装辅助列已被写过键
+    ok, detail = wc.probe_sort_area(cli, plan, 1, col_from=plan.sort_key_col + 1,
+                                    row_to=plan.last_data_row)
+    assert (ok, detail) == (True, "")
+
+
 def test_sort_failure_rolls_back_inserted_rows():
     """排序失败时行还没被搬动，可以把插进去的新行整块删掉。"""
     class NoSortCli(FakeCli):

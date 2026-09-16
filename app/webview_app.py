@@ -22,23 +22,72 @@ WINDOW_TITLE = "一口轻食 - 订单处理"
 logger = logging.getLogger(__name__)
 
 
-def _configure_linux_input_method() -> None:
-    """GTK3 不会自动从 XMODIFIERS/QT_IM_MODULE 推断输入法。
+def _running_input_method() -> str:
+    """按 /proc 里**实际在跑的**输入法守护进程判断用哪个 GTK 输入法模块。
 
-    打包后的 pywebview/WebKitGTK 里如果不显式设置 GTK_IM_MODULE，输入框只有
-    简单键盘输入，中文输入法的候选窗不会出现。这里按当前桌面环境里正在使用
-    的输入法框架补上 GTK 模块名（ibus/fcitx），不覆盖用户已有配置。
+    不看 ``XMODIFIERS``/``QT_IM_MODULE`` 这类环境变量：它们由 im-config/桌面会话
+    在登录时写死，用户中途换输入法（ibus ↔ fcitx5）后并不跟着变 —— 装了 fcitx5
+    但环境里还留着 ``@im=ibus`` 是常见情形（本机 Ubuntu 就是这样）。
+    探测失败（没有 /proc、没有守护进程）时返回空串，交给调用方兜底。
+    """
+    processes = ""
+    try:
+        # 只看带这些前缀的进程名就够；进程多时这个循环也就几百次 scandir。
+        prefixes = ("fcitx", "ibus")
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry.name}/comm", encoding="utf-8",
+                          errors="replace") as handle:
+                    name = handle.read().strip()
+            except OSError:
+                continue
+            if name.startswith(prefixes):
+                processes += name + "\n"
+    except OSError:
+        return ""
+    for marker, module in (("fcitx5", "fcitx5"), ("fcitx", "fcitx"), ("ibus", "ibus")):
+        if any(line.startswith(marker) for line in processes.splitlines()):
+            return module
+    return ""
+
+
+def _configure_linux_input_method() -> None:
+    """按会话类型挑对 Linux 输入法路径，不再无条件覆盖 ``GTK_IM_MODULE``。
+
+    * **Wayland**：GTK3 默认走合成器的 text-input 协议（``im-wayland.so``），
+      中文输入本来就正常。此时强行设置 ``GTK_IM_MODULE`` 会把它换成传统的
+      ``im-ibus``/``im-fcitx`` 模块，输入法反而失效（候选框不出现、按键收不到）。
+      因此只在用户自己配了 ``GTK_IM_MODULE`` 时尊重它，绝不替用户决定。
+    * **X11**：GTK3 无法从 ``XMODIFIERS`` 推断模块，必须显式设置。
+      优先按"实际在跑的守护进程"选，选不出来才用环境变量兜底。
     """
     if not sys.platform.startswith("linux") or os.environ.get("GTK_IM_MODULE"):
         return
-    hints = " ".join(
-        str(os.environ.get(key, ""))
-        for key in ("XMODIFIERS", "QT_IM_MODULE", "QT_IM_MODULES", "INPUT_METHOD")
-    ).lower()
-    if "fcitx" in hints:
-        os.environ["GTK_IM_MODULE"] = "fcitx"
-    elif "ibus" in hints:
-        os.environ["GTK_IM_MODULE"] = "ibus"
+    session = str(os.environ.get("XDG_SESSION_TYPE", "")).strip().lower()
+    if session == "wayland" or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    module = _running_input_method()
+    if not module:
+        hints = " ".join(
+            str(os.environ.get(key, ""))
+            for key in ("XMODIFIERS", "QT_IM_MODULE", "QT_IM_MODULES", "INPUT_METHOD")
+        ).lower()
+        module = "fcitx" if "fcitx" in hints else ("ibus" if "ibus" in hints else "")
+    if module:
+        os.environ["GTK_IM_MODULE"] = module
+
+
+def mark_gui_started() -> None:
+    """写"新版 GUI 已经起来"的健康标记（更新器据此决定是否回滚）。
+
+    必须**不依赖任何窗口事件**：pywebview 的 ``shown`` 事件来自 WebKit 的
+    ``notify::visible``，在部分 Wayland/WebKitGTK 组合上不会触发。靠它会让新版
+    启动成功却写不出标记 —— 更新脚本等满 180 秒后把新版回滚掉（本机
+    ``update.log`` 里就留下过一次 3.4.1 → 新版 → 回滚的记录）。
+    """
+    mark_startup_healthy(__version__)
 
 
 def _frontend_target() -> tuple[str, bool]:
@@ -117,8 +166,19 @@ def run() -> None:
     window.events.closing += bridge.on_native_closing
 
     def _on_gui_ready() -> None:
-        # GUI 事件循环启动后立即写健康标记，避免更新脚本等待过久误判超时。
-        mark_startup_healthy(__version__)
+        # 这段跑在 pywebview 于 GUI 主循环启动后拉起的线程里：先直接写一次标记，
+        # 再用一次 GTK 空闲回调确认「事件循环确实在转」，双保险。
+        mark_gui_started()
+        if not sys.platform.startswith("linux"):
+            return
+        try:
+            from gi.repository import GLib  # noqa: PLC0415 - 仅 Linux 需要
+        except (ImportError, ValueError):  # pragma: no cover - 非 GTK 后端
+            return
+        try:
+            GLib.idle_add(lambda: (mark_gui_started(), False)[1])
+        except Exception:  # pragma: no cover - 防御性：GLib 不可用时忽略
+            logger.debug("健康标记的空闲回调注册失败", exc_info=True)
 
     try:
         webview.start(
