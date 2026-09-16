@@ -153,6 +153,7 @@ class Bridge:
     # 普通日志/进度会被丢弃，并通过 ``events:dropped`` 明确告警。
     # ------------------------------------------------------------------
     def attach(self, window: Any) -> None:
+        """把 pywebview 窗口对象交给桥接层，供窗口动作与关闭流程使用。"""
         self._window = window
 
     @staticmethod
@@ -307,6 +308,7 @@ class Bridge:
             }
 
     def log(self, message: str, level: str = "INFO") -> None:
+        """向前端推一条日志行（``event="log"``，含 ``ts``/``level``/``msg``）。"""
         self._emit_event("log", {"ts": time.strftime("%H:%M:%S"), "level": level, "msg": message.rstrip()})
 
     def _set_status(self, state: str) -> None:
@@ -315,6 +317,7 @@ class Bridge:
 
     @property
     def status(self) -> str:
+        """当前任务状态（``ready``/``running``/``stopping``/``success``/``partial``/``stopped``/``error``/``updating``）。"""
         return self._status
 
     # ------------------------------------------------------------------
@@ -379,6 +382,13 @@ class Bridge:
     # js_api：任务启动/停止（校验逻辑移植自旧 _validate_form/_validate_sss_form）
     # ------------------------------------------------------------------
     def start_order(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验订单表单并启动「订单处理」任务。
+
+        校验失败返回 ``{"ok": False, "fields": {字段: {"message": ...}}}``（**不写配置、
+        不写密钥链、不起线程**）；已有任务在跑时返回 ``{"ok": False, "reason": "busy"}``。
+        只有全部校验通过才就地更新订单侧配置、落盘、（``remember`` 为真时）保存密码，
+        并把配置**深拷贝**交给运行线程。
+        """
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
         fields: dict[str, dict[str, str]] = {}
@@ -428,6 +438,11 @@ class Bridge:
         return {"ok": True}
 
     def start_sss(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """校验闪时送表单并启动「闪时送下单」任务。
+
+        与 :meth:`start_order` 同一套路：校验失败只回 ``fields``，不动配置；
+        已有任务时回 ``reason="busy"``；成功则就地更新闪时送侧配置后起线程。
+        """
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
         fields = {}
@@ -495,6 +510,7 @@ class Bridge:
 
     # 表单防抖即时保存：只落盘本次改动，不做启动校验、不触发任务。
     def save_order_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """只更新订单处理侧的配置字段并落盘（不触碰闪时送侧）。写盘失败回 ``write_failed``。"""
         _apply_order_payload(self._config, payload)
         try:
             self._config.save()
@@ -506,6 +522,7 @@ class Bridge:
         }}
 
     def save_sss_config(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """只更新闪时送侧的配置字段并落盘（不触碰订单处理侧）。写盘失败回 ``write_failed``。"""
         _apply_sss_payload(self._config, payload)
         try:
             self._config.save()
@@ -671,6 +688,7 @@ class Bridge:
         self._emit_event("task:error", {"message": message})
 
     def stop_task(self) -> dict[str, Any]:
+        """请求停止当前任务（置停止事件并取消等待中的交互）。没有任务在跑时回 ``{"ok": False}``。"""
         if not self._worker or not self._worker.is_alive():
             return {"ok": False}
         self._stop_event.set()
@@ -681,6 +699,7 @@ class Bridge:
         return {"ok": True}
 
     def worker_alive(self) -> bool:
+        """当前是否有任务线程在运行。"""
         return bool(self._worker and self._worker.is_alive())
 
     # ------------------------------------------------------------------
@@ -747,6 +766,11 @@ class Bridge:
         return str(self._wait_interaction(decision_id, entry, default=self._interaction_default(kind)))
 
     def resolve_decision(self, decision_id: str, choice: str) -> dict[str, Any]:
+        """把用户在决策弹窗里的选择交回等待中的任务线程。
+
+        ``holder`` 收到 ``str(choice)`` 并唤醒事件；**同一个 id 只能兑现一次**，
+        重复提交返回 ``{"ok": False}``；未知 id 同样返回 ``{"ok": False}`` 且不抛异常。
+        """
         with self._push_lock:
             entry = self._decisions.pop(str(decision_id), None)
             if entry is not None:
@@ -779,6 +803,7 @@ class Bridge:
         return self._request_captcha(image_bytes)
 
     def resolve_captcha(self, captcha_id: str, code: str) -> dict[str, Any]:
+        """把用户输入的验证码交回等待中的任务线程；同一 id 只能兑现一次，未知 id 回 ``{"ok": False}``。"""
         with self._push_lock:
             entry = self._decisions.pop(str(captcha_id), None)
             if entry is not None:
@@ -835,6 +860,11 @@ class Bridge:
     # js_api：文件对话框与模板
     # ------------------------------------------------------------------
     def choose_excel(self, mode: str = "order") -> dict[str, Any]:
+        """弹出文件选择框，返回 ``{"path": ..., "error": ...}``。
+
+        ``error`` 由 :func:`_excel_field_error` 给出（空路径 / 文件不存在 / 后缀不是
+        ``.xlsx``/``.xlsm``）。注意：只接受对话框返回 ``list``/``tuple`` 的情形。
+        """
         import webview
 
         result = self._window.create_file_dialog(
@@ -844,6 +874,11 @@ class Bridge:
         return {"path": path, "error": error}
 
     def new_template(self, mode: str = "order") -> dict[str, Any]:
+        """弹出保存框并生成空白模板（``mode="order"`` 生成排单表，否则生成闪时送表）。
+
+        用户取消时返回 ``{"path": "", "error": ""}``（**不算错误**）；没有 Excel 后缀会
+        自动补 ``.xlsx``；写盘失败返回 ``{"path": "", "error": "无法写入模板文件：…"}``。
+        """
         import webview
 
         save_name = "排单.xlsx" if mode == "order" else "闪时送.xlsx"
@@ -867,6 +902,7 @@ class Bridge:
     # js_api：浏览器检查 / 凭据 / 更新
     # ------------------------------------------------------------------
     def check_browser(self) -> dict[str, Any]:
+        """启动内置浏览器自检（后台线程），立即返回；结果通过日志事件回报。"""
         self._set_status("updating")
         self.log("正在检查浏览器...")
         threading.Thread(target=self._check_browser_worker, daemon=True).start()
@@ -1273,6 +1309,11 @@ class Bridge:
             self._emit_event("wps:status", self.wps_status())
 
     def clear_password(self, mode: str = "order") -> dict[str, Any]:
+        """删除本机密钥链里保存的密码。
+
+        ``mode="sss"`` 删闪时送那把，**其余取值一律删管理后台那把**；账号为空时不调用
+        密钥链（没存过就没什么可删）。恒返回 ``{"ok": True}``。
+        """
         if mode == "sss":
             account = self._config.sss_account.strip()
             if account:
@@ -1286,6 +1327,7 @@ class Bridge:
         return {"ok": True}
 
     def check_updates(self, manual: bool = False) -> dict[str, Any]:
+        """启动更新检查（后台线程）。正在检查时返回 ``{"ok": False, "reason": "already_checking"}``。"""
         if self._update_checking:
             return {"ok": False, "reason": "already_checking"}
         self._update_checking = True
@@ -1318,6 +1360,7 @@ class Bridge:
             self._update_checking = False
 
     def install_update(self) -> dict[str, Any]:
+        """安装已发现的更新；没有待安装版本时返回 ``{"ok": False, "reason": "no_release"}``。"""
         release = self._pending_release
         if release is None:
             return {"ok": False, "reason": "no_release"}
@@ -1346,6 +1389,11 @@ class Bridge:
             self._emit_event("update:install_error", {"message": str(exc)})
 
     def open_external(self, url: str) -> dict[str, Any]:
+        """用系统默认程序打开外链。
+
+        **协议白名单**：只放行 ``http://`` 与 ``https://``，其余（含 ``file://``）一律忽略。
+        恒返回 ``{"ok": True}``。
+        """
         if isinstance(url, str) and url.startswith(("https://", "http://")):
             webbrowser.open(url)
         return {"ok": True}
@@ -1365,6 +1413,7 @@ class Bridge:
         return {"ok": True}
 
     def pop_reports(self) -> list[dict[str, Any]]:
+        """取出并清空前端回传的运行快照（自动化验收用）。"""
         with self._push_lock:
             reports, self._reports = self._reports, []
         return reports
@@ -1373,6 +1422,12 @@ class Bridge:
     # js_api：窗口动作与关闭保护
     # ------------------------------------------------------------------
     def window_action(self, action: str) -> dict[str, Any]:
+        """标题栏按钮动作：``minimize`` / ``toggle_maximize`` / ``close``。
+
+        ``toggle_maximize`` 靠 ``_maximized`` 自己记状态（pywebview 没有「是否最大化」查询），
+        在 maximize 与 restore 之间交替；``close`` 转交 :meth:`request_close`。
+        没有窗口时返回 ``{"ok": False}``。
+        """
         if self._window is None:
             return {"ok": False}
         if action == "minimize":
@@ -1472,6 +1527,7 @@ class Bridge:
             pass
 
     def set_split_ratio(self, ratio: float) -> dict[str, Any]:
+        """设置并落盘界面分隔比例（经 :func:`clamp_split_ratio` 夹紧）。"""
         self._config.split_ratio = clamp_split_ratio(ratio)
         try:
             self._config.save()
