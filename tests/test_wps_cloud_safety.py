@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
 
-from app.wps_cloud import (CloudOrder, SheetPlan, WpsCloudError, _rollback_inserts,
-                           apply_plan, build_plan)
+from app.wps_cloud import (CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+                           _rollback_inserts, apply_plan, build_plan)
 
 BASE_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四",
                4: "9.11 周五", 5: "类型", 6: "餐种", 7: "总餐次",
@@ -70,7 +71,14 @@ class FakeCli:
             self.grid[(int(cell["row"]) - 1, int(cell["col"]) - 1)] = str(cell["value"])
 
     def read_formulas(self, file_id, ws, row_from, row_to, col_from, col_to):
-        return {}
+        """回读公式：与真实接口一致，只返回以 = 开头的格子。
+
+        缺了它，新客户行的「已出餐/剩余餐」公式回读为空 → 连**成功路径**都会被判
+        ``verify_failed``（第 11 轮那批测试只走失败路径，所以一直没暴露）。
+        """
+        return {k: v for k, v in self.grid.items()
+                if row_from <= k[0] <= row_to and col_from <= k[1] <= col_to
+                and str(v).startswith("=")}
 
     def insert_rows(self, file_id, ws, *, row, count):
         self.inserts.append((row, count))
@@ -228,3 +236,166 @@ def test_failure_after_successful_sort_does_not_roll_back():
     # 新行的信息仍留在云端（等用户重传），没有被抹掉
     names = [v for (r, c), v in cli.grid.items() if c == 0 and r >= 2]
     assert "新人" in names
+
+
+# ----------------------------------------------------------------------
+# README：校验不通过则报告并**不更新本地账本**
+# ----------------------------------------------------------------------
+def _ledger(tmp_path):
+    from app.wps_cloud import SyncLedger
+    return SyncLedger(tmp_path / "wps_sync_state.json")
+
+
+def _batch_people(ledger, target, file_id="F1"):
+    """返回账本里该 (日期, 文件) 批次记下的人数；没有批次时返回 None。"""
+    batch = ledger.data.get("batches", {}).get(target.isoformat(), {}).get(file_id)
+    return None if not batch else len(batch.get("people", {}))
+
+
+def test_ledger_is_updated_when_verification_passes(tmp_path):
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    plans = _plans(cli, name="老客户")
+    ledger = _ledger(tmp_path)
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
+
+    assert result["failed"] == 0
+    assert _batch_people(ledger, dt.date(2026, 9, 11)) == 1
+    # 落盘后重新读回来也还在
+    assert _batch_people(_ledger(tmp_path), dt.date(2026, 9, 11)) == 1
+
+
+def _existing_customer_plans(cli):
+    """构造一个**老客户**的计划（不插行、不排序），让它直接走到「逐格回读校验」。"""
+    orders = [CloudOrder("东湖中餐", "老客户", "小", "111", "中餐", "经济", 6)]
+    return build_plan(cli, local_orders={"东湖中餐": orders},
+                      tables={"东湖中餐": {"file_id": "F1"}},
+                      target=dt.date(2026, 9, 11), ledger=None,
+                      address_order={}, sort_enabled=False)
+
+
+def test_ledger_is_not_updated_when_verification_fails(tmp_path):
+    """README 的安全边界：**校验不通过则报告并不更新本地账本**。
+
+    实现上靠 ``if problems: ... continue`` 在校验失败时**跳过 ledger.record**。
+    这条一旦写反（把 record 提到 continue 之前），账本就会记下**并没真正写成功**的
+    餐次数，下次同步会据此算出错误的差额。
+
+    注意必须用**老客户 + 关排序**：新客户会先经历插行/排序/重定位，写坏时会**更早**
+    以 ``failed`` 退出，根本走不到 ``verify_failed`` 这一步（变异测试发现过这个盲点）。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    plans = _existing_customer_plans(cli)
+    ledger = _ledger(tmp_path)
+    # 「写入表面成功、内容却没变」→ 回读校验必然失败
+    cli.write_cells = lambda *a, **k: None  # type: ignore[method-assign]
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
+
+    assert result["failed"] == 1
+    assert result["sheets"][0]["status"] == "verify_failed"
+    assert _batch_people(ledger, dt.date(2026, 9, 11)) is None, "校验没过不能记进账本"
+
+
+def test_ledger_records_nothing_when_the_whole_run_fails(tmp_path):
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()), fail_write=True)
+    plans = _plans(cli)
+    ledger = _ledger(tmp_path)
+
+    result = apply_plan(cli, plans, ledger=ledger, marker_enabled=False)
+
+    assert result["failed"] == 1
+    assert ledger.data.get("batches", {}) == {}
+    assert _batch_people(ledger, dt.date(2026, 9, 11)) is None
+
+
+def test_apply_plan_without_a_ledger_still_works(tmp_path):
+    """``ledger=None`` 是合法调用（历史行为），不能因此报错。"""
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    plans = _plans(cli, name="老客户")
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["failed"] == 0 and result["written"] == 1
+
+
+# ----------------------------------------------------------------------
+# README：任何失败都只写日志，**不会影响本地排单任务**
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("kwargs", [
+    {"fail_write": True},
+    {"fail_sort": True},
+    {"fail_read_after_sort": True},
+])
+def test_cloud_failures_never_raise_out_of_apply_plan(tmp_path, kwargs):
+    """云同步的每一种失败都必须被**消化成返回值**，绝不向上抛。
+
+    这是 README「任何失败都只写日志，不会影响本地排单任务」的落点：
+    云同步是本地排单之外的附加动作，它炸了不能把调用方（排单任务）一起带崩。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()), **kwargs)
+    plans = _plans(cli)
+
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)   # 不应抛
+
+    assert result["failed"] == 1
+    assert isinstance(result["sheets"], list) and result["sheets"][0]["status"] != "ok"
+
+
+def test_unexpected_exception_propagates_out_of_apply_plan(tmp_path):
+    """记录实际分层：``apply_plan`` **只吞 WpsCloudError**，其它意外异常照抛。
+
+    这不是缺陷 —— 它是纯云端逻辑层，让编程错误暴露出来更好排查；真正的安全边界在
+    上一层 ``Bridge.wps_upload``（见下一条）。写下来免得后人误以为这层也兜底。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+    plans = _plans(cli)
+
+    def boom(*_a, **_k):
+        raise KeyError("坏数据")
+
+    cli.write_cells = boom  # type: ignore[method-assign]
+
+    with pytest.raises(KeyError):
+        apply_plan(cli, plans, ledger=None, marker_enabled=False)
+
+
+def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
+    """README「任何失败都只写日志，不会影响本地排单任务」的**落点在这一层**。
+
+    ``wps_upload`` 末尾有 ``except Exception``，把任何异常转成
+    ``{"ok": False, "reason": "类型: 消息"}``，界面只会看到一条红色日志，
+    排单任务不会被云同步的意外错误带崩。
+    """
+    from app import bridge as bridge_module
+    from app.bridge import Bridge
+
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._config.excel_path = tmp_path / "排单.xlsx"
+    bridge._config.excel_path.write_bytes(b"x")
+    monkeypatch.setattr(bridge_module, "effective_tables",
+                        lambda _cfg: {"东湖中餐": {"file_id": "F1"}})
+    monkeypatch.setattr(
+        bridge_module, "read_local_orders",
+        lambda path, log=None: {"东湖中餐": [
+            CloudOrder("东湖中餐", "某人", "小", "13800000000", "中餐", "经济", 6)]})
+    monkeypatch.setattr(bridge_module, "SyncLedger",
+                        lambda *a, **k: SyncLedger(tmp_path / "l.json"))
+
+    class _Cli:
+        path = "/fake/kdocs-cli"
+
+        def authenticated(self) -> bool:
+            return True
+
+    monkeypatch.setattr(bridge, "_wps_cli", lambda: _Cli())
+
+    def boom(*_a, **_k):
+        raise KeyError("坏数据")
+
+    monkeypatch.setattr(bridge_module, "build_plan", boom)
+
+    got = bridge.wps_upload()          # 不应抛
+
+    assert got["ok"] is False
+    assert got["reason"] == "KeyError: '坏数据'"
+    logs = [e["payload"] for e in bridge.drain_events(0)["events"] if e["event"] == "log"]
+    assert any(line["level"] == "ERROR" and "异常" in line["msg"] for line in logs)
