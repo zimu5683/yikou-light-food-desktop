@@ -35,6 +35,7 @@ def _enable_high_dpi_awareness() -> str:
 
 
 def main() -> None:
+    """命令行入口：``--apply-update`` / ``--check-browser`` / ``--version`` / ``--self-check`` / ``--wps-check`` / ``--sss-import-check`` 等子命令，无参数时启动 pywebview 窗口。"""
     if "--apply-update" in sys.argv:
         index = sys.argv.index("--apply-update")
         if len(sys.argv) < index + 3:

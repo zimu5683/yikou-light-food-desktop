@@ -26,6 +26,7 @@ ADDRESS_SHEET_MAP = {
 
 
 def split_text_and_number(text: Any) -> Tuple[str, str]:
+    """把文本拆成（去掉数字的部分, 数字部分）—— 地址排序键要用。"""
     if text is None:
         return "", ""
     value = str(text).strip()
@@ -44,6 +45,7 @@ def parse_receiver_info(receiver_text: Any) -> Tuple[str, str]:
 
 
 def get_address_base_sheet_name(delivery_address: Any) -> Optional[str]:
+    """按收货地址判断落在哪个校区子表；农林路未写「联建」时归东湖。"""
     value = str(delivery_address or "")
     lower = value.lower()
     for keyword, sheet in ADDRESS_SHEET_MAP.items():
@@ -67,6 +69,7 @@ def _canonical_donghu_address_segment(segment: Any) -> str:
 
 
 def get_donghu_address_segment(delivery_address: Any) -> str:
+    """从东湖校区地址里抽出「大西/小西 + 楼栋号」这一段（用于分表）。"""
     value = str(delivery_address or "")
     match = re.search(r"大西.*?([A-Za-z]+\d+|\d+[A-Za-z]+)", value, re.I)
     if match:
@@ -82,6 +85,7 @@ def get_donghu_address_segment(delivery_address: Any) -> str:
 
 
 def get_yijin_address_from_product_note(product_note: Any) -> str:
+    """按订单备注判断衣锦校区取餐点：含「联建门口外卖柜」为外卖柜，否则校门口。"""
     value = str(product_note or "")
     return "外卖柜" if "联建门口外卖柜" in value else "校门口"
 
@@ -119,6 +123,7 @@ def _merged_ranges(sheet: Any) -> set[str]:
 
 
 def get_first_empty_row(sheet: Any, merged_ranges: set[str] | None = None, start_col: str = "A", minimum: int = 3) -> int:
+    """从下往上找第一个空行，用作追加位置；可传入合并单元格坐标以跳过。"""
     merged_ranges = merged_ranges or set()
     for row in range(max(getattr(sheet, "max_row", minimum), minimum), minimum - 1, -1):
         coord = f"{start_col}{row}"
@@ -160,6 +165,7 @@ def write_order_row(sheet: Any, order: OrderInfo | Mapping[str, Any], meal: Meal
 
 
 def backup_excel(path: str | Path, backup_dir: str | Path | None = None) -> Path:
+    """把排单表复制一份到 ``backups/``（带时间戳）；源文件不存在时抛 ``FileNotFoundError``。返回备份文件路径。"""
     source = Path(path)
     if not source.exists():
         raise FileNotFoundError(source)
@@ -172,6 +178,7 @@ def backup_excel(path: str | Path, backup_dir: str | Path | None = None) -> Path
 
 
 def save_excel_with_retry(workbook: Any, excel_path: str | Path, retries: int = 1) -> bool:
+    """保存工作簿，遇到 ``PermissionError``（文件被 Excel 占用）时重试；全部失败返回 ``False``。"""
     for attempt in range(max(0, retries) + 1):
         try:
             workbook.save(str(excel_path))
@@ -185,6 +192,7 @@ def save_excel_with_retry(workbook: Any, excel_path: str | Path, retries: int = 
 
 
 def get_weekday_fill_value(now: Optional[_dt.datetime] = None) -> Dict[str, Any]:
+    """返回通讯记号用的 ``{周几: 1 或 ""}``：标的是**次日**的周几（周日跑标记周一）。"""
     names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
     current = (now or _dt.datetime.now()).weekday()
     target = names[(current + 1) % 7]

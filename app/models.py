@@ -20,6 +20,7 @@ class MealInfo:
     meal_type: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
+        """转成普通 dict（订单侧模型）。"""
         return asdict(self)
 
 
@@ -39,6 +40,7 @@ class OrderInfo:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        """转成普通 dict（闪时送侧模型）。"""
         data = asdict(self)
         data["lunch"] = [m.to_dict() for m in self.lunch]
         data["dinner"] = [m.to_dict() for m in self.dinner]

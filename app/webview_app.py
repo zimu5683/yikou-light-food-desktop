@@ -68,6 +68,7 @@ def _frontend_target() -> tuple[str, bool]:
 
 
 def run() -> None:
+    """启动 pywebview 窗口并挂接 :class:`~app.bridge.Bridge`；前端产物缺失或图形后端不可用时抛出带排查提示的 ``RuntimeError``。"""
     _configure_linux_input_method()
     try:
         import webview

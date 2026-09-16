@@ -22,6 +22,7 @@ def _backend():
 
 
 def get_password(username: str, service: str = SERVICE_NAME) -> Optional[str]:
+    """从系统密钥链读密码；密钥链不可用或读取失败时返回 ``None``（提示每次手输）。"""
     backend = _backend()
     if backend is None or not username:
         return None
@@ -32,6 +33,7 @@ def get_password(username: str, service: str = SERVICE_NAME) -> Optional[str]:
 
 
 def set_password(username: str, password: str, service: str = SERVICE_NAME) -> bool:
+    """把密码写进系统密钥链；失败返回 ``False``，不抛异常。"""
     backend = _backend()
     if backend is None or not username:
         return False
@@ -43,6 +45,7 @@ def set_password(username: str, password: str, service: str = SERVICE_NAME) -> b
 
 
 def delete_password(username: str, service: str = SERVICE_NAME) -> bool:
+    """从系统密钥链删除密码；账号为空或失败返回 ``False``。"""
     backend = _backend()
     if backend is None or not username:
         return False
@@ -75,8 +78,10 @@ def delete_sss_password(username: str) -> bool:
 
 # Compatibility aliases used by the Tkinter layer.
 def load_password(username: str, service: str = SERVICE_NAME) -> Optional[str]:
+    """``get_password`` 的旧别名（Tkinter 层用过）。"""
     return get_password(username, service)
 
 
 def save_password(username: str, password: str, service: str = SERVICE_NAME) -> bool:
+    """``set_password`` 的旧别名（Tkinter 层用过）。"""
     return set_password(username, password, service)

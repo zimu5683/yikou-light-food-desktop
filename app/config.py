@@ -382,34 +382,42 @@ class AppConfig:
 
     @property
     def url(self) -> str:
+        """管理后台网址（旧 Tkinter 层用的别名，等价于 ``target_url``）。"""
         return self.target_url
 
     @url.setter
     def url(self, value: str) -> None:
+        """设置管理后台网址（旧 Tkinter 层用的别名）。"""
         self.target_url = value
 
     @property
     def phone(self) -> str:
+        """登录账号（手机号）；同时用作系统密钥链里的账号名。"""
         return self.phone_number
 
     @phone.setter
     def phone(self, value: str) -> None:
+        """设置登录账号。"""
         self.phone_number = value
 
     @property
     def browser(self) -> str:
+        """浏览器模式（已弃用，仅为兼容旧配置保留）。"""
         return self.browser_mode
 
     @browser.setter
     def browser(self, value: str) -> None:
+        """设置浏览器模式（已弃用）。"""
         self.browser_mode = value
 
     @classmethod
     def default_path(cls) -> Path:
+        """配置文件默认位置：用户配置目录下的 ``config.json``。"""
         return user_data_dir() / "config.json"
 
     @classmethod
     def load(cls, path: Optional[os.PathLike[str] | str] = None) -> "AppConfig":
+        """从磁盘读取配置；文件缺失/损坏/字段非法时退回默认值，不抛异常。"""
         target = Path(path) if path else cls.default_path()
         if not target.exists():
             return cls(config_path=str(target))
@@ -523,8 +531,10 @@ class AppConfig:
 
 
 def load_config(path: Optional[os.PathLike[str] | str] = None) -> AppConfig:
+    """``AppConfig.load`` 的函数式别名。"""
     return AppConfig.load(path)
 
 
 def save_config(config: AppConfig, path: Optional[os.PathLike[str] | str] = None) -> Path:
+    """``AppConfig.save`` 的函数式别名。"""
     return config.save(path)

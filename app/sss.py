@@ -833,6 +833,7 @@ class OrderFingerprint(NamedTuple):
     order_type: str = ""
 
     def as_dict(self) -> dict[str, str]:
+        """把结果对象转成普通 dict（供日志/回报使用）。"""
         return self._asdict()
 
 

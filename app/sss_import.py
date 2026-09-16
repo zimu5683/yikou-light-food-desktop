@@ -209,6 +209,7 @@ class MealImport:
 
     @property
     def order_count(self) -> int:
+        """该餐实际要下单的人数（已剔除被地址过滤掉的人）。"""
         return len(self.orders)
 
 
@@ -449,6 +450,7 @@ class DayOrders:
 
     @property
     def total(self) -> int:
+        """两张表合计要下单的人数。"""
         return sum(len(orders) for orders in self.orders_by_sheet.values())
 
     @property

@@ -140,6 +140,7 @@ class ReleaseInfo:
 
     @property
     def version(self) -> str:
+        """规范化后的版本号（去掉 ``v`` 前缀、拒绝非 SemVer）。"""
         return normalize_version(self.tag_name)
 
     @property
@@ -153,6 +154,7 @@ class ReleaseInfo:
 
     @property
     def checksum_asset(self) -> dict[str, Any] | None:
+        """Windows 可执行文件对应的 ``.sha256`` 资源；没有则返回 ``None``。"""
         for asset in self.assets:
             name = str(asset.get("name") or "").lower()
             if name == "yikou-light-food.exe.sha256" and safe_asset_name(name):
@@ -165,6 +167,7 @@ class ReleaseInfo:
 
     @property
     def executable_size(self) -> int | None:
+        """Windows 可执行文件的字节数；缺失或非法时返回 ``None``。"""
         asset = self.executable_asset
         try:
             size = int(asset.get("size")) if asset and asset.get("size") is not None else None
@@ -183,6 +186,7 @@ class ReleaseInfo:
 
     @property
     def macos_checksum_asset(self) -> dict[str, Any] | None:
+        """macOS 压缩包对应的 ``.sha256`` 资源；没有则返回 ``None``。"""
         for asset in self.assets:
             name = str(asset.get("name") or "").lower()
             if name == "yikou-light-food-macos.zip.sha256" and safe_asset_name(name):
@@ -204,6 +208,7 @@ class ReleaseInfo:
 
     @property
     def linux_checksum_asset(self) -> dict[str, Any] | None:
+        """Linux 压缩包对应的 ``.sha256`` 资源；没有则返回 ``None``。"""
         for asset in self.assets:
             name = str(asset.get("name") or "").lower()
             if name == "yikou-light-food-linux-x64.tar.gz.sha256" and safe_asset_name(name):

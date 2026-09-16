@@ -73,6 +73,7 @@ def wait_for_health(marker: str | Path, token: str, *, timeout: float = 60.0,
 
 
 def clear_update_health(marker: str | Path) -> None:
+    """删除更新健康标记文件；文件不存在或删除失败都忽略。"""
     try:
         Path(marker).unlink(missing_ok=True)
     except OSError:

@@ -159,6 +159,7 @@ class Change:
 
     @property
     def needs_write(self) -> bool:
+        """这条变更是否真的需要写云端（目标格已是目标状态且无需补格式时为 ``False``）。"""
         return ((not self.target_ok) or self.total_after != self.total_before
                 or self.fill_type or self.fill_kind or self.fill_formula)
 
@@ -224,6 +225,7 @@ class SheetPlan:
 
     @property
     def applied(self) -> bool:
+        """本次计划是否包含任何变更。"""
         return bool(self.changes)
 
 
@@ -272,6 +274,7 @@ def person_key(name: Any, phone: Any) -> tuple[str, str]:
 
 
 def normalize_phone(value: Any) -> str:
+    """把手机号规范化成「11 位 ASCII 数字」形式（与 :func:`person_key` 口径一致）。"""
     return person_key("", value)[1]
 
 
@@ -461,6 +464,7 @@ def read_local_orders(excel_path: str | os.PathLike[str], *,
 # ----------------------------------------------------------------------
 
 def default_state_path() -> Path:
+    """同步账本的默认路径：用户配置目录下的 ``wps_sync_state.json``。"""
     try:
         from .config import user_data_dir
     except ImportError:  # pragma: no cover - 直接执行模块时
@@ -489,6 +493,7 @@ class SyncLedger:
             self.data = payload
 
     def save(self) -> Path:
+        """原子写账本（先写临时文件再 ``os.replace``），返回落盘路径。"""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(self.data, ensure_ascii=False, indent=2)
         fd, tmp = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp",
@@ -513,6 +518,7 @@ class SyncLedger:
 
     def synced_meals(self, date_key: str, file_id: str,
                      name: str, phone: str) -> int | None:
+        """查账本里某人某天在某表上「上次已同步的餐次」；没有记录返回 ``None``。"""
         people = self._batch(date_key, file_id)["people"]
         entry = people.get(f"{name}\u0000{phone}")
         if entry is None:
@@ -524,6 +530,7 @@ class SyncLedger:
 
     def record(self, date_key: str, file_id: str,
                entries: Mapping[str, int]) -> None:
+        """把本次写入后的每人餐次记进账本（键为 ``姓名\u0000电话``），并刷新批次时间。"""
         batch = self._batch(date_key, file_id)
         batch["synced_at"] = _dt.datetime.now().isoformat(timespec="seconds")
         people = batch["people"]
@@ -532,6 +539,7 @@ class SyncLedger:
                            "at": _dt.datetime.now().isoformat(timespec="seconds")}
 
     def batch_summary(self, date_key: str, file_id: str) -> dict[str, Any] | None:
+        """某天某表的批次摘要 ``{synced_at, people}``；没有批次返回 ``None``。"""
         batch = self.data.get("batches", {}).get(date_key, {}).get(file_id)
         if not batch:
             return None
@@ -704,6 +712,7 @@ class KdocsCli:
     # ---- 认证 ----
 
     def authenticated(self) -> bool:
+        """kdocs-cli 是否已授权（跑 ``auth status``）；命令缺失或超时按未授权处理。"""
         try:
             proc = subprocess.run([self.path, "auth", "status"],
                                   capture_output=True, text=True, timeout=60)
@@ -721,6 +730,7 @@ class KdocsCli:
     # ---- 表格读写 ----
 
     def sheets_info(self, file_id: str) -> list[dict[str, Any]]:
+        """读取在线表格的子表信息列表（``sheetsInfo``）；读不到返回空列表。"""
         data = self._run("sheet", "get-sheets-info", params={"file_id": file_id})
         detail = data.get("detail") or {}
         return detail.get("sheetsInfo") or []
@@ -893,6 +903,7 @@ class KdocsCli:
 
     def list_files(self, drive_id: str, parent_id: str = "0",
                    page_size: int = 200) -> list[dict[str, Any]]:
+        """列出云盘目录下的文件；接口两种返回形态都兼容，取不到时返回空列表。"""
         data = self._run("drive", "list-files", params={
             "drive_id": drive_id, "parent_id": parent_id, "page_size": page_size})
         return data.get("data", {}).get("items") or data.get("items") or []
@@ -933,6 +944,7 @@ def find_target_column(header: Mapping[int, str],
 
 
 def column_name(column: int) -> str:
+    """把 1-based 列号转成 Excel 列名（1 → ``A``，27 → ``AA``）。"""
     result = ""
     while column:
         column, remainder = divmod(column - 1, 26)

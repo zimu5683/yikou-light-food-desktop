@@ -14,10 +14,12 @@ except ImportError:  # pragma: no cover - direct module execution compatibility
 
 
 def aliases_path() -> Path:
+    """人工确认过的「原始地址 → 点名」覆盖表的路径。"""
     return user_data_dir() / "address_aliases.json"
 
 
 def pending_path() -> Path:
+    """待人工确认的地址清单（pending_addresses.json）的路径。"""
     return user_data_dir() / "pending_addresses.json"
 
 

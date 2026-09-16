@@ -411,6 +411,7 @@ def _navigate(page: Any, step_name: str, locators: dict[str, Any] | None, base_u
 
 
 def parse_meal_rows(rows: Iterable[dict[str, str]], meal_type: str) -> list[MealInfo]:
+    """把订单表格里的「商品名 + 数量」解析成 MealInfo 列表。"""
     result: list[MealInfo] = []
     for row in rows:
         product = str(row.get("product", ""))
@@ -451,6 +452,7 @@ def _meal_rows(page: Any, locators: dict[str, Any] | None) -> list[dict[str, str
 
 
 def extract_meal_info(page: Any, meal_type: str, locators: dict[str, Any] | None = None) -> list[MealInfo]:
+    """从页面表格里读出指定餐别的 MealInfo 列表（取行 + 解析的组合入口）。"""
     return parse_meal_rows(_meal_rows(page, locators), meal_type)
 
 

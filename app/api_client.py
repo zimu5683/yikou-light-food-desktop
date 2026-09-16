@@ -48,6 +48,7 @@ def is_auth_expired_payload(payload: Any) -> bool:
 
 
 def auth_error_message(payload: Any = None, fallback: str = "") -> str:
+    """把「登录态失效」的响应体整理成一句给用户看的中文提示（含 code 与原文）。"""
     if isinstance(payload, dict):
         message = str(payload.get("message") or payload.get("msg") or "").strip()
         code = payload.get("code")
@@ -332,7 +333,9 @@ class SssApiClient:
         return payload
 
     def get_json(self, path: str) -> dict[str, Any]:
+        """对闪时送发起 GET 并返回解析后的 JSON（走统一的请求头/超时/错误处理）。"""
         return self._request("GET", path)
 
     def post_json(self, path: str, body: Any = None) -> dict[str, Any]:
+        """对闪时送发起 POST 并返回解析后的 JSON；body 为空时按无载荷请求发送。"""
         return self._request("POST", path, body)
