@@ -16,13 +16,16 @@ import json
 import os
 import pathlib
 import subprocess
+import sys
 import textwrap
 import time
 
 import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-PYTHON = str(REPO_ROOT / ".venv" / "bin" / "python")
+#: 子进程复用**当前解释器**：本地是 .venv/bin/python，CI/Windows/macOS 则是别的路径。
+#: 绝不能写死 .venv（CI 上不存在，会把跨进程用例全部判失败）。
+PYTHON = sys.executable
 
 
 # ======================================================================

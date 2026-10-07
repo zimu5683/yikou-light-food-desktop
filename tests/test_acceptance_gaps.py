@@ -1087,10 +1087,12 @@ def test_a29_style_only_change_invalidates_the_token(tmp_path, monkeypatch):
     preview = bridge.wps_preview()
     assert preview["ok"] is True
 
-    # 只改字体（数据一个字节都不变），并保持文件大小/mtime 可见性无关紧要
+    # 只改字体（数据一个字节都不变）
+    from openpyxl.styles import Font
+
     workbook = load_workbook(excel)
     sheet = workbook["东湖中餐"]
-    sheet["B3"].font = sheet["B3"].font.copy(bold=True)
+    sheet["B3"].font = Font(bold=True)
     workbook.save(excel)
 
     got = bridge.wps_upload(preview["preview_id"])
