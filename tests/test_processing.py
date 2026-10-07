@@ -857,3 +857,162 @@ def test_get_weekday_fill_value_uses_exactly_one_marker():
     marks = get_weekday_fill_value(dt.datetime(2026, 9, 20, 23, 59))  # 周日深夜
     assert marks["周一"] == 1
     assert [v for k, v in marks.items() if k != "周一"] == [""] * 6
+
+
+# ----------------------------------------------------------------------
+# 杭电信工（2026-10-07 新增校区）
+# ----------------------------------------------------------------------
+
+def _hangdian_api_data(address, description, spec="杭电信工（北门外卖架）",
+                       goods="单点经济餐（午餐）"):
+    """构造 /channel/order/{id} 详情接口的 data 片段（字段名照抄实测响应）。"""
+    return {
+        "id": 14366617,
+        "address": {"address": address, "description": description,
+                    "contact": "陈木", "mobile": "15058927816"},
+        "goods": [{"name": goods, "num": 1,
+                   "attrData": {"matal": spec, "material": [{"name": spec}]}}],
+    }
+
+
+def test_address_base_sheet_maps_hangdian_keywords_and_spec():
+    # 后台地址库里中文全称与英文全称两种写法（2026-10-07 实测 W5/W7）。
+    assert get_address_base_sheet_name(
+        "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)") == "杭电"
+    assert get_address_base_sheet_name(
+        "浙江省杭州市临安区School of Information Engineering, "
+        "Hangzhou Dianzi University Qingshan Lake Campus Zijin Court Lin'an District") == "杭电"
+    # 商品规格写了「杭电信工」时直接判杭电，哪怕地址本身认不出来。
+    assert get_address_base_sheet_name("青山湖街道某处", "杭电信工（东1门）") == "杭电"
+    # 其它校区不受影响
+    assert get_address_base_sheet_name("浙江农林大学东湖校区 A5") == "东湖"
+
+
+def test_hangdian_point_from_product_note_and_address():
+    from app.processing import get_hangdian_address_from_product_note
+
+    # 规格优先（客户在选项里选的门），地址写别的门也不改判
+    assert get_hangdian_address_from_product_note("杭电信工（北门外卖架）") == "北门"
+    assert get_hangdian_address_from_product_note("杭电信工（北门外卖架）", "三号楼") == "北门"
+    assert get_hangdian_address_from_product_note("杭电信工（东1门）", "北门三号楼") == "东1门"
+    assert get_hangdian_address_from_product_note("杭电信工（东一门）") == "东1门"
+    # 规格没写门名时回退看地址原文
+    assert get_hangdian_address_from_product_note("", "北门三号楼") == "北门"
+    assert get_hangdian_address_from_product_note(
+        "", "青山湖街道青山湖科技城杭电路1号北门") == "北门"
+    # 两个信号都没有 → 空串（上层降级为待确认）
+    assert get_hangdian_address_from_product_note("杭电信工", "三号楼") == ""
+    assert get_hangdian_address_from_product_note("东湖配送寝室楼下外卖柜", "三号楼") == ""
+
+
+def test_hangdian_sheet_name_and_type_label():
+    from app.processing import meal_type_label, order_sheet_name
+
+    # 杭电两张子表叫「杭电午餐/杭电晚餐」，类型列也写「午餐/晚餐」
+    # （与协作者维护的云端表已有行一致）。
+    assert order_sheet_name("杭电", "午餐") == "杭电午餐"
+    assert order_sheet_name("杭电", "晚餐") == "杭电晚餐"
+    assert meal_type_label("杭电", "午餐") == "午餐"
+    assert meal_type_label("杭电", "晚餐") == "晚餐"
+    # 其余校区维持原口径
+    assert order_sheet_name("东湖", "午餐") == "东湖中餐"
+    assert order_sheet_name("医学院", "晚餐") == "医学院晚餐"
+    assert meal_type_label("衣锦", "午餐") == "中餐"
+    assert meal_type_label("医学院", "晚餐") == "晚餐"
+
+
+def test_yijin_note_accepts_waimaigui_writing_variants():
+    # 平台选项文案改过版：历史长文案、旧短文案、「外面柜」都要判外卖柜；
+    # 没存柜（校门口单）的规格里不会出现「联建门口…柜」。
+    assert get_yijin_address_from_product_note("联建门口外面柜") == "外卖柜"
+    assert get_yijin_address_from_product_note(
+        "联建门口外卖柜（可以不选，不选放在外卖柜旁，丢了也负责怕你们饿肚子）") == "外卖柜"
+    assert get_yijin_address_from_product_note("外卖柜谢谢") == "校门口"
+    assert get_yijin_address_from_product_note("") == "校门口"
+
+
+def test_hangdian_order_from_api_data_uses_spec_then_address():
+    from app.automation import _order_from_api_data, _prepare_order_address
+
+    # W7 的真实写法：英文地址 + 规格选北门。
+    order = _order_from_api_data("W7", _hangdian_api_data(
+        "浙江省杭州市临安区School of Information Engineering, Hangzhou Dianzi "
+        "University Qingshan Lake Campus Zijin Court Lin'an District",
+        "青山湖街道青山湖科技城杭电路1号北门"))
+    result = _prepare_order_address(order, {})
+    assert (order.address_base_sheet, order.address) == ("杭电", "北门")
+    assert result["confidence"] == "high"
+
+    # W5 的真实写法：中文地址 + 规格选北门。
+    order = _order_from_api_data("W5", _hangdian_api_data(
+        "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)", "北门三号楼"))
+    _prepare_order_address(order, {})
+    assert (order.address_base_sheet, order.address) == ("杭电", "北门")
+
+    # 规格选东1门。
+    order = _order_from_api_data("W6", _hangdian_api_data(
+        "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)", "三号楼",
+        spec="杭电信工（东1门）"))
+    _prepare_order_address(order, {})
+    assert (order.address_base_sheet, order.address) == ("杭电", "东1门")
+
+
+def test_hangdian_order_without_any_point_goes_pending():
+    from app.automation import _order_from_api_data, _prepare_order_address
+
+    order = _order_from_api_data("W8", _hangdian_api_data(
+        "浙江省杭州市临安区杭州电子科技大学信息工程学院(青山湖校区)", "三号楼",
+        spec="杭电信工"))
+    result = _prepare_order_address(order, {})
+    assert order.address_base_sheet == "杭电"
+    assert result["confidence"] == "unknown"
+    # 保留原始地址：界面会弹窗让人工填（与其它校区 medium 置信度同一套回退）。
+    assert order.address == order.delivery_address
+
+
+def test_hangdian_spec_conflicting_with_other_campus_goes_pending():
+    from app.automation import _order_from_api_data, _prepare_order_address
+
+    order = _order_from_api_data("W9", _hangdian_api_data(
+        "浙江省杭州市临安区浙江农林大学(东湖校区)", "A4楼下外卖柜"))
+    result = _prepare_order_address(order, {})
+    assert order.address_base_sheet == "杭电"
+    assert result["confidence"] == "unknown"
+    assert "杭电信工" in result["reason"]
+    assert order.address == order.delivery_address
+
+
+def test_write_order_creates_hangdian_sheet_with_lunch_label():
+    from app.automation import _write_order
+
+    workbook = Workbook()
+    meal = MealInfo(total_meals=1, grade="经济", meal_type="午餐")
+    order = OrderInfo(order_no="W7", name="陈木", phone="15058927816",
+                      address="北门", address_base_sheet="杭电")
+    _write_order(workbook, order, meal, "午餐")
+    assert "杭电午餐" in workbook.sheetnames
+    sheet = workbook["杭电午餐"]
+    # 第 3 行起：订单 姓名 地址 电话 周一~周日 类型 餐种 餐次
+    assert [sheet.cell(3, c).value for c in (1, 2, 3, 4, 12, 13, 14)] == [
+        "W7", "陈木", "北门", "15058927816", "午餐", "经济", 1]
+
+
+def test_sort_and_clear_cover_hangdian_sheets():
+    from app.processing import clear_campus_sub_sheets, sort_campus_sub_sheets
+
+    wb = Workbook()
+    lunch = wb.active
+    _build_sheet(lunch, ["东1门", "北门", "未识别写法"], "杭电午餐")
+    dinner = wb.create_sheet("杭电晚餐")
+    _build_sheet(dinner, ["北门", "东1门"], "杭电晚餐")
+
+    sort_campus_sub_sheets(wb)
+    assert _col_c(lunch) == ["北门", "东1门", "未识别写法"]
+    assert _col_c(dinner) == ["北门", "东1门"]
+
+    cleared = clear_campus_sub_sheets(wb)
+    assert sorted(cleared) == ["杭电午餐", "杭电晚餐"]
+    assert lunch.cell(3, 1).value is None
+    assert dinner.cell(3, 1).value is None
+    # 表头不动
+    assert lunch.cell(2, 1).value == "订单"

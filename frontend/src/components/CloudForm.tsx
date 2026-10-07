@@ -37,14 +37,16 @@ import { cn } from '@/lib/utils'
 import { splitAddressLines } from '@/lib/format'
 import { canUpload, singleFlight } from '@/lib/interaction'
 
-/** 地址排序涉及的 6 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
+/** 地址排序涉及的 8 张子表（顺序与后端 DEFAULT_ADDRESS_ORDER 一致）。 */
 const ADDRESS_SHEETS = [
   '东湖中餐',
   '衣锦中餐',
   '医学院中餐',
+  '杭电午餐',
   '东湖晚餐',
   '衣锦晚餐',
   '医学院晚餐',
+  '杭电晚餐',
 ] as const
 
 const ADDRESS_PLACEHOLDER = '一行一个地址，从上到下就是排列顺序；留空 = 按地址升序排列（医学院用这种）'
@@ -313,7 +315,10 @@ export function CloudForm() {
 
       {status?.writing_test_copies ? (
         <div className="mb-3.5 rounded-md border border-emerald-500/50 bg-emerald-500/5 px-3 py-2 text-[11px] leading-relaxed">
-          <b>当前写入目标是 6 个测试副本</b>，不会碰你的正式排单表。
+          <b>
+            当前写入目标是 {Object.keys(status.test_tables ?? {}).length} 个测试副本
+          </b>
+          ，不会碰你的正式排单表。
           {status.production_tables && Object.keys(status.production_tables).length > 0
             ? '正式表 ID 已备份，需要时可在「更多」里切回。'
             : ''}
@@ -397,7 +402,7 @@ export function CloudForm() {
           )}
           {orderOpen
             ? '收起地址顺序'
-            : `展开地址顺序（已指定 ${addressConfigured}/6 张子表）`}
+            : `展开地址顺序（已指定 ${addressConfigured}/${ADDRESS_SHEETS.length} 张子表）`}
         </button>
 
         {orderOpen ? (

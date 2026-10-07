@@ -481,7 +481,7 @@ def test_read_order_retries_once_after_bounce(monkeypatch):
 
     monkeypatch.setattr(automation, "_read_contact", fake_contact)
     monkeypatch.setattr(automation, "_read_address", lambda p, _t, _l: "医学院1栋" if p.url == detail else "")
-    monkeypatch.setattr(automation, "get_address_base_sheet_name", lambda _a: "医学院")
+    monkeypatch.setattr(automation, "get_address_base_sheet_name", lambda _a, _n="": "医学院")
     monkeypatch.setattr(automation, "extract_meal_info", lambda _p, _t, _l=None: [])
     order = automation._read_order(page, "W2", 1000, None, None, detail)
     assert order is not None
@@ -543,7 +543,7 @@ def test_read_order_returns_none_when_always_empty(monkeypatch):
 
     monkeypatch.setattr(automation, "_read_contact", lambda p, _t, _l: ("", ""))
     monkeypatch.setattr(automation, "_read_address", lambda p, _t, _l: "")
-    monkeypatch.setattr(automation, "get_address_base_sheet_name", lambda _a: None)
+    monkeypatch.setattr(automation, "get_address_base_sheet_name", lambda _a, _n="": None)
     monkeypatch.setattr(automation, "extract_meal_info", lambda _p, _t, _l=None: [])
     assert automation._read_order(Page(), "W2", 1000, None, None) is None
 

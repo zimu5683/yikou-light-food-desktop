@@ -27,6 +27,10 @@ from typing import Optional
 # 校区判定关键词（与 processing.ADDRESS_SHEET_MAP 保持同源语义）
 CAMPUS_YIXUE_KEYWORDS = ("医学院", "杭州医学院", "medical college")
 CAMPUS_DONGHU_KEYWORDS = ("东湖", "农林", "农大")
+# 杭电信工：后台地址库里有中文全称与英文全称两种写法（取餐点北门/东1门由
+# 商品规格决定，见 processing.get_hangdian_address_from_product_note）。
+CAMPUS_HANGDIAN_KEYWORDS = ("杭电信工", "杭电", "杭州电子科技大学", "信息工程学院",
+                            "hangzhou dianzi", "information engineering")
 
 # 东湖校区字母宿舍区。E 区属衣锦联建；其余字母当异常。
 DORM_ZONES = ("A", "B", "C", "D")
@@ -167,12 +171,14 @@ def _clean(value: str) -> str:
 
 
 def detect_campus(address: str) -> str:
-    """按文本识别校区：东湖农林 / 医学院 / 衣锦联建 / 未知。"""
+    """按文本识别校区：东湖农林 / 医学院 / 衣锦联建 / 杭电信工 / 未知。"""
     text = unicodedata.normalize("NFKC", str(address or "")).translate(_CN_TABLE).lower()
     if "联建" in text or "衣锦" in text:
         return "衣锦联建"
     if any(k in text for k in CAMPUS_YIXUE_KEYWORDS):
         return "医学院"
+    if any(k in text for k in CAMPUS_HANGDIAN_KEYWORDS):
+        return "杭电信工"
     if any(k in text for k in CAMPUS_DONGHU_KEYWORDS):
         return "东湖农林"
     return "未知"

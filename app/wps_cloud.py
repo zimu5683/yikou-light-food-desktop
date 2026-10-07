@@ -545,8 +545,8 @@ def find_marker_column(header: Mapping[int, str], remark_col: int) -> int:
 # 本地排单表读取
 # ----------------------------------------------------------------------
 
-LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐",
-                "东湖晚餐", "衣锦晚餐", "医学院晚餐")
+LOCAL_SHEETS = ("东湖中餐", "衣锦中餐", "医学院中餐", "杭电午餐",
+                "东湖晚餐", "衣锦晚餐", "医学院晚餐", "杭电晚餐")
 # 本地子表列（1-based），与 app/excel_templates.py 的排单模板一致
 LOCAL_COL = {
     "order": 1, "name": 2, "address": 3, "phone": 4,

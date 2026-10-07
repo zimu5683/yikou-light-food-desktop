@@ -104,8 +104,8 @@ def test_order_date_is_also_trimmed():
 # 数值字段的夹紧
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("given,expected", [
-    (0, 1), (-5, 1), (1, 1), (4, 4), (20, 20), (99, 20),
-    (None, 8), ("abc", 8), ("7", 7),
+    (0, 1), (-5, 1), (1, 1), (4, 1), (8, 1), (20, 1), (99, 1),
+    (None, 1), ("abc", 1), ("7", 1),
 ])
 def test_sss_max_workers_is_clamped(given, expected):
     assert AppConfig(sss_max_workers=given).sss_max_workers == expected
@@ -119,21 +119,21 @@ def test_legacy_defaults_are_migrated_once():
     """旧配置（缺 defaults_revision）里仍是旧出厂默认的值 → 迁移到新默认。"""
     legacy = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
                        defaults_revision=0)
-    assert legacy.sss_max_workers == 8
+    assert legacy.sss_max_workers == 1
     assert legacy.sss_read_timeout_s == 30.0
-    assert legacy.defaults_revision == 1
+    assert legacy.defaults_revision == 2
 
 
-def test_migration_keeps_user_chosen_values():
-    """用户显式改过的其它并发值必须原样保留（哪怕更保守）。"""
+def test_sss_create_workers_are_forced_to_one():
+    """闪时送创建订单暂时固定串行，不采用旧配置中的并发值。"""
     kept = AppConfig(sss_max_workers=3, sss_read_timeout_s=45.0,
                      defaults_revision=0)
-    assert kept.sss_max_workers == 3
+    assert kept.sss_max_workers == 1
     assert kept.sss_read_timeout_s == 45.0
 
     already = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
-                        defaults_revision=1)
-    assert already.sss_max_workers == 4, "已迁移过的配置不能再被改动"
+                        defaults_revision=2)
+    assert already.sss_max_workers == 1
     assert already.sss_read_timeout_s == 20.0
 
 
@@ -144,12 +144,12 @@ def test_missing_revision_key_in_file_is_treated_as_legacy(tmp_path):
     path.write_text(json.dumps({"sss_max_workers": 4,
                                 "sss_read_timeout_s": 20.0}), encoding="utf-8")
     loaded = AppConfig.load(path)
-    assert loaded.sss_max_workers == 8
+    assert loaded.sss_max_workers == 1
     assert loaded.sss_read_timeout_s == 30.0
     loaded.save()
     again = AppConfig.load(path)
-    assert again.defaults_revision == 1
-    assert again.sss_max_workers == 8
+    assert again.defaults_revision == 2
+    assert again.sss_max_workers == 1
 
 
 @pytest.mark.parametrize("given,expected", [

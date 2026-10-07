@@ -92,6 +92,10 @@ _RECONCILE_POLL_INTERVAL_S = 0.5
 _PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 # 订单创建时间与本地批次起点的最大时钟偏差；用于排除其他设备更早创建的相似订单。
 _BATCH_CLOCK_SKEW_S = 120.0
+# 创建订单接口是非幂等 POST，且平台在并发请求下会间歇性返回
+# ``IndexOutOfBoundsException: Index: 0, Size: 0``。对真实创建请求强制串行，
+# 对账仍然只读且保留原有防重复流程。
+_SSS_CREATE_MAX_WORKERS = 1
 # 对账页大小。实测 2026-09-10：100 条/页每页约 2.0s；改成 1000 条/页反而要
 # 17.9s，所以宁可多翻几页也不要放大单页体积。
 _LIST_PAGE_SIZE = 100
@@ -2147,7 +2151,7 @@ def run_sss_job(config: Any, stop_event: Any,
     ``config.sss_dry_run`` 为真时只组装并打印报文，不真实提交（且跳过
     登录与门店/地址查询，无需验证码）。
     ``captcha_callback`` 在纯接口模式接收验证码 PNG 字节，返回用户输入的验证码。
-    下单阶段并发提交（``config.sss_max_workers``，默认 4），提交前后均会
+    下单阶段串行提交（创建订单接口固定 1 路），提交前后均会
     查询站内订单列表；状态不确定时绝不直接重复 POST。
     """
     load_start = time.perf_counter()
@@ -2280,10 +2284,11 @@ def run_sss_job(config: Any, stop_event: Any,
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
     api_mode = bool(getattr(config, "api_mode", True))
     try:
-        max_workers = int(getattr(config, "sss_max_workers", 4))
+        configured_workers = int(getattr(config, "sss_max_workers", 1))
     except (TypeError, ValueError):
-        max_workers = 4
-    max_workers = max(1, min(20, max_workers))
+        configured_workers = 1
+    configured_workers = max(1, min(20, configured_workers))
+    max_workers = _SSS_CREATE_MAX_WORKERS
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 
@@ -2481,7 +2486,8 @@ def run_sss_job(config: Any, stop_event: Any,
             if not allowed:
                 return lock
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，并发 {max_workers} 路，读取超时 {read_timeout_s:g}s")
+                  f"开始下单：共 {len(tasks)} 单，创建订单串行 1 路"
+                  f"（原配置 {configured_workers} 路），读取超时 {read_timeout_s:g}s")
             submit_start = time.perf_counter()
             try:
                 final, reconciled = _run_reconciled_submission(

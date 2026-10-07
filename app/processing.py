@@ -21,8 +21,16 @@ MEAL_COUNT = re.compile(r"x\s*(\d+)", re.IGNORECASE)
 # the parser usable with test fixtures and newly-created workbooks as well.
 ADDRESS_SHEET_MAP = {
     "联建": "衣锦", "衣锦": "衣锦", "医学院": "医学院", "东湖": "东湖",
+    "杭电信工": "杭电", "杭电": "杭电",
+    "杭州电子科技大学": "杭电", "信息工程学院": "杭电",
     "lianjian": "衣锦", "yijin": "衣锦", "medical": "医学院", "donghu": "东湖",
+    "hangzhou dianzi": "杭电", "information engineering": "杭电",
 }
+
+# 规格（商品加料）里出现这些词即判杭电：客户的取餐点就是在选项里选的，
+# 地址可能是「School of Information Engineering, Hangzhou Dianzi University…」
+# 这类中英混写的长写法（2026-10-07 实测 W7）。
+HANGDIAN_SPEC_KEYWORDS = ("杭电信工",)
 
 
 def split_text_and_number(text: Any) -> Tuple[str, str]:
@@ -44,8 +52,15 @@ def parse_receiver_info(receiver_text: Any) -> Tuple[str, str]:
     return split_text_and_number(value)
 
 
-def get_address_base_sheet_name(delivery_address: Any) -> Optional[str]:
-    """按收货地址判断落在哪个校区子表；农林路未写「联建」时归东湖。"""
+def get_address_base_sheet_name(delivery_address: Any, product_note: Any = "") -> Optional[str]:
+    """按收货地址判断落在哪个校区子表；农林路未写「联建」时归东湖。
+
+    ``product_note``（商品规格/加料文案）里出现「杭电信工」时**直接判杭电**：
+    杭电两个取餐点是客户在规格选项里选的，地址写法很不稳定。
+    """
+    note = str(product_note or "")
+    if any(keyword in note for keyword in HANGDIAN_SPEC_KEYWORDS):
+        return "杭电"
     value = str(delivery_address or "")
     lower = value.lower()
     for keyword, sheet in ADDRESS_SHEET_MAP.items():
@@ -55,6 +70,20 @@ def get_address_base_sheet_name(delivery_address: Any) -> Optional[str]:
     if "农林" in value and "联建" not in value:
         return "东湖"
     return None
+
+
+def get_hangdian_address_from_product_note(product_note: Any, delivery_address: Any = "") -> str:
+    """判定杭电信工取餐点：规格里选的门优先，其次看地址原文；认不出返回空串。
+
+    规格文案即后台商品选项（``杭电信工（北门外卖架）`` / ``杭电信工（东1门）``），
+    地址里通常也会带上门名（``北门三号楼``、``…杭电路1号北门``）。
+    """
+    for text in (str(product_note or ""), str(delivery_address or "")):
+        if "东1门" in text or "东一门" in text:
+            return "东1门"
+        if "北门" in text:
+            return "北门"
+    return ""
 
 
 def _canonical_donghu_address_segment(segment: Any) -> str:
@@ -85,9 +114,14 @@ def get_donghu_address_segment(delivery_address: Any) -> str:
 
 
 def get_yijin_address_from_product_note(product_note: Any) -> str:
-    """按订单备注判断衣锦校区取餐点：含「联建门口外卖柜」为外卖柜，否则校门口。"""
+    """按商品规格判断衣锦校区取餐点：带「联建门口…柜」为外卖柜，否则校门口。
+
+    区间判两个词而不是整串：平台选项文案改过版（历史「联建门口外卖柜（可以不选…）」，
+    2026-10 的周餐选项叫「联建门口外面柜」），但口径不变 —— 存外卖柜的订单才会
+    带上这条规格，没存柜（校门口）的订单不带。
+    """
     value = str(product_note or "")
-    return "外卖柜" if "联建门口外卖柜" in value else "校门口"
+    return "外卖柜" if "联建门口" in value and "柜" in value else "校门口"
 
 
 def parse_meal_text(text: Any, meal_type: Optional[str] = None) -> list[MealInfo]:
@@ -200,9 +234,30 @@ def get_weekday_fill_value(now: Optional[_dt.datetime] = None) -> Dict[str, Any]
 
 
 # 校区子表（如「东湖中餐」）的地址排序规则。表名以校区开头、以中餐/晚餐结尾。
-_CAMPUS_SHEET_PREFIXES = ("东湖", "衣锦", "医学院")
-_CAMPUS_SHEET_SUFFIXES = ("中餐", "晚餐")
+# 杭电两张表按用户口径叫「杭电午餐/杭电晚餐」，因此后缀多一个「午餐」。
+_CAMPUS_SHEET_PREFIXES = ("东湖", "衣锦", "医学院", "杭电")
+_CAMPUS_SHEET_SUFFIXES = ("中餐", "晚餐", "午餐")
 _ADDRESS_HEADER_ROWS = 2  # 第 1 行标题、第 2 行表头，数据自第 3 行起
+
+# 「类型」列的通用取值：与现有六张表一致（午餐写「中餐」）。
+MEAL_TYPE_LABELS = {"午餐": "中餐", "晚餐": "晚餐"}
+# 杭电的例外：子表名与「类型」列都写「午餐/晚餐」——协作者维护的
+# 《杭电午餐9月.xlsx》里已有行的类型列就是「午餐」（2026-10-07 实测）。
+_HANGDIAN_LABELS = {"午餐": "午餐", "晚餐": "晚餐"}
+
+
+def order_sheet_name(base: str, meal_type: str) -> str:
+    """返回订单要写入的校区子表名：「杭电午餐/杭电晚餐」或「{校区}{中餐|晚餐}」。"""
+    default = MEAL_TYPE_LABELS.get(meal_type, meal_type)
+    suffix = _HANGDIAN_LABELS.get(meal_type, default) if str(base) == "杭电" else default
+    return f"{base}{suffix}"
+
+
+def meal_type_label(base: str, meal_type: str) -> str:
+    """返回「类型」列的值：杭电写「午餐/晚餐」，其余校区写「中餐/晚餐」。"""
+    if str(base) == "杭电":
+        return _HANGDIAN_LABELS.get(meal_type, meal_type)
+    return MEAL_TYPE_LABELS.get(meal_type, meal_type)
 
 
 def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
@@ -210,7 +265,8 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
 
     东湖：大西 → 小/小西 → A/B/C/D（按数字升序）→ 其他；
     衣锦：校门口 → 外卖柜 → 其他；
-    医学院：医 N号（按数字升序；兼容旧写法 医N号）→ 其他。
+    医学院：医 N号（按数字升序；兼容旧写法 医N号）→ 其他；
+    杭电：北门 → 东1门 → 其他。
     """
     value = str(address or "").strip()
     if not value:
@@ -237,13 +293,19 @@ def _sort_key_for_address(address: Any, campus: str) -> tuple[int, int, int]:
         if match:
             return (0, int(match.group(1)), 0)
         return (9, 0, 0)
+    if campus == "杭电":
+        if "北门" in value:
+            return (0, 0, 0)
+        if "东1门" in value or "东一门" in value:
+            return (1, 0, 0)
+        return (9, 0, 0)
     return (9, 0, 0)
 
 
 def clear_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = None) -> list[str]:
-    """Clear all data rows of the six campus sub-sheets before writing.
+    """Clear all data rows of the campus sub-sheets before writing.
 
-    仅清空六张校区子表（东湖/衣锦/医学院 × 中餐/晚餐）第 3 行起的数据，
+    仅清空八张校区子表（东湖/衣锦/医学院 × 中餐/晚餐，杭电 × 午餐/晚餐）第 3 行起的数据，
     第 1 行标题与第 2 行表头保持不动。删除整行（而非仅置空单元格），
     否则工作表的 max_row 不会收缩、后续写入仍从旧尾部续写。数据区若有
     合并单元格则退化为逐格置空并提示。返回实际被清空的表名列表。
@@ -290,7 +352,7 @@ def clear_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = No
 def sort_campus_sub_sheets(workbook: Any, log: Callable[[str], Any] | None = None) -> list[str]:
     """Sort each campus sub-sheet's rows by address after the run finishes.
 
-    仅整理六张校区子表（东湖/衣锦/医学院 × 中餐/晚餐），周表与历史日期表不动。
+    仅整理八张校区子表（东湖/衣锦/医学院 × 中餐/晚餐，杭电 × 午餐/晚餐），周表与历史日期表不动。
     扫描整张表第 3 行起**所有**非空行一起排序（中间空行会被压缩掉），
     排好后从第 3 行起连续写回。表头与行样式保持不变。
     返回已整理的表名列表（便于上层写日志）。

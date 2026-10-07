@@ -19,15 +19,13 @@ _CONFIG_SAVE_LOCK = threading.RLock()
 
 #: 出厂默认值迁移版本。
 #:
-#: * ``0``：旧配置（`config.json` 里没有 ``defaults_revision`` 这个键）；
-#: * ``1``：现行默认值（闪时送并发 8 路、读取超时 30 秒）。
+#: * ``0``：旧配置（``config.json`` 里没有 ``defaults_revision`` 这个键）；
+#: * ``2``：闪时送创建订单固定串行提交、读取超时 30 秒。
 #:
-#: 迁移只做一次，而且**只在旧值仍等于旧出厂默认值时才改**：用户显式改过的
-#: 其它并发值必须原样保留（哪怕它比新默认更保守或更激进）。
-DEFAULTS_REVISION = 1
-_LEGACY_DEFAULT_SSS_MAX_WORKERS = 4
+#: 老版本的 4 / 8 路并发设置在下单接口稳定性核实前统一降为 1 路。
+DEFAULTS_REVISION = 2
 _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
-_DEFAULT_SSS_MAX_WORKERS = 8
+_DEFAULT_SSS_MAX_WORKERS = 1
 _DEFAULT_SSS_READ_TIMEOUT_S = 30.0
 
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
@@ -37,6 +35,10 @@ DEFAULT_WPS_PRODUCTION_TABLES: Dict[str, Dict[str, str]] = {
     "东湖中餐": {"file_id": "fr2FrpFVMrM8poHaSHFK1xAsmSSBMspye"},
     "衣锦中餐": {"file_id": "amqzgcXVMrMWopCdyxkJrxnqzcQ8UbaJG"},
     "医学院中餐": {"file_id": "qvuPzdurK1MyKwL2weiZ1xF8RzdijFdaJ"},
+    # 杭电午餐9月.xlsx（协作者维护，2026-10-07 用 kdocs-cli 搜索确认）。
+    # 杭电晚餐暂不配置：店家还没开放晚餐（云端虽有《杭电晚餐9月.xlsx》，
+    # 但正式开放后确认再用同一行格式补上 file_id 即可）。
+    "杭电午餐": {"file_id": "bDV7kDE3nxMmpbLBEXvL1xeYd5SMMSTRn"},
     "东湖晚餐": {"file_id": "noJa93Xq9xM62hfVqj6UrxEmgLjAHmqka"},
     "衣锦晚餐": {"file_id": "mAc5hDw1q1MV33kW8JE7xxnnW1KEdYc1V"},
     "医学院晚餐": {"file_id": "PpnGwh9ERxMRByaRp2EHrxUgCDjP4kZpA"},
@@ -65,6 +67,9 @@ DEFAULT_ADDRESS_ORDER: Dict[str, list] = {
     "衣锦晚餐": ["外卖柜", "校门口"],
     "医学院中餐": [],
     "医学院晚餐": [],
+    # 杭电信工：两个取餐点，北门在前（用户 2026-10-07 确认）。
+    "杭电午餐": ["北门", "东1门"],
+    "杭电晚餐": ["北门", "东1门"],
 }
 
 
@@ -357,11 +362,7 @@ class AppConfig:
         self.sss_preflight = bool(sss_preflight)
         self.sss_store_id = int(sss_store_id) if sss_store_id not in (None, "") else None
         self.sss_store_name_cached = str(sss_store_name_cached or "")
-        try:
-            workers = int(sss_max_workers)
-        except (TypeError, ValueError):
-            workers = _DEFAULT_SSS_MAX_WORKERS
-        self.sss_max_workers = max(1, min(20, workers))
+        self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
         try:
             read_timeout = float(sss_read_timeout_s)
         except (TypeError, ValueError):
@@ -373,9 +374,6 @@ class AppConfig:
         except (TypeError, ValueError):
             revision = 0
         if revision < DEFAULTS_REVISION:
-            # 旧值仍等于旧出厂默认 → 迁移到新默认；用户改过的其它值一律保留。
-            if self.sss_max_workers == _LEGACY_DEFAULT_SSS_MAX_WORKERS:
-                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
             if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
                 self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
         self.defaults_revision = DEFAULTS_REVISION
