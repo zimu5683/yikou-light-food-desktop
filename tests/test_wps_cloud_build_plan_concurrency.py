@@ -282,7 +282,9 @@ def test_unreadable_sheet_does_not_stop_the_others():
     plans, _, sheets = _run(2, unreadable={"F3"})
     assert [p.sheet for p in plans] == sheets
     assert plans[3].warnings
-    assert not plans[0].warnings
+    assert not plans[0].blocked_reason
+    # 健康表的告警只有"没有星期标记、无法核对批次日期"这一条（照常写入）
+    assert not [w for w in plans[0].warnings if "无法核对" not in w]
 
 
 class _Boom(Exception):

@@ -644,8 +644,12 @@ def test_safe_reconcile_falls_back_to_full_scan_when_prefilter_misses(monkeypatc
     logs = []
     result = sss._safe_reconcile([task], fetch, logs.append, "测试对账", zero_retry_delay=0)
     assert result is not None and result.confirmed == {"t1"} and not result.missing
-    # 预筛空 → 立即重查一次（区分“刚写入不可见”）→ 仍空 → 全量复核
-    assert calls == ["window", "window", "full"]
+    # 预筛空 → 立即重查一次（区分“刚写入不可见”）→ 仍空 → 全量复核。
+    # 全量复核之前还有**时间窗自检**的两次只读探针（pageSize=1，不带过滤 +
+    # 带窗口），用来确认服务端还接受 startTime/endTime；它只读、不改判定结论。
+    assert calls[0] == "window" and calls[1] == "window"
+    assert calls[-1] == "full", calls
+    assert calls.count("full") >= 1 and "window" in calls
     assert "全量复核确认为 1/1 单" in "\n".join(logs)
 
 

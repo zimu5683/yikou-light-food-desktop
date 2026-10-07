@@ -11,6 +11,7 @@ import {
   type CaptchaRequest,
   type DecisionRequest,
   type LogEntry,
+  type OperationStatusResult,
   type OrderFormPayload,
   type SssFormPayload,
   type StatusState,
@@ -45,6 +46,10 @@ export interface AppStateBundle {
   addressInput: AddressInputRequest | null
   updateProgress: UpdateProgress | null
   workerAlive: boolean
+  /** 统一操作状态（后端权威）：`active` 为真时其它危险操作会被拒绝。 */
+  operation: OperationStatusResult | null
+  /** 主动刷新统一操作状态（动作完成后调用）。 */
+  refreshOperation: () => Promise<void>
   mode: TaskMode
   setMode: (mode: TaskMode) => void
   startOrder: (payload: OrderFormPayload) => Promise<FieldErrors | null>

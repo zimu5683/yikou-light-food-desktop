@@ -132,15 +132,15 @@ def test_sss_transport_defaults_persist(tmp_path):
     path = tmp_path / "config.json"
     config = AppConfig()
     assert config.sss_dry_run is True
-    assert config.sss_max_workers == 4
-    assert config.sss_read_timeout_s == 20.0
+    assert config.sss_max_workers == 8
+    assert config.sss_read_timeout_s == 30.0
     assert config.sss_unit_price == 1.9
     assert config.sss_idempotency_field == ""
     config.save(path)
     loaded = AppConfig.load(path)
     assert loaded.sss_dry_run is True
-    assert loaded.sss_max_workers == 4
-    assert loaded.sss_read_timeout_s == 20.0
+    assert loaded.sss_max_workers == 8
+    assert loaded.sss_read_timeout_s == 30.0
     assert loaded.sss_unit_price == 1.9
 
 

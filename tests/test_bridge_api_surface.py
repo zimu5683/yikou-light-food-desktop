@@ -523,3 +523,87 @@ def test_native_closing_is_cancelled_while_a_task_runs(tmp_path, monkeypatch):
     # 必须另起线程走 request_close，而不是在 pywebview 的回调里阻塞
     assert len(started) == 1
     assert started[0]["target"] == bridge.request_close
+
+
+# ----------------------------------------------------------------------
+# 新增的 js_api 面：契约必须存在且返回稳定形状
+#
+# 这些方法名是**前后端契约**：前端按名字调用，改名/删名 = 界面上的按钮失灵。
+# ----------------------------------------------------------------------
+
+#: 新增（由本轮功能补齐引入）的公开方法。
+NEW_JS_API = (
+    # WPS 预览/上传/恢复
+    "wps_preview", "wps_upload",
+    "wps_recovery_status", "wps_recovery_resolve",
+    # 闪时送未决记录
+    "sss_uncertain_records", "start_sss_review", "sss_uncertain_resolve",
+    # 统一操作状态
+    "operation_status",
+)
+
+
+def test_new_js_api_methods_exist():
+    for name in NEW_JS_API:
+        assert callable(getattr(Bridge, name, None)), f"前端契约缺少 {name}"
+
+
+def test_wps_upload_requires_a_preview_id_argument():
+    """无参上传必须被安全拒绝（旧的无参调用不能绕过预览令牌）。"""
+    import inspect
+
+    signature = inspect.signature(Bridge.wps_upload)
+    assert "preview_id" in signature.parameters
+
+
+def test_operation_status_shape(tmp_path):
+    bridge = _bridge(tmp_path)
+    status = bridge.operation_status()
+    assert status["ok"] is True
+    assert status["active"] is False
+    assert status["operation"] is None
+    assert "last" in status
+
+
+def test_sss_uncertain_records_reports_unreadable_journal(tmp_path):
+    """日志损坏时**绝不能**返回空列表伪装成"没有未决记录"。"""
+    bridge = _bridge(tmp_path)
+    journal_path = bridge._sss_journal_path()
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{ 坏了", encoding="utf-8")
+
+    got = bridge.sss_uncertain_records()
+
+    assert got["ok"] is False
+    assert got["journal_unreadable"] is True
+    assert got["error_code"] == "journal_unreadable"
+    assert got["records"] == [] and got["next_action"]
+
+
+def test_sss_uncertain_records_is_empty_and_read_only_when_no_journal(tmp_path):
+    bridge = _bridge(tmp_path)
+    got = bridge.sss_uncertain_records()
+    assert got["ok"] is True and got["records"] == []
+    assert got["counts"]["active"] == 0
+    assert not bridge._sss_journal_path().exists(), "只读查询不该创建日志文件"
+
+
+def test_wps_recovery_status_is_read_only(tmp_path):
+    bridge = _bridge(tmp_path)
+    got = bridge.wps_recovery_status()
+    assert got["ok"] is True and got["read_only"] is True
+    assert got["queried_cloud"] is False
+    assert got["source"] == "local_journal"
+
+
+def test_wps_recovery_status_fails_closed_on_corrupt_journal(tmp_path):
+    bridge = _bridge(tmp_path)
+    state_path = bridge._wps_ledger_and_journal()[0].path
+    journal_path = bridge._wps_ledger_and_journal()[1].path
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    journal_path.write_text("{ 坏了", encoding="utf-8")
+    got = bridge.wps_recovery_status()
+    assert got["ok"] is False
+    assert got["error_code"] == "wps_recovery_journal_unreadable"
+    assert got["operations"] == []
+    assert str(state_path)

@@ -65,3 +65,6 @@ vendor/kdocs-cli/kdocs-cli
 vendor/kdocs-cli/kdocs-cli.exe
 vendor/kdocs-cli/*.tar.gz
 vendor/kdocs-cli/*.zip
+
+# 编辑器/办公套件的临时锁文件（LibreOffice 等），不得入库
+.~lock.*#

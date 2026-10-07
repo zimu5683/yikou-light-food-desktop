@@ -138,6 +138,350 @@ export interface WpsResult {
   result?: { written: number; failed: number; sheets: Array<{ sheet: string; status: string; reason?: string }> }
 }
 
+// ---------- 计划口径 vs 执行口径（禁止混用） ----------
+
+/** 计划**要改**多少行；`kind` 恒为 `plan`。 */
+export interface WpsPlannedSummary {
+  kind: 'plan'
+  to_update: number
+  to_append: number
+  unchanged: number
+  skipped: number
+  warned: number
+  blocked: number
+  rows: {
+    to_update: number
+    to_append: number
+    unchanged: number
+    skipped: number
+    warned: number
+    blocked: number
+  }
+  note: string
+}
+
+export interface WpsExecutionSheetCounts {
+  total: number
+  verified: number
+  noop: number
+  failed: number
+  uncertain: number
+  skipped: number
+  blocked: number
+  other: number
+}
+
+/**
+ * 执行**实际证明**了多少行；`kind` 恒为 `execution`。
+ *
+ * ``rows`` 里为 `null` 表示"无法证明"，**不能**用计划数或成功表数顶替。
+ */
+export interface WpsExecutionSummary {
+  kind: 'execution'
+  contract_version: number
+  status: string
+  executed: boolean
+  counts_source: string
+  sheets: WpsExecutionSheetCounts
+  rows: {
+    verified: number | null
+    failed: number | null
+    uncertain: number | null
+    skipped: number | null
+    planned: number
+  }
+  rows_unknown: boolean
+  proven_no_write: boolean
+  written_sheets: number
+  failed_sheets: number
+  note: string
+  next_action: string
+}
+
+/** 一张云表的逐格状态（预览与上传共用同一结构）。 */
+export interface WpsTableDetail {
+  sheet: string
+  file_id: string
+  target_date: string
+  target_col: number
+  target_header: string
+  blocked_reason: string
+  previous_batch: string
+  warnings: string[]
+  sort_enabled: boolean
+  unknown_addresses: string[]
+  counts: {
+    to_update: number
+    to_append: number
+    unchanged: number
+    skipped: number
+    warned: number
+    blocked: number
+  }
+  changes: Array<{
+    kind: 'existing' | 'new'
+    name: string
+    phone: string
+    row: number
+    slot: number
+    total_before: number
+    total_after: number
+    target_ok: boolean
+    target_blocked: boolean
+    target_occupied: string
+    needs_write: boolean
+    local_rows: number[]
+    local_meals: number
+    ledger_prev: number | null
+  }>
+}
+
+/** `wps_preview()` 的返回值：必须把 `preview_id` 原样传给 `wps_upload`。 */
+export interface WpsPreviewResult extends WpsResult {
+  code?: string
+  status?: string
+  next_action?: string
+  /** 预览令牌（10 分钟、一次性）。 */
+  preview_id?: string
+  expires_at?: string
+  expires_in?: number
+  ttl_seconds?: number
+  state?: 'valid' | 'expired' | 'consumed' | 'invalidated'
+  local_sha256?: string
+  fingerprint?: { local_sha256: string; context: string; plan: string }
+  planned_summary?: WpsPlannedSummary
+  execution_summary?: WpsExecutionSummary
+  tables?: WpsTableDetail[]
+  blocked?: Array<{ sheet: string; reason: string }>
+  warnings?: string[]
+  /** 上下文变化时列出变化的键（排序开关、目标表、日期…）。 */
+  changed?: string[]
+  operation_id?: string
+  conflicting_operation?: OperationInfo | null
+}
+
+/** `wps_upload(preview_id)` 的返回值。 */
+export interface WpsUploadResult extends WpsPreviewResult {
+  journal_path?: string
+  failed_sheets?: string[]
+}
+
+// ---------- WPS 恢复状态与人工处置 ----------
+
+export type WpsSheetStatus =
+  | 'planned'
+  | 'writing'
+  | 'ledger_pending'
+  | 'uncertain'
+  | 'verified'
+  | 'failed_no_write'
+  | 'not_started'
+  | 'retired_guarded'
+
+export interface WpsRecoverySheet {
+  sheet: string
+  status: WpsSheetStatus | string
+  display_status: string
+  reason: string
+  problems: string[]
+  next_action: string
+  allowed_actions: WpsRecoveryDecision[]
+  target_date: string
+  target_ref: string
+  people: Array<{
+    name: string
+    phone: string
+    slot: number
+    local_meals: number
+    total_before: number
+    total_after: number
+  }>
+  people_count: number
+  cloud_checked: boolean
+  evidence: string
+  retire_note: string
+  retired_at: string
+  prior_status: string
+}
+
+export interface WpsRecoveryOperation {
+  operation_id: string
+  operation_ref: string
+  status: string
+  next_action: string
+  created_at: string
+  updated_at: string
+  target_date: string
+  pending: boolean
+  retired_guarded: boolean
+  retire_note: string
+  sheets: WpsRecoverySheet[]
+}
+
+/** `wps_recovery_status()`：只读本地日志，不联网、不写任何文件。 */
+export interface WpsRecoveryStatus {
+  ok: boolean
+  contract_version: number
+  source: 'local_journal'
+  read_only: true
+  queried_cloud: false
+  error_code?: string
+  reason?: string
+  next_action?: string
+  counts: Record<string, number>
+  pending_count?: number
+  guarded_count?: number
+  operations: WpsRecoveryOperation[]
+  pending_operations?: WpsRecoveryOperation[]
+  journal_path?: string
+}
+
+export type WpsRecoveryDecision = 'retire_guarded' | 'cloud_verified' | 'cloud_untouched' | 'keep'
+
+export interface WpsRecoveryResolveResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason?: string
+  reason_code?: string
+  next_action?: string
+  contract_version?: number
+  read_only?: boolean
+  /** 恒为 false：处置入口永不写云端。 */
+  cloud_write: boolean
+  operation_ref?: string
+  changed: boolean
+  note?: string
+  resolved_at?: string
+  operations: Array<{ journal_id?: string; sheet?: string; status: string; reason?: string }>
+  allowed_decisions?: WpsRecoveryDecision[]
+}
+
+// ---------- 闪时送未决记录 ----------
+
+export interface SssUncertainRecordView {
+  journal_id: string
+  identifier: string
+  sheet: string
+  batch_id: string
+  delivery_date: string
+  status: 'inflight' | 'unresolved' | string
+  error: string
+  created_at: string
+  name: string
+  /** 已脱敏（前 3 后 4）。 */
+  phone: string
+  delivery_time: string
+  door_num: string
+  address: string
+  goods_name: string
+  account: string
+  platform: string
+  source: string
+}
+
+/** `sss_uncertain_records()`：日志损坏时 `journal_unreadable=true`，绝不能当成"没有"。 */
+export interface SssUncertainState {
+  ok: boolean
+  reason?: string
+  error_code?: 'journal_unreadable' | string
+  journal_unreadable: boolean
+  records: SssUncertainRecordView[]
+  counts: {
+    active: number
+    inflight: number
+    unresolved: number
+    resolved: number
+    discarded: number
+  }
+  journal_path?: string
+  fingerprint?: string
+  delivery_date?: string
+  account?: string
+  next_action?: string
+}
+
+export type SssReviewClassification =
+  | 'station_confirmed'
+  | 'station_missing'
+  | 'station_found_other_day'
+  | 'scan_failed'
+
+export interface SssUncertainReviewItem {
+  journal_id: string
+  classification: SssReviewClassification
+  reason: string
+  name: string
+  phone: string
+  delivery_time: string
+  error: string
+}
+
+/** `start_sss_review()`：只读核对（不对远端订单产生写副作用）。 */
+export interface SssUncertainReview {
+  ok: boolean
+  reason?: string
+  next_action?: string
+  journal_path?: string
+  batch_key?: string
+  delivery_date?: string
+  account?: string
+  created_at?: string
+  expires_at?: string
+  ttl_seconds?: number
+  queried_cloud?: boolean
+  read_only?: boolean
+  cloud_write?: false
+  results: SssUncertainReviewItem[]
+  counts?: Record<string, number>
+  confirmed?: number
+  missing?: number
+  other_day?: number
+  scan_failed?: number
+}
+
+export type SssUncertainDecision = 'station_present' | 'station_absent' | 'keep'
+
+/** `sss_uncertain_resolve()`：只写本地日志，**不会发送创建订单请求**。 */
+export interface SssUncertainResolveResult {
+  ok: boolean
+  status: string
+  code?: string
+  reason?: string
+  reason_code?: string
+  next_action?: string
+  cloud_write: boolean
+  changed: boolean
+  note?: string
+  record_ids?: string[]
+  operations: Array<{ journal_id: string; status: string }>
+}
+
+// ---------- 统一操作状态 ----------
+
+export interface OperationInfo {
+  operation_id: string
+  mode: string
+  title: string
+  status: string
+  active: boolean
+  phase: string
+  reason: string
+  next_action: string
+  summary: Record<string, unknown>
+  started_at: string
+  finished_at: string
+}
+
+export interface OperationStatusResult {
+  ok: boolean
+  active: boolean
+  operation: OperationInfo | null
+  last: OperationInfo | null
+  reason?: string
+  reason_code?: string
+}
+
 /** 云端当天名单（bridge.sss_day_orders 返回）。 */
 export interface SssDayOrders {
   ok: boolean
@@ -373,12 +717,42 @@ interface PywebviewApi {
   new_template(mode: 'order' | 'sss'): Promise<{ path: string; error: string }>
   check_browser(): Promise<{ ok: boolean }>
   wps_status(): Promise<WpsStatus>
-  wps_preview(): Promise<WpsResult>
-  wps_upload(): Promise<WpsResult>
+  wps_preview(): Promise<WpsPreviewResult>
+  /** 必须传 `wps_preview()` 返回的 `preview_id`；无参调用会被安全拒绝。 */
+  wps_upload(previewId?: string): Promise<WpsUploadResult>
   wps_authorize(): Promise<{ ok: boolean; reason?: string; hint?: string }>
   wps_check_copies(): Promise<WpsCopyCheck>
+  /** 只读恢复状态：不联网、不写任何文件。 */
+  wps_recovery_status(): Promise<WpsRecoveryStatus>
+  /** 人工处置：带确认与备注；**永不写云端**。 */
+  wps_recovery_resolve(payload: {
+    operation_id: string
+    decision: WpsRecoveryDecision
+    confirm: string
+    note: string
+    confirm_structure_checked?: boolean
+  }): Promise<WpsRecoveryResolveResult>
+  /** 未决记录列表（脱敏）；日志损坏时 `journal_unreadable=true`。 */
+  sss_uncertain_records(): Promise<SssUncertainState>
+  /** 只读核对：登录 + 查订单 + 存快照；不发送创建订单请求。 */
+  start_sss_review(payload?: { password?: string }): Promise<SssUncertainReview>
+  /** 人工处置未决记录：不发送创建订单请求。 */
+  sss_uncertain_resolve(payload: {
+    decision: SssUncertainDecision
+    confirm: string
+    note: string
+    record_ids: string[]
+  }): Promise<SssUncertainResolveResult>
+  /** 统一操作状态：前端据此禁用按钮并显示"谁在跑、跑到哪一步"。 */
+  operation_status(operationId?: string): Promise<OperationStatusResult>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
-  clear_password(mode: 'order' | 'sss'): Promise<{ ok: boolean }>
+  /** 删除本机密钥环里的密码；`ok=false` 时**没有**删掉，必须如实提示。 */
+  clear_password(mode: 'order' | 'sss'): Promise<{
+    ok: boolean
+    removed?: boolean
+    reason?: string
+    next_action?: string
+  }>
   check_updates(manual: boolean): Promise<{ ok: boolean; reason?: string }>
   install_update(): Promise<{ ok: boolean; reason?: string }>
   open_external(url: string): Promise<{ ok: boolean }>
@@ -643,4 +1017,94 @@ function mockState(): AppState {
     },
     passwords: { order: '', sss: '' },
   }
+}
+
+
+// ---------- 结果分档：前端必须能区分成功/部分/未知/阻断/需恢复 ----------
+
+export type OutcomeKind =
+  | 'success'
+  | 'partial'
+  | 'unknown'
+  | 'blocked'
+  | 'needs_recovery'
+  | 'rejected'
+
+export interface OutcomeView {
+  kind: OutcomeKind
+  label: string
+  tone: 'ok' | 'warn' | 'danger' | 'muted'
+  /** 界面上要显示的"下一步"（后端给出时优先用它）。 */
+  nextAction: string
+}
+
+const OUTCOME_LABELS: Record<OutcomeKind, { label: string; tone: OutcomeView['tone'] }> = {
+  success: { label: '成功', tone: 'ok' },
+  partial: { label: '部分完成', tone: 'warn' },
+  unknown: { label: '结果未知（需人工核对）', tone: 'danger' },
+  blocked: { label: '已被拒绝（未写入）', tone: 'warn' },
+  needs_recovery: { label: '需要恢复处置', tone: 'danger' },
+  rejected: { label: '未执行', tone: 'muted' },
+}
+
+/**
+ * 把后端返回的状态分档。
+ *
+ * 顺序很重要：**未知**永远优先于"失败" —— 写入结果不确定时不能被显示成
+ * 一次干净的失败，否则用户会直接重试，而重试可能造成重复累加/重复下单。
+ */
+export function classifyOutcome(input: {
+  status?: string
+  code?: string
+  ok?: boolean
+  executionSummary?: WpsExecutionSummary
+  uncertainPending?: number
+}): OutcomeView {
+  const status = String(input.status ?? '').toLowerCase()
+  const code = String(input.code ?? '')
+  const summary = input.executionSummary
+  let kind: OutcomeKind = 'success'
+
+  if (code === 'operation_conflict') {
+    kind = 'rejected'
+  } else if (code === 'preview_changed' || code?.startsWith('preview_')
+             || code === 'missing_preview') {
+    kind = 'rejected'
+  } else if (status === 'uncertain' || status === 'verify_unreadable'
+             || status === 'blocked_by_uncertain' || status === 'uncertain_journal_unreadable') {
+    kind = 'unknown'
+  } else if (status === 'blocked' || status === 'stale_batch'
+             || status === 'insufficient_balance' || status === 'balance_unknown'
+             || status === 'rejected') {
+    kind = 'blocked'
+  } else if (status === 'failed' || status === 'error') {
+    // 失败但"结果未知"时仍按未知处理。
+    kind = summary && summary.rows_unknown && !summary.proven_no_write
+      ? 'unknown' : 'partial'
+  } else if (status === 'partial' || status === 'verify_failed') {
+    kind = summary && summary.rows_unknown ? 'unknown' : 'partial'
+  } else if (status === 'no_orders' || status === 'dry_run' || status === 'noop') {
+    kind = 'success'
+  } else if (!input.ok && status === '') {
+    kind = 'rejected'
+  }
+
+  if ((input.uncertainPending ?? 0) > 0 && kind === 'success') {
+    kind = 'unknown'
+  }
+  const meta = OUTCOME_LABELS[kind]
+  return { kind, label: meta.label, tone: meta.tone, nextAction: '' }
+}
+
+/** 操作是否仍占用槽位（前端据此禁用按钮；安全判定仍在后端）。 */
+export function operationIsActive(status: OperationStatusResult | null): boolean {
+  return Boolean(status?.active)
+}
+
+/** 冲突时的提示文案（"谁在跑 + 下一步"）。 */
+export function conflictNotice(status: OperationStatusResult | null): string {
+  const current = status?.operation
+  if (!current) return ''
+  const phase = current.phase ? `（${current.phase}）` : ''
+  return `当前正在执行：${current.title}${phase}`
 }

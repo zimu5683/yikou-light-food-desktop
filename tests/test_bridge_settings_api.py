@@ -233,9 +233,9 @@ def test_empty_payload_is_a_noop_but_still_saves(tmp_path):
 def deleted(monkeypatch):
     calls: list[tuple[str, str]] = []
     monkeypatch.setattr(bridge_module, "delete_password",
-                        lambda account: calls.append(("admin", account)))
+                        lambda account: calls.append(("admin", account)) or True)
     monkeypatch.setattr(bridge_module, "delete_sss_password",
-                        lambda account: calls.append(("sss", account)))
+                        lambda account: calls.append(("sss", account)) or True)
     return calls
 
 
@@ -243,7 +243,8 @@ def test_clear_order_password_targets_the_admin_credential(tmp_path, deleted):
     bridge = _bridge(tmp_path)
     bridge._config.phone_number = "13800000000"
 
-    assert bridge.clear_password("order") == {"ok": True}
+    result = bridge.clear_password("order")
+    assert result["ok"] is True and result["removed"] is True
 
     assert deleted == [("admin", "13800000000")]
 
@@ -252,7 +253,8 @@ def test_clear_sss_password_targets_the_sss_credential(tmp_path, deleted):
     bridge = _bridge(tmp_path)
     bridge._config.sss_account = "sss-user"
 
-    assert bridge.clear_password("sss") == {"ok": True}
+    result = bridge.clear_password("sss")
+    assert result["ok"] is True and result["removed"] is True
 
     assert deleted == [("sss", "sss-user")], "必须删闪时送那一把，不能误删管理后台的"
 
@@ -279,16 +281,43 @@ def test_empty_account_never_touches_the_keychain(tmp_path, deleted):
     assert deleted == []
 
 
-def test_clear_password_always_reports_ok_and_logs_each_mode(tmp_path, deleted):
+def test_clear_password_reports_success_and_logs_each_mode(tmp_path, deleted):
     bridge = _bridge(tmp_path)
+    bridge._config.phone_number = "13800000000"
+    bridge._config.sss_account = "sss-user"
 
-    assert bridge.clear_password("order") == {"ok": True}
-    assert bridge.clear_password("sss") == {"ok": True}
+    order_result = bridge.clear_password("order")
+    sss_result = bridge.clear_password("sss")
+    assert order_result["ok"] is True and order_result["removed"] is True
+    assert sss_result["ok"] is True and sss_result["removed"] is True
 
     logs = [e["payload"]["msg"] for e in bridge.drain_events(0)["events"]
             if e["event"] == "log"]
     assert any(line == "已清除本机保存的密码" for line in logs)
     assert any(line == "已清除本机保存的闪时送密码" for line in logs)
+
+
+def test_clear_password_never_lies_when_the_keychain_fails(tmp_path, monkeypatch):
+    """密钥环拒绝删除时必须如实报错：显示"已清除"会让用户以为密码不存在了。"""
+    bridge = _bridge(tmp_path)
+    bridge._config.phone_number = "13800000000"
+    monkeypatch.setattr(bridge_module, "delete_password", lambda account: False)
+
+    result = bridge.clear_password("order")
+
+    assert result["ok"] is False and result["removed"] is False
+    assert "密钥环" in result["reason"] and result["next_action"]
+    logs = [e["payload"] for e in bridge.drain_events(0)["events"]
+            if e["event"] == "log"]
+    assert not any(line["msg"] == "已清除本机保存的密码" for line in logs)
+    assert any(line["level"] == "WARN" for line in logs)
+
+
+def test_clear_password_without_an_account_reports_nothing_to_delete(tmp_path, deleted):
+    bridge = _bridge(tmp_path)
+    result = bridge.clear_password("order")
+    assert result["ok"] is False and result["removed"] is False
+    assert "没有可清除" in result["reason"]
 
 
 # ----------------------------------------------------------------------

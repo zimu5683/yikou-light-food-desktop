@@ -137,19 +137,62 @@ class AdminApiClient:
         self.token = ""
         self.uniacid = ""
 
-    def login(self) -> None:
-        """账号密码登录，保存 token 与 uniacid。"""
+    def _warm_up(self) -> None:
+        """登录前先访问管理后台页面，让 WAF 下发它需要的 Cookie/挑战。
+
+        实测背景：直接 POST ``/channel/login`` 有时会被 WAF 以 HTTP 403 拒绝，
+        而先 GET 一次登录页让 WAF 建立会话后同一个 POST 就能成功。属于**只读打底**，
+        失败不影响后续登录（真正的原因由登录响应给出）。
+        """
         try:
-            resp = self.session.post(
+            self.session.get(self.origin + "/", timeout=self.timeout)
+        except requests.RequestException:
+            # 预热只是提高成功率，失败不阻断：登录请求自己会报错。
+            pass
+
+    def _reset_session(self) -> None:
+        """关掉旧 Session 并新建一个（WAF 403 后重试用）。
+
+        必须换 Session：被 WAF 拒绝的会话带着当时的挑战状态，在同一个 Session
+        上重试往往继续 403。
+        """
+        try:
+            self.session.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不影响新建
+            pass
+        self.session = requests.Session()
+        self.session.headers.update(_browser_headers(self.origin, admin=True))
+
+    def _post_login(self):
+        """发一次登录 POST；网络异常转成 :class:`ApiError`。"""
+        try:
+            return self.session.post(
                 self.origin + "/channel/login",
-                json={"username": self.username, "password": self.password, "remember": False},
+                json={"username": self.username, "password": self.password,
+                      "remember": False},
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
             raise ApiError(f"管理后台登录请求失败：{exc}") from exc
 
+    def login(self) -> None:
+        """账号密码登录，保存 token 与 uniacid。
+
+        先预热 WAF 再登录；遇到 HTTP 403 时**换一个新 Session 重新预热并重试一次**。
+        仍然 403 才提示改用浏览器备用模式 —— 备用模式必须继续保留，它是 WAF
+        变更时的兜底路径。
+        """
+        self._warm_up()
+        resp = self._post_login()
         if resp.status_code == 403:
-            raise ApiError("管理后台拒绝了纯接口登录（HTTP 403），请改用浏览器备用模式")
+            # 403 往往来自 WAF 的会话挑战：换 Session + 重新预热再试一次。
+            self._reset_session()
+            self._warm_up()
+            resp = self._post_login()
+
+        if resp.status_code == 403:
+            raise ApiError("管理后台拒绝了纯接口登录（HTTP 403，已换新会话重试过一次），"
+                           "请改用浏览器备用模式")
 
         try:
             payload = resp.json()

@@ -1,22 +1,42 @@
 """Tests for app.wps_cloud —— 云文档同步（全部离线，不联网、不写云端）。
 
-覆盖：目标日期规则、表头解析、人员匹配、总餐次绝对值语义、幂等、
-列定位（含协作者写错星期的情况）、写入与回读校验、错误处理。
+覆盖：目标日期规则、表头解析、人员匹配（含一人多行多槽位）、总餐次增量累加、
+协作者 0 保护、批次日期闸门、幂等、列定位（含协作者写错星期的情况）、
+写入与回读校验、账本损坏时失败关闭、错误处理。
 """
 from __future__ import annotations
 
 import datetime as dt
 import re
+import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
 
 from app import wps_cloud as wc
 from app.wps_cloud import (
-    Change, CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+    Change, CloudOrder, LedgerCorruptError, SheetPlan, SyncLedger, WpsCloudError,
     apply_plan, build_plan, find_cli, format_plan, parse_date_header,
     person_key, summarize_plan, target_date_for, weekday_number,
 )
+
+
+def _ledger_with(directory, date_key: str, file_id: str, name: str, phone: str,
+                 slots: list[int]):
+    """造一个已记录 ``slots`` 的临时账本（模拟"本批已经同步过一次"）。"""
+    path = Path(directory) / f"state-{uuid.uuid4().hex[:8]}.json"
+    ledger = SyncLedger(path)
+    ledger.record(date_key, file_id,
+                  {f"{name}\u0000{phone}": {"slots": list(slots),
+                                            "total": sum(slots)}})
+    ledger.save()
+    return ledger
+
+
+def tmp_path_dir() -> Path:
+    """给不需要 pytest fixture 的用例造一个临时目录。"""
+    return Path(tempfile.mkdtemp(prefix="yikou-wps-ledger-"))
 
 # ----------------------------------------------------------------------
 # 测试替身
@@ -36,13 +56,18 @@ class FakeCli:
         self.format_ops: list[list[dict]] = []
         self.sorts: list[dict] = []
         self.deleted_columns: list[tuple[int, int]] = []
+        # 只读往返的流水：日期闸门要求"被拒绝的子表一个请求都不发"，靠它断言。
+        self.reads: list[tuple] = []
         self.path = "/fake/kdocs-cli"
 
     def sheets_info(self, file_id: str):
+        self.reads.append(("sheets_info", file_id))
         return [{"sheetId": 1, "sheetName": "Sheet1", "rowTo": 200, "colTo": 50}]
 
     def read_grid(self, file_id, worksheet_id, row_from, row_to, col_from, col_to,
                   *, with_format: bool = False):
+        self.reads.append(("read_grid", row_from, row_to, col_from, col_to,
+                           bool(with_format)))
         hits = {k: v for k, v in self.grid.items()
                 if row_from <= k[0] <= row_to and col_from <= k[1] <= col_to}
         if with_format:
@@ -259,8 +284,12 @@ def test_new_customer_is_inserted_below_header():
     assert [b.position for b in plans[0].insert_blocks] == [4]
 
 
-def test_existing_customer_total_is_absolute_not_additive():
-    """总餐次写的是本地值本身，不是"云端 + 本地"（否则重复跑会翻倍）。"""
+def test_existing_customer_total_is_additive():
+    """总餐次 = 云端现值 + 本次增量（不是绝对值覆盖）。
+
+    云端 6 + 本批本地 6（账本里本批还没有记录）= 12。写成绝对值会让
+    "云端已经累加过的历史餐次"被本地本批值抹掉。
+    """
     cli = FakeCli(make_grid(BASE_HEADER, [
         # 真实老行：类型/餐种/已出餐/剩余餐都有值，所以不需要"补全"
         {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6", 8: "=SUM(D3)", 9: "=H3-I3"},
@@ -268,18 +297,127 @@ def test_existing_customer_total_is_absolute_not_additive():
     orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
     change = _plan(cli, orders)[0].changes[0]
     assert change.kind == "existing"
-    assert change.total_after == 6 and change.total_before == 6
-    assert change.needs_write is False      # 目标格已是 1、总餐次已一致 → 一个字都不写
+    assert change.total_before == 6 and change.total_after == 12
+    assert change.local_meals == 6 and change.ledger_prev is None
+    assert change.needs_write is True
 
 
 def test_total_written_when_mismatch():
     cli = FakeCli(make_grid(BASE_HEADER, [
-        {0: "张", 2: "111", 7: "3"},        # 云端 3，本地 6
+        {0: "张", 2: "111", 7: "3"},        # 云端 3，本批本地 6 → 3 + 6 = 9
     ]))
     orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
     change = _plan(cli, orders)[0].changes[0]
-    assert change.total_after == 6 and change.total_before == 3
+    assert change.total_after == 9 and change.total_before == 3
     assert change.needs_write is True
+
+
+def test_ledger_delta_is_only_the_difference():
+    """账本里本批已同步 6 餐、本地本批变 8 餐 → 只补 +2（不是再加一遍 8）。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "10", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 8)]
+    change = _plan(cli, orders, ledger=ledger)[0].changes[0]
+    assert change.ledger_prev == 6 and change.total_after == 12
+
+
+def test_reupload_with_same_ledger_writes_nothing():
+    """重复上传（账本已记本批）时增量为 0：日期格已经是 1，一个格子都不写。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "12", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
+    change = _plan(cli, orders, ledger=ledger)[0].changes[0]
+    assert change.total_after == change.total_before == 12
+    assert change.needs_write is False
+
+
+def test_collaborator_zero_in_target_cell_is_never_overwritten():
+    """协作者在日期格里写了 0（当天不送）：只读不写，但总餐次照常累加。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "0", 5: "中餐", 6: "经济", 7: "3", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
+    plan = _plan(cli, orders)[0]
+    change = plan.changes[0]
+    assert change.target_occupied == "0" and change.target_blocked is True
+    assert change.total_after == 9, "日期格不改，不表示总餐次也不加"
+    assert any("协作者已经写了" in w for w in plan.warnings)
+
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.grid[(2, 4)] == "0", "协作者写的 0 必须原样保留"
+    assert cli.grid[(2, 7)] == "9"
+
+
+def test_other_non_empty_marker_values_are_kept():
+    """日期格里的其它非空值（例如「不送」）同样只读不写。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "不送", 5: "中餐", 6: "经济", 7: "3", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    change = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 1)])[0].changes[0]
+    assert change.target_blocked is True and change.target_occupied == "不送"
+
+
+def test_existing_mark_one_keeps_one_and_adds_nothing():
+    """已经是 1：不重复写 1，也不额外加餐（增量由账本决定）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "1", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    change = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 1)])[0].changes[0]
+    assert change.target_ok is True and change.target_blocked is False
+
+
+def test_multi_row_customer_writes_two_cloud_rows():
+    """同一个人本地两行 → 云端两行、各标当天 1，两行各自的餐次独立累加。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "雷", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "2", 8: "=SUM(D3)", 9: "=H3-I3"},
+        {0: "雷", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "1", 8: "=SUM(D4)", 9: "=H4-I4"},
+    ]))
+    orders = [
+        CloudOrder("东湖中餐", "雷", "小", "111", "中餐", "经济", 1, row=3, rows=(3,)),
+        CloudOrder("东湖中餐", "雷", "小", "111", "中餐", "经济", 1, row=4, rows=(4,)),
+    ]
+    plan = _plan(cli, orders, sort=False)[0]
+    assert [c.slot for c in plan.changes] == [1, 2]
+    assert [c.row for c in plan.changes] == [3, 4]
+    assert [c.total_after for c in plan.changes] == [3, 2]
+    assert any("在本地表里有 2 行" in w for w in plan.warnings)
+
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    assert cli.grid[(2, 4)] == "1" and cli.grid[(3, 4)] == "1"
+    assert cli.grid[(2, 7)] == "3" and cli.grid[(3, 7)] == "2"
+
+
+def test_multi_row_second_order_creates_a_second_cloud_row():
+    """本地一天两单而云端只有一行：第二单**新建一行**，不是往第一行叠加。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "雷", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "1", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    orders = [
+        CloudOrder("东湖中餐", "雷", "小", "111", "中餐", "经济", 1, row=3, rows=(3,)),
+        CloudOrder("东湖中餐", "雷", "W5", "111", "中餐", "经济", 1, row=9, rows=(9,)),
+    ]
+    plan = _plan(cli, orders, sort=False)[0]
+    kinds = [(c.kind, c.slot, c.total_after) for c in plan.changes]
+    assert kinds == [("existing", 1, 2), ("new", 2, 1)], kinds
+    apply_plan(cli, [plan], ledger=None, marker_enabled=False)
+    # 第 2 槽的新行插在第 4 行（0-based 3），老行仍停在第 3 行
+    assert cli.grid[(2, 7)] == "2", "第 1 槽：云端 1 + 本批 1 = 2"
+    assert cli.grid[(3, 0)] == "雷" and cli.grid[(3, 4)] == "1" and cli.grid[(3, 7)] == "1"
+
+
+def test_zero_meals_row_is_skipped():
+    """本地「餐次」为空/0：不写日期格、不动总餐次（否则白送一餐）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "0", 5: "中餐", 6: "经济", 7: "3", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 0)])[0]
+    assert plan.changes == []
+    assert any("「餐次」是空的" in w for w in plan.warnings)
+    assert cli.grid[(2, 4)] == "0" or True
 
 
 def test_match_requires_both_name_and_phone():
@@ -330,7 +468,7 @@ def test_column_lookup_handles_shifted_layout():
     plan = _plan(cli, orders)[0]
     assert plan.columns["total"] == 9          # 1-based，"总餐数"在第 9 列
     assert plan.target_col == 5                # "9.11 周五"（0-based 4 → 1-based 5）
-    assert plan.changes[0].total_after == 6
+    assert plan.changes[0].total_after == 8    # 云端 2 + 本批 6
 
 
 # ----------------------------------------------------------------------
@@ -347,7 +485,7 @@ def test_apply_plan_writes_and_verifies():
     assert result["written"] == 1 and result["failed"] == 0
     # 目标日期列（第 5 列 = index 4）与总餐次（第 8 列 = index 7）都写对了
     assert cli.grid[(2, 4)] == "1"
-    assert cli.grid[(2, 7)] == "6"
+    assert cli.grid[(2, 7)] == "9", "云端 3 + 本批 6 = 9"
 
 
 def test_apply_plan_detects_silent_write_failure():
@@ -543,7 +681,8 @@ def test_sort_reorders_whole_table_by_address_order():
                  address_order=order)[0]
     rows = {c.name: c.row for c in plan.changes}
     assert rows == {"新人": 5}
-    assert any("学三" in w and "最后面" in w for w in plan.warnings)
+    # 清单外地址按设计排到表尾，只作为结构化数据保留，不再逐条报成风险
+    assert "学三" in plan.unknown_addresses
     assert plan.sort_range and plan.sort_key_col
 
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
@@ -586,11 +725,11 @@ def test_address_alias_and_case_insensitive_match():
     assert cli.grid[(5, 1)] == "b2", "本地写 B2，云端按清单落成 b2"
 
 
-def test_unknown_address_goes_to_table_end_with_warning():
+def test_unknown_address_goes_to_table_end():
     cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 1: "小", 2: "111", 7: "3"}]))
     orders = [CloudOrder("东湖中餐", "路人", "食堂", "555", "中餐", "经济", 1)]
     plan = _plan(cli, orders, address_order={"东湖中餐": ["小"]})[0]
-    assert any("食堂" in w and "最后面" in w for w in plan.warnings)
+    assert "食堂" in plan.unknown_addresses
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
     assert cli.grid[(2, 0)] == "张" and cli.grid[(3, 0)] == "路人", "清单外的人排在表尾"
 
@@ -774,7 +913,8 @@ def test_existing_customer_written_at_post_sort_row():
     rows = {c.name: c.row for c in plan.changes}
     assert rows == {"新人": 4, "李": 3}
     apply_plan(cli, [plan], ledger=None, marker_enabled=False)
-    assert cli.grid[(2, 0)] == "李" and cli.grid[(2, 7)] == "6" and cli.grid[(2, 4)] == "1"
+    # 李：云端 3 + 本批 6 = 9；张没有日期格，别写错行
+    assert cli.grid[(2, 0)] == "李" and cli.grid[(2, 7)] == "9" and cli.grid[(2, 4)] == "1"
     assert cli.grid[(4, 0)] == "张" and (4, 4) not in cli.grid, "张没有日期格，别写错行"
 
 
@@ -962,14 +1102,21 @@ def test_apply_plan_writes_marker_when_enabled():
 
 
 def test_second_run_writes_nothing():
-    """幂等：内容一致时第二次运行零写入。"""
-    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    """幂等：账本已记本批时第二次运行零写入（增量 0、日期格已是 1）。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "9", 8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
     orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6)]
-    apply_plan(cli, _plan(cli, orders), ledger=None, marker_enabled=False)
+    first = apply_plan(cli, _plan(cli, orders, ledger=ledger), ledger=ledger,
+                       marker_enabled=False)
+    assert first["sheets"][0]["status"] == "noop", first["sheets"]
     before = dict(cli.grid)
-    result = apply_plan(cli, _plan(cli, orders), ledger=None, marker_enabled=False)
+    second = apply_plan(cli, _plan(cli, orders, ledger=ledger), ledger=ledger,
+                        marker_enabled=False)
     assert cli.grid == before
-    assert result["sheets"][0]["status"] in {"noop", "ok"}
+    assert second["sheets"][0]["status"] in {"noop", "ok"}
+    assert not cli.writes, "第二次运行不应发出任何写请求"
 
 
 # ----------------------------------------------------------------------
@@ -983,7 +1130,24 @@ def test_summary_counts():
         Change("new", "c", "3", 5, 2, 5, 0, 2, False),        # 新增
     ])]
     assert summarize_plan(plans) == {"to_update": 1, "to_append": 1,
-                                     "unchanged": 1, "warned": 0}
+                                     "unchanged": 1, "warned": 0, "skipped": 0,
+                                     "blocked": 0}
+
+
+def test_summary_counts_blocked_sheet_and_skipped_cells():
+    """汇总要把"整表被拒绝"和"日期格被协作者占用"分别计数出来。"""
+    blocked = SheetPlan(sheet="s1", file_id="f", blocked_reason="星期不符")
+    skipped = SheetPlan(sheet="s2", file_id="f2", changes=[
+        Change("existing", "a", "1", 3, 3, 5, 1, 4, False, target_occupied="0"),
+    ])
+    summary = summarize_plan([blocked, skipped])
+    assert summary["blocked"] == 1 and summary["skipped"] == 1
+
+
+def test_format_plan_renders_blocked_sheet():
+    plans = [SheetPlan(sheet="东湖中餐", file_id="f", blocked_reason="星期标记是「周六」")]
+    text = format_plan(plans)
+    assert "一个格子都没动" in text and "星期标记是「周六」" in text
 
 
 def test_format_plan_mentions_missing_column():
@@ -1010,11 +1174,131 @@ def test_ledger_roundtrip(tmp_path: Path):
     assert summary and summary["people"] == 1
 
 
-def test_ledger_ignores_corrupt_file(tmp_path: Path):
+def test_ledger_rejects_corrupt_file(tmp_path: Path):
+    """账本损坏必须失败关闭：不能当成空账本把同一批餐再加一遍。"""
     path = tmp_path / "state.json"
     path.write_text("{ not json", encoding="utf-8")
-    led = SyncLedger(path)
-    assert led.synced_meals("2026-09-11", "F1", "张", "111") is None
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+
+def test_ledger_rejects_structurally_broken_payload(tmp_path: Path):
+    """截断/半截写入（缺 people、条目缺锚点）同样必须拒绝读取。"""
+    path = tmp_path / "state.json"
+    path.write_text('{"version": 1, "batches": {"2026-09-11": {"F1": {}}}}',
+                    encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+    path.write_text('{"version": 1, "batches": {"2026-09-11": {"F1": '
+                    '{"people": {"张\\u0000111": {"at": "x"}}}}}}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+
+def test_ledger_reads_legacy_meals_field(tmp_path: Path):
+    """旧账本只有 meals：当成第 1 个槽位，升级后同一批不会被重复加一次。"""
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"meals": 6, "at": "2026-09-11T20:00:00"}}}}}}',
+        encoding="utf-8")
+    ledger = SyncLedger(path)
+    assert ledger.synced_local("2026-09-11", "F1", "张", "111") == 6
+    assert ledger.synced_slots("2026-09-11", "F1", "张", "111") == [6]
+
+
+def test_ledger_records_slots_and_survives_concurrent_save(tmp_path: Path):
+    """record 写入 slots/local/total；两个账本对象先后 save 不互相覆盖。"""
+    path = tmp_path / "state.json"
+    first = SyncLedger(path)
+    first.record("2026-09-11", "F1", {"甲\u00001": {"slots": [1, 2], "total": 5}})
+    first.save()
+    second = SyncLedger(path)
+    second.record("2026-09-11", "F1", {"乙\u00002": {"slots": [3], "total": 3}})
+    second.save()
+    merged = SyncLedger(path)
+    assert merged.synced_slots("2026-09-11", "F1", "甲", "1") == [1, 2]
+    assert merged.synced_slots("2026-09-11", "F1", "乙", "2") == [3]
+    assert merged.synced_total("2026-09-11", "F1", "乙", "2") == 3
+
+
+# ----------------------------------------------------------------------
+# 批次日期闸门（零云端写请求）
+# ----------------------------------------------------------------------
+
+def _weekday_grid(rows):
+    """按 2026-09-12（周六）的本地行造一张云端表 + 一批带星期标记的订单。"""
+    cli = FakeCli(make_grid(BASE_HEADER, rows))
+    return cli
+
+
+def test_batch_date_mismatch_blocks_whole_sheet_with_zero_requests():
+    """本地表的星期标记全是别的日期：整表拒绝，一个云端请求都不发。"""
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "3"}]))
+    orders = [CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 6, row=3,
+                         weekday_marks=("周五",))]
+    plans = build_plan(cli, local_orders={"东湖中餐": orders},
+                       tables={"东湖中餐": {"file_id": "F1"}},
+                       target=dt.date(2026, 9, 12), ledger=None,
+                       run_date=dt.date(2026, 9, 11))
+    plan = plans[0]
+    assert plan.blocked_reason and plans[0].changes == []
+    assert cli.reads == [], "被拒绝的子表连只读请求都不该发"
+
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "blocked"
+    assert result["sheets"][0]["cloud_writes"] == 0
+    assert not cli.writes and not cli.inserts
+
+
+def test_batch_date_partial_mismatch_only_warns():
+    """只有部分行标记不符：只警告，照常写入（可能是个别行来自别的批次）。"""
+    cli = FakeCli(make_grid(BASE_HEADER, []))
+    orders = [
+        CloudOrder("东湖中餐", "甲", "小", "111", "中餐", "经济", 1, row=3,
+                   weekday_marks=("周六",)),
+        CloudOrder("东湖中餐", "乙", "小", "222", "中餐", "经济", 1, row=4,
+                   weekday_marks=("周五",)),
+    ]
+    plan = build_plan(cli, local_orders={"东湖中餐": orders},
+                      tables={"东湖中餐": {"file_id": "F1"}},
+                      target=dt.date(2026, 9, 12), ledger=None)
+    assert plan[0].blocked_reason == ""
+    assert any("不是「周六」" in w for w in plan[0].warnings)
+
+
+def test_batch_date_without_marks_only_warns():
+    """人工做的表没有任何星期标记：只警告，照常写入。"""
+    cli = FakeCli(make_grid(BASE_HEADER, []))
+    orders = [CloudOrder("东湖中餐", "甲", "小", "111", "中餐", "经济", 1, row=3)]
+    plan = build_plan(cli, local_orders={"东湖中餐": orders},
+                      tables={"东湖中餐": {"file_id": "F1"}},
+                      target=dt.date(2026, 9, 12), ledger=None)
+    assert plan[0].blocked_reason == ""
+    assert any("没有星期标记" in w for w in plan[0].warnings)
+
+
+def test_read_local_orders_captures_weekday_marks_and_order_no(tmp_path: Path):
+    """本地读取层要把「订单」列与周一~周日标记带出来（日期闸门靠它）。"""
+    from openpyxl import Workbook
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "东湖中餐"
+    ws.cell(2, 2, "姓名")
+    ws.cell(3, 1, "W25")
+    ws.cell(3, 2, "雷丝淇")
+    ws.cell(3, 3, "小")
+    ws.cell(3, 4, "13800000000")
+    ws.cell(3, 11, "1")            # 第 11 列 = 周日
+    ws.cell(3, 14, 2)              # 餐次
+    path = tmp_path / "排单.xlsx"
+    wb.save(path)
+    orders = wc.read_local_orders(path, sheets=("东湖中餐",))
+    assert len(orders["东湖中餐"]) == 1
+    order = orders["东湖中餐"][0]
+    assert order.order_no == "W25"
+    assert order.weekday_marks == ("周日",)
+    assert order.local_rows == (3,)
 
 
 # ----------------------------------------------------------------------

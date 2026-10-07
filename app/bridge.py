@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import copy
 import datetime as _dt
+import hashlib
 import json
 import os
 import secrets
@@ -45,6 +46,9 @@ from pathlib import Path as _Path
 from typing import Any
 
 from . import __version__
+from .api_client import SssApiClient
+from .operations import OperationCoordinator
+from .redact import redact
 from .automation import (
     BrowserNotFoundError,
     browser_description,
@@ -59,10 +63,21 @@ from .credentials import (delete_password, delete_sss_password, get_password,
 from .excel_templates import write_order_template, write_sss_template
 from .sss import expected_delivery_date, run_sss_job
 from .sss_import import ImportRefused, prepare_day_orders
+from .sss_journal import (UncertainJournalError, default_uncertain_path,
+                          platform_origin)
+from .sss_review import (SCAN_FAILED, pending_views, resolve_records as
+                         resolve_uncertain_records, start_review)
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
-from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError, apply_plan,
-                        build_plan, effective_tables, format_plan,
-                        read_local_orders, summarize_plan, target_date_for)
+from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError,
+                        apply_plan, build_plan, effective_tables, format_plan,
+                        read_local_orders, read_local_orders_from_bytes,
+                        summarize_plan, target_date_for)
+from .wps_journal import JournalError, SyncJournal, journal_path_for
+from .wps_preview import (PREVIEW_TTL_SECONDS, PreviewStore, canonical_plan,
+                          plan_fingerprint)
+from .wps_recovery import (recovery_status, recovery_status_error,
+                           resolve_pending_operation)
+from .wps_summary import execution_summary, planned_summary
 
 logger = logging.getLogger(__name__)
 
@@ -137,11 +152,18 @@ class Bridge:
         self._event_dropped_ranges: deque[tuple[int, int, int]] = deque()
         self._push_lock = threading.Lock()
         self._worker_lock = threading.Lock()
+        # 任务线程当前持有的操作占位（在 _finish_task/_task_error 里释放）。
+        self._worker_operation: Any = None
         self._update_checking = False
+        self._update_check_operation: Any = None
         self._pending_release: ReleaseInfo | None = None
         self._decision_seq = 0
         self._decisions: dict[str, _PendingInteraction] = {}
         self._interaction_timeout_s = DEFAULT_INTERACTION_TIMEOUT_S
+        # 一次性预览令牌表（10 分钟）：wps_upload 必须带 preview_id。
+        self._previews = PreviewStore(ttl_seconds=PREVIEW_TTL_SECONDS)
+        # 统一操作互斥：订单、闪时送、只读核对、WPS 预览/上传/授权/恢复、更新。
+        self._operations = OperationCoordinator()
 
     # ------------------------------------------------------------------
     # 事件通道：保留窗口 + 前端 cursor 拉取
@@ -308,8 +330,13 @@ class Bridge:
             }
 
     def log(self, message: str, level: str = "INFO") -> None:
-        """向前端推一条日志行（``event="log"``，含 ``ts``/``level``/``msg``）。"""
-        self._emit_event("log", {"ts": time.strftime("%H:%M:%S"), "level": level, "msg": message.rstrip()})
+        """向前端推一条日志行（``event="log"``，含 ``ts``/``level``/``msg``）。
+
+        出口统一脱敏（手机号 / ``password=…`` 形态的凭据 / Bearer 头）：
+        日志会被用户复制粘贴、也可能进入验收证据，不能成为泄露通道。
+        """
+        self._emit_event("log", {"ts": time.strftime("%H:%M:%S"), "level": level,
+                                 "msg": redact(message).rstrip()})
 
     def _set_status(self, state: str) -> None:
         self._status = state
@@ -391,6 +418,12 @@ class Bridge:
         """
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
+        operation, conflict = self._reserve(
+            "order", title="订单处理", next_action="等待订单处理结束后重试")
+        if conflict is not None:
+            return {"ok": False, "reason": "operation_conflict",
+                    "message": conflict["reason"], "fields": {},
+                    "next_action": conflict["next_action"]}
         fields: dict[str, dict[str, str]] = {}
         url = str(payload.get("url", "")).strip()
         phone = str(payload.get("phone", "")).strip()
@@ -421,21 +454,32 @@ class Bridge:
             fields["date"] = {"message": str(exc)}
         if fields:
             self._set_status("error")
+            self._operations.finish(operation, status="rejected",
+                                    reason="validation_failed")
             return {"ok": False, "fields": fields}
 
         # 就地更新已加载配置并保存，避免用「全默认值新对象」覆盖另一半模式
         # （跑一次订单任务就把闪时送配置重置成默认值的同源问题）。
-        _apply_order_payload(self._config, {
-            "url": url, "phone": phone, "excel": excel, "date": date_text,
-            "count": count, "api_mode": bool(payload.get("api_mode", True)),
-        })
-        self._config.save()
-        if payload.get("remember", True):
-            set_password(phone, password)
-        # 运行线程拿到配置快照，避免任务执行期间被后续防抖保存改写。
-        if self._launch("order", copy.deepcopy(self._config), count, password) is False:
-            return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
-        return {"ok": True}
+        # 从占位开始，任何一步失败（写盘、密钥链、起线程）都必须释放占位：
+        # 泄漏的占位会表现为"永久忙"，之后所有危险操作都被拒绝。
+        def _start() -> dict[str, Any]:
+            _apply_order_payload(self._config, {
+                "url": url, "phone": phone, "excel": excel, "date": date_text,
+                "count": count, "api_mode": bool(payload.get("api_mode", True)),
+            })
+            self._config.save()
+            if payload.get("remember", True):
+                set_password(phone, password)
+            # 运行线程拿到配置快照，避免任务执行期间被后续防抖保存改写。
+            self._worker_operation = operation
+            if self._launch("order", copy.deepcopy(self._config), count,
+                            password) is False:
+                return {"ok": False, "reason": "busy",
+                        "message": "已有任务正在运行，请先停止后再启动",
+                        "fields": {}}
+            return {"ok": True}
+
+        return self._guard_reserved(operation, _start, label="订单处理")
 
     def start_sss(self, payload: dict[str, Any]) -> dict[str, Any]:
         """校验闪时送表单并启动「闪时送下单」任务。
@@ -445,6 +489,12 @@ class Bridge:
         """
         if self.worker_alive():
             return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
+        operation, conflict = self._reserve(
+            "sss", title="闪时送下单", next_action="等待闪时送任务结束后重试")
+        if conflict is not None:
+            return {"ok": False, "reason": "operation_conflict",
+                    "message": conflict["reason"], "fields": {},
+                    "next_action": conflict["next_action"]}
         fields = {}
         url = str(payload.get("url", "")).strip()
         account = str(payload.get("account", "")).strip()
@@ -483,9 +533,35 @@ class Bridge:
                 fields["fixed_address_detail"] = {"message": "请输入详细地址"}
         if fields:
             self._set_status("error")
+            self._operations.finish(operation, status="rejected",
+                                    reason="validation_failed")
             return {"ok": False, "fields": fields}
 
         # 就地更新并保存：避免全新 AppConfig 把订单处理侧配置重置成默认。
+        # 同样走 _guard_reserved：写盘/密钥链/起线程失败都要释放占位。
+        def _start() -> dict[str, Any]:
+            return self._start_sss_locked(payload, password, operation)
+        return self._guard_reserved(operation, _start, label="闪时送下单")
+
+    def _start_sss_locked(self, payload: dict[str, Any], password: str,
+                          operation: Any) -> dict[str, Any]:
+        """``start_sss`` 占位成功之后的实际逻辑（含写配置与起线程）。
+
+        这里重新从 ``payload``/配置取值，而不是依赖 ``start_sss`` 的局部变量：
+        校验与启动被拆成两段（中间隔着占位管理），只有重新取值才能避免
+        "在另一段里引用了不存在的局部名"这类错误。
+        """
+        url = str(payload.get("url", "")).strip()
+        account = str(payload.get("account", "")).strip()
+        excel = str(payload.get("excel", "")).strip()
+        source = str(payload.get("order_source",
+                                 self._config.sss_order_source) or "").strip().lower()
+        order_source = "excel" if source == "excel" else "wps"
+        use_fixed_address = bool(payload.get("use_fixed_address", False))
+        fixed_lnt = str(payload.get("fixed_lnt", "")).strip()
+        fixed_lat = str(payload.get("fixed_lat", "")).strip()
+        fixed_area_code = str(payload.get("fixed_area_code", "")).strip()
+        fixed_address_detail = str(payload.get("fixed_address_detail", "")).strip()
         _apply_sss_payload(self._config, {
             "url": url, "account": account, "excel": excel,
             "order_source": order_source,
@@ -504,8 +580,10 @@ class Bridge:
         self._config.save()
         if payload.get("remember", True):
             set_sss_password(account, password)
+        self._worker_operation = operation
         if self._launch("sss", copy.deepcopy(self._config), None, password) is False:
-            return {"ok": False, "reason": "busy", "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
+            return {"ok": False, "reason": "busy",
+                    "message": "已有任务正在运行，请先停止后再启动", "fields": {}}
         return {"ok": True}
 
     # 表单防抖即时保存：只落盘本次改动，不做启动校验、不触发任务。
@@ -539,6 +617,21 @@ class Bridge:
         """
         if self.worker_alive():
             return {"ok": False, "reason": "已有任务正在运行，请先停止后再读取当天名单"}
+        # 只读入口也纳入统一协调器：它同样会消耗云端每日额度，并可能写留档 Excel
+        # （而留档文件正是闪时送下单的名单来源），与上传/下单并发会互相干扰。
+        operation, conflict = self._reserve(
+            "sss_day_orders", title="读取云端当天名单",
+            summary={"read_only": True, "cloud_write": False})
+        if conflict is not None:
+            conflict.update({"read_only": True, "cloud_write": False})
+            return conflict
+        try:
+            return self._sss_day_orders_impl()
+        finally:
+            self._operations.finish(operation, status="success")
+
+    def _sss_day_orders_impl(self) -> dict[str, Any]:
+        """``sss_day_orders`` 的实际实现（调用方已取占位）。"""
         try:
             day = prepare_day_orders(self._config,
                                      delivery_date=expected_delivery_date(),
@@ -566,11 +659,231 @@ class Bridge:
             self.log("留档 Excel 写入失败：" + str(summary["archive_error"]), "WARN")
         return {"ok": True, **summary}
 
+    # ------------------------------------------------------------------
+    # 闪时送：未决记录列表 / 只读核对 / 人工处置
+    #
+    # 这三个入口是"上一次下单结果未知"时的唯一出路：只读核对查站内订单并留
+    # 证据；人工处置只写本地日志，**永不写云端**、不创建订单。解除阻断后，
+    # 用户下一次主动点「开始下单」才会真正发单。
+    # ------------------------------------------------------------------
+    def _sss_journal_path(self) -> _Path:
+        """权威未决日志路径。
+
+        生产环境就是固定的用户数据目录（与 ``sss_journal.default_uncertain_path``
+        一致）；只在**显式指定了非默认配置文件**（测试/独立安装）时，才把状态
+        放在配置文件旁边，避免测试碰到真实用户的日志。
+
+        刻意**不**从网址/账号/名单来源/Excel 路径推导 —— 那些都是用户可改的
+        业务配置，一旦参与文件名，改一下配置就能换一个日志、看不到原来的未决记录。
+        """
+        explicit = str(getattr(self._config, "sss_uncertain_path", "") or "").strip()
+        if explicit:
+            return _Path(explicit).expanduser()
+        config_path = getattr(self._config, "config_path", None)
+        if config_path and _Path(config_path) != AppConfig.default_path():
+            return _Path(config_path).parent / "sss_uncertain.json"
+        return default_uncertain_path(self._config)
+
+    def _sss_scope(self) -> tuple[str, str, str]:
+        """本次运行的 ``(送达日, 账号, 平台 origin)``；网址非法时抛错。"""
+        account = str(self._config.sss_account or "")
+        origin = platform_origin(self._config)
+        return (expected_delivery_date().isoformat(), account, origin)
+
+    def sss_uncertain_records(self) -> dict[str, Any]:
+        """列出闪时送未决记录（脱敏）；日志损坏时明确报错而不是谎称"没有"。"""
+        journal_path = self._sss_journal_path()
+        try:
+            delivery_date, account, _origin = self._sss_scope()
+        except UncertainJournalError as exc:
+            return {"ok": False, "reason": str(exc), "records": [], "counts": {},
+                    "journal_unreadable": False, "next_action": "修正闪时送网址"}
+        try:
+            result = pending_views(journal_path, delivery_date=delivery_date,
+                                   account=account, origin=_origin)
+        except UncertainJournalError as exc:
+            # 关键：损坏时绝不能返回空列表伪装成"没有未决记录"。
+            self.log(f"[闪时送] 未决日志不可用：{exc}", "ERROR")
+            return {"ok": False, "reason": str(exc), "records": [], "counts": {},
+                    "journal_unreadable": True, "error_code": "journal_unreadable",
+                    "journal_path": str(journal_path),
+                    "next_action": "先人工核对站内订单并修复/移走该文件",
+                    "delivery_date": delivery_date, "account": account}
+        group_counts = result.get("group_counts") or {}
+        other = int(group_counts.get("other_scope", 0) or 0)
+        history = int(group_counts.get("history", 0) or 0)
+        hints: list[str] = []
+        if result["counts"].get("active"):
+            hints.append("先做「只读核对」或人工处置")
+        if other:
+            hints.append("其它范围仍有未决记录：切回原账号/原平台后再核对与处置"
+                         "（当前账号/网址下的核对结果不能用于它们）")
+        next_action = "；".join(hints)
+        result.update({
+            "delivery_date": delivery_date,
+            "account": account,
+            "origin": _origin,
+            "other_scope_count": other,
+            "history_count": history,
+            "next_action": next_action,
+        })
+        return result
+
+    def start_sss_review(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """闪时送**只读核对**：登录、查订单、保存核对快照。
+
+        只允许登录、查询订单、查询目标时间窗和保存核对快照；**严禁**创建订单
+        请求或自动补发（登录本身可能用 POST，"只读"指对远端订单没有写副作用）。
+
+        可靠匹配到的未决记录会被标记为本地已确认（因此本地文件会变），仍然缺失
+        或无法确认的记录只生成证据。本入口不会因为 ``remember`` 保存密码。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        if self.worker_alive():
+            return {"ok": False, "reason": "已有任务正在运行，请先停止后再核对",
+                    "records": [], "next_action": "停止当前任务"}
+        operation, conflict = self._reserve(
+            "sss_review", title="闪时送只读核对",
+            summary={"read_only": True, "cloud_write": False})
+        if conflict is not None:
+            conflict.update({"records": [], "cloud_write": False})
+            return conflict
+        try:
+            result = self._start_sss_review_impl(data)
+        except BaseException:
+            self._operations.finish(operation, status="error", reason="unexpected")
+            raise
+        status = "success" if result.get("ok") else "error"
+        self._operations.finish(operation, status=status,
+                                reason=str(result.get("reason") or ""))
+        return result
+
+    def _start_sss_review_impl(self, data: dict[str, Any]) -> dict[str, Any]:
+        """``start_sss_review`` 的实际实现（调用方已取占位）。"""
+        journal_path = self._sss_journal_path()
+        try:
+            delivery_date, account, _origin = self._sss_scope()
+        except UncertainJournalError as exc:
+            return {"ok": False, "reason": str(exc), "records": [],
+                    "next_action": "修正闪时送网址"}
+        if not account:
+            return {"ok": False, "reason": "尚未填写闪时送账号", "records": [],
+                    "next_action": "在「闪时送下单」里填写账号"}
+        password = str(data.get("password") or "").strip() or get_sss_password(account)
+        if not password:
+            return {"ok": False, "reason": "没有可用于只读核对的闪时送密码",
+                    "records": [], "next_action": "输入密码后重试（不会保存）"}
+        url = str(self._config.sss_url or "").strip()
+        try:
+            read_timeout = float(getattr(self._config, "sss_read_timeout_s", 20.0))
+        except (TypeError, ValueError):
+            read_timeout = 20.0
+        self.log("[闪时送] 开始只读核对：登录 → 查询订单 → 保存核对快照（不下单）")
+        client = None
+        try:
+            client = SssApiClient(url, account, password,
+                                  timeout=(5.0, max(1.0, min(120.0, read_timeout))),
+                                  pool_size=1)
+            captcha = client.fetch_captcha()
+            client.login(self._sss_captcha(captcha))
+            result = start_review(journal_path, delivery_date=delivery_date,
+                                  account=account, origin=_origin,
+                                  fetch_json=client.get_json,
+                                  log=lambda message: self.log(message))
+        except _InteractionCancelled as exc:
+            return {"ok": False, "reason": f"验证码输入已取消或超时：{exc}",
+                    "records": [], "next_action": "重新核对"}
+        except Exception as exc:  # noqa: BLE001 - 界面需要原样原因
+            self.log(f"[闪时送] 只读核对失败：{type(exc).__name__}: {exc}", "ERROR")
+            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}",
+                    "records": [], "next_action": "检查账号/验证码/网络后重试"}
+        finally:
+            if client is not None:
+                client.close()
+        self.log("[闪时送] 只读核对完成："
+                 f"站内已确认 {result.get('confirmed', 0)}、"
+                 f"站内没有 {result.get('missing', 0)}、"
+                 f"日期不符 {result.get('other_day', 0)}、"
+                 f"读取失败 {result.get('scan_failed', 0)}", "OK")
+        for item in result.get("results") or []:
+            if item.get("classification") == SCAN_FAILED:
+                self.log(f"[闪时送] ⚠ {item.get('name')}：{item.get('reason')}", "WARN")
+        return result
+
+    def sss_uncertain_resolve(self, payload: dict[str, Any] | None = None,
+                             **options: Any) -> dict[str, Any]:
+        """人工处置闪时送未决记录；**不会发送任何创建订单请求**。
+
+        ``payload`` 需要 ``decision``（``station_present`` / ``station_absent`` /
+        ``keep``）、``confirm``（与 decision 完全相同）、``record_ids``，以及
+        ``note``（``station_absent`` 至少 4 个字符）。
+        ``station_absent`` 还必须有新鲜的只读核对证据，且所选记录全部是
+        "站内确认没有"；解除后**下一次主动运行才会真正发单**。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        for key, value in options.items():
+            if value is not None:
+                data[key] = value
+        journal_path = self._sss_journal_path()
+        try:
+            delivery_date, account, origin = self._sss_scope()
+        except UncertainJournalError as exc:
+            return {"ok": False, "reason": str(exc), "cloud_write": False,
+                    "changed": False, "operations": []}
+        # 人工处置也纳入统一协调器：它与下单、只读核对、云同步上传互相排斥。
+        operation, conflict = self._reserve(
+            "sss_uncertain_resolve", title="闪时送未决处置",
+            summary={"record_count": len(data.get("record_ids") or []),
+                     "cloud_write": False})
+        if conflict is not None:
+            conflict.update({"cloud_write": False, "changed": False,
+                             "operations": []})
+            return conflict
+        try:
+            result = resolve_uncertain_records(
+                journal_path, delivery_date=delivery_date, account=account,
+                origin=origin,
+                decision=str(data.get("decision") or ""),
+                record_ids=data.get("record_ids") or [],
+                confirm=str(data.get("confirm") or ""),
+                note=str(data.get("note") or ""))
+        except UncertainJournalError as exc:
+            self.log(f"[闪时送] 人工处置失败：未决日志不可用：{exc}", "ERROR")
+            self._operations.finish(operation, status="blocked",
+                                    reason=str(exc)[:200],
+                                    next_action="fix_journal")
+            return {"ok": False, "status": "blocked", "code": "journal_unreadable",
+                    "reason": str(exc), "next_action": "先修复未决日志",
+                    "cloud_write": False, "changed": False, "operations": []}
+        except BaseException as exc:
+            self._operations.finish(operation, status="error",
+                                    reason=f"{type(exc).__name__}: {exc}")
+            raise
+        self._operations.finish(
+            operation, status="success" if result.get("ok") else "rejected",
+            reason=str(result.get("reason") or result.get("code") or "")[:200],
+            summary={"changed": bool(result.get("changed")),
+                     "reason_code": str(result.get("reason_code") or "")},
+            next_action=str(result.get("next_action") or ""))
+        if result.get("ok") and result.get("changed"):
+            self.log(f"[闪时送] 人工处置未决记录：{result.get('reason')}；"
+                     f"备注：{str(data.get('note') or '')[:60]}（未发送任何下单请求）",
+                     "WARN")
+        return result
+
     def _launch(self, mode: str, config: AppConfig, count: int | None, password: str) -> bool:
-        """启动 worker；已有任务时拒绝，返回 False（不覆盖在跑线程）。"""
+        """启动 worker；已有任务时拒绝，返回 False（不覆盖在跑线程）。
+
+        操作占位由调用方（``start_order``/``start_sss``）预先放进
+        ``self._worker_operation``，任务结束时由 ``_finish_task``/``_task_error``
+        释放；这里抢不到 worker 就把它按"被拒"结掉。
+        """
         with self._worker_lock:
             if self._worker is not None and self._worker.is_alive():
                 self.log("已有任务在运行，拒绝并发启动", "WARN")
+                operation, self._worker_operation = self._worker_operation, None
+                self._operations.finish(operation, status="rejected", reason="busy",
+                                        next_action="等待当前任务结束")
                 return False
             self._stop_event.clear()
             self._set_status("running")
@@ -652,6 +965,21 @@ class Bridge:
         partial = bool(result.get("partial"))
         self._cancel_pending_interactions("任务结束")
         self.log(message, "OK")
+        operation, self._worker_operation = self._worker_operation, None
+        if operation is not None:
+            # 如实透传业务状态（dry_run / preflight_ok / blocked_by_uncertain /
+            # no_orders / insufficient_balance …）：终结由 finish() 显式置
+            # active=False 决定，不再靠状态词表，所以任何业务词都能安全展示。
+            status = str(result.get("status") or "")
+            overall = status or ("partial" if partial
+                                 else "stopped" if stopped else "success")
+            self._operations.finish(
+                operation, status=overall,
+                reason=str(result.get("reason") or result.get("block_reason") or ""),
+                summary={"message": message, "created": result.get("created"),
+                         "processed": result.get("processed"),
+                         "uncertain_pending": result.get("uncertain_pending")},
+                next_action=str(result.get("next_action") or ""))
         self._worker = None
         self._set_status("partial" if partial else "stopped" if stopped else "success")
         self._emit_event("task:done", {
@@ -683,6 +1011,8 @@ class Bridge:
     def _task_error(self, message: str) -> None:
         self._cancel_pending_interactions("任务异常")
         self.log("错误: " + message, "ERROR")
+        operation, self._worker_operation = self._worker_operation, None
+        self._operations.finish(operation, status="error", reason=message)
         self._worker = None
         self._set_status("error")
         self._emit_event("task:error", {"message": message})
@@ -932,10 +1262,21 @@ class Bridge:
         return effective_tables(self._config)
 
     def save_wps_config(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """保存云文档同步的配置（沿用 AppConfig 的原子保存）。"""
+        """保存云文档同步的配置（沿用 AppConfig 的原子保存）。
+
+        关闭云同步（``enabled`` True→False）时**立刻作废**所有未使用的预览令牌：
+        否则用户在关闭期间一次上传都不调用，重新开启后旧 ``preview_id`` 仍能真的
+        写云端 —— 那是"关闭了还能写"的漏洞。
+        """
         cfg = self._config
+        was_enabled = bool(cfg.wps_enabled)
         if "enabled" in payload:
             cfg.wps_enabled = bool(payload.get("enabled"))
+            if was_enabled and not cfg.wps_enabled:
+                invalidated = self._previews.invalidate_all("preview_invalidated")
+                if invalidated:
+                    self.log(f"[云同步] 已关闭，作废 {invalidated} 份未使用的预览令牌",
+                             "WARN")
         if "test_mode" in payload:
             cfg.wps_test_mode = bool(payload.get("test_mode"))
         if "cli_path" in payload:
@@ -1062,130 +1403,772 @@ class Bridge:
         status["state_path"] = str(ledger.path)
         return status
 
-    def wps_preview(self) -> dict[str, Any]:
-        """只读云端，生成"会改谁、加几餐"的预览（不写云端、不动账本）。"""
+    # ------------------------------------------------------------------
+    # WPS：预览上下文 / 结构化计划 / 预览令牌
+    #
+    # 预览与上传**共用同一个上下文与同一套只读计划构建**：上传前重新构建一次
+    # 并与预览时保存的指纹逐字段比对，任何变化（本地文件、目标表、日期、
+    # 排序/标记配置）都在消费令牌与写入之前拒绝。这不是远端 CAS，
+    # 只能缩小"只读复核 → 首次写入"的窗口。
+    # ------------------------------------------------------------------
+    def _wps_context(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """当前云同步上下文的可哈希快照；失败时返回 ``(None, 拒绝结果)``。"""
         cfg = self._config
-        if not cfg.excel_path:
-            return {"ok": False, "reason": "请先在「订单处理」里选择排单表"}
         try:
             tables = self._wps_effective_tables()
         except WpsCloudError as exc:
-            return {"ok": False, "reason": str(exc)}
+            return None, self._wps_reject("wps_disabled", str(exc), "检查云同步配置",
+                                          status="rejected", proven_no_write=True)
         if not tables:
-            return {"ok": False, "reason": "测试模式未配置测试文件 id"}
+            return None, self._wps_reject(
+                "no_target_tables", "测试模式未配置测试文件 id（测试副本），拒绝读取与写入",
+                "先创建并配置测试副本", status="rejected", proven_no_write=True)
         target = target_date_for(start_hour=cfg.wps_target_hour_start,
                                  end_hour=cfg.wps_target_hour_end)
-        try:
-            cli = self._wps_cli()
-            if not cli.authenticated():
-                return {"ok": False, "reason": "尚未授权云文档，请先点击「去授权」"}
-            local = read_local_orders(cfg.excel_path, log=self.log)
-            plans = build_plan(cli, local_orders=local, tables=tables, target=target,
-                               ledger=SyncLedger(),
-                               marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
-                               run_date=_dt.date.today(),
-                               address_order=cfg.wps_address_order,
-                               sort_enabled=cfg.wps_sort_enabled,
-                               log=self.log)
-        except WpsCloudError as exc:
-            return {"ok": False, "reason": str(exc)}
-        except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        excel = str(cfg.excel_path) if cfg.excel_path else ""
+        return {
+            "enabled": bool(cfg.wps_enabled),
+            "test_mode": bool(cfg.wps_test_mode),
+            "excel_path": excel,
+            "target_date": target.isoformat(),
+            "run_date": _dt.date.today().isoformat(),
+            "tables": {sheet: str(conf.get("file_id", ""))
+                       for sheet, conf in sorted(tables.items())},
+            "marker_enabled": bool(cfg.wps_marker_enabled) and not bool(cfg.wps_test_mode),
+            "sort_enabled": bool(cfg.wps_sort_enabled),
+            "address_order": {sheet: list(order) for sheet, order in
+                              sorted((cfg.wps_address_order or {}).items())},
+            "cli_path": str(cfg.wps_cli_path or ""),
+        }, None
 
-        text = format_plan(plans)
-        for plan in plans:
-            for warning in plan.warnings:
-                self.log(f"[云同步预览] {plan.sheet}：{warning}", "WARN")
-        return {"ok": True, "target_date": target.isoformat(), "text": text,
-                "summary": summarize_plan(plans),
-                "test_mode": bool(cfg.wps_test_mode)}
+    @staticmethod
+    def _wps_context_changes(old: dict[str, Any],
+                             new: dict[str, Any]) -> list[str]:
+        return sorted(
+            key for key in set(old or {}) | set(new or {})
+            if (old or {}).get(key) != (new or {}).get(key))
 
-    def wps_upload(self) -> dict[str, Any]:
-        """真正写云端。同步执行（写入量很小），完成后返回结果。"""
+    def _wps_string_tables(self, tables: Any) -> dict[str, dict[str, str]]:
+        return {str(sheet): {"file_id": str(conf.get("file_id", ""))}
+                for sheet, conf in (tables or {}).items()}
+
+    def _wps_structured_tables(self, plans: list[Any]) -> list[dict[str, Any]]:
+        """把计划转成前端可直接渲染的逐表结构，并补每表统计。"""
+        tables = canonical_plan(plans)
+        for table in tables:
+            changes = table.get("changes") or []
+            counts = {"to_update": 0, "to_append": 0, "unchanged": 0,
+                      "skipped": 0, "warned": len(table.get("warnings") or []),
+                      "blocked": 1 if table.get("blocked_reason") else 0}
+            for change in changes:
+                if change.get("target_blocked"):
+                    counts["skipped"] += 1
+                elif str(change.get("kind") or "") == "new":
+                    counts["to_append"] += 1
+                elif change.get("needs_write"):
+                    counts["to_update"] += 1
+                else:
+                    counts["unchanged"] += 1
+            table["counts"] = counts
+            table["sort"] = {
+                "enabled": bool(table.get("sort_enabled")),
+                "sort_range": table.get("sort_range") or "",
+                "sort_key_col": table.get("sort_key_col") or 0,
+                "row_keys_count": len(table.get("row_keys") or []),
+                "unknown_addresses": table.get("unknown_addresses") or [],
+            }
+        return tables
+
+    @staticmethod
+    def _wps_blocked_list(tables: list[dict[str, Any]]) -> list[dict[str, str]]:
+        return [{"sheet": str(item.get("sheet") or ""),
+                 "reason": str(item.get("blocked_reason") or "")}
+                for item in tables if item.get("blocked_reason")]
+
+    @staticmethod
+    def _wps_warning_list(tables: list[dict[str, Any]]) -> list[str]:
+        warnings: list[str] = []
+        for item in tables:
+            sheet = str(item.get("sheet") or "")
+            for warning in item.get("warnings") or []:
+                warnings.append(f"{sheet}：{warning}" if sheet else str(warning))
+        return warnings
+
+    def _wps_ledger_and_journal(self) -> tuple[SyncLedger, SyncJournal]:
+        """账本与意图日志（同目录）。
+
+        两者都可能抛错，**都必须由调用方转成结构化拒绝**（不能抛给前端）：
+
+        * 账本损坏 → :class:`app.wps_cloud.LedgerCorruptError`；
+        * 意图日志损坏/版本不支持 → :class:`app.wps_journal.JournalError`。
+
+        路径跟着**配置文件所在目录**走：生产环境就是用户配置目录（与
+        ``wps_cloud.default_state_path`` 一致），测试注入临时配置文件时
+        状态也落在临时目录里，不会碰到真实用户的账本。
+        """
+        config_path = getattr(self._config, "config_path", None)
+        state_path = None
+        if config_path:
+            state_path = _Path(config_path).parent / "wps_sync_state.json"
+        ledger = SyncLedger(state_path)
+        return ledger, SyncJournal(journal_path_for(ledger.path))
+
+    @staticmethod
+    def _local_state_error(exc: BaseException) -> str:
+        """把本地状态异常归一成"哪一类不可用"，便于给出修复指引。"""
+        name = type(exc).__name__
+        if name in ("JournalError", "JournalCorruptError"):
+            return "意图日志"
+        if name == "LedgerCorruptError":
+            return "同步账本"
+        return "本地状态"
+
+    def _read_local_bytes(self, *, preview_id: str = ""
+                          ) -> tuple[bytes, str] | tuple[dict[str, Any], None]:
+        """读取本地排单表的**整份字节**并返回 ``(data, sha256)``。
+
+        失败时返回一个结构化拒绝结果（而不是抛异常）；它由调用方直接返回。
+        之所以整份读进内存：本项目的排单表只有几十 KB，而"哈希与解析必须同源"
+        比省这点内存重要得多。
+        """
         cfg = self._config
         if not cfg.excel_path:
-            return {"ok": False, "reason": "请先在「订单处理」里选择排单表"}
+            return self._wps_reject("no_local_file", "请先在「订单处理」里选择排单表",
+                                    "选择排单表后重新预览", status="rejected",
+                                    preview_id=preview_id, proven_no_write=True), None
+        try:
+            data = _Path(cfg.excel_path).read_bytes()
+        except OSError as exc:
+            if preview_id:
+                self._previews.invalidate(preview_id, "preview_changed")
+            return self._wps_reject(
+                "local_file_unreadable", f"本地排单表不可读：{exc}",
+                "确认文件存在且未被占用后重新预览", status="failed",
+                preview_id=preview_id, proven_no_write=True), None
+        return data, hashlib.sha256(data).hexdigest()
+
+    def _wps_build_plans(self, context: dict[str, Any],
+                         data: bytes | None = None
+                         ) -> tuple[list[Any] | None, dict[str, Any] | None]:
+        """只读构建计划；失败返回 ``(None, 拒绝结果)``。
+
+        本地状态（账本、意图日志）不可用一律 ``local_state_blocked`` ——
+        没有可信的幂等锚点就绝不能写云端，否则会把同一批餐重复累加。
+        """
+        cfg = self._config
         try:
             tables = self._wps_effective_tables()
         except WpsCloudError as exc:
-            return {"ok": False, "reason": str(exc)}
-        if not tables:
-            return {"ok": False, "reason": "测试模式未配置测试文件 id"}
-        target = target_date_for(start_hour=cfg.wps_target_hour_start,
-                                 end_hour=cfg.wps_target_hour_end)
-        self._set_status("updating")
+            return None, self._wps_reject("wps_disabled", str(exc),
+                                          "检查云同步配置", status="rejected",
+                                          proven_no_write=True)
+        try:
+            ledger, _journal = self._wps_ledger_and_journal()
+        except Exception as exc:  # noqa: BLE001 - 账本/日志损坏都要转成拒绝
+            self.log(f"[云同步] 本地状态不可用：{type(exc).__name__}: {exc}", "ERROR")
+            return None, self._wps_reject(
+                "local_state_blocked",
+                f"本地{self._local_state_error(exc)}不可用：{exc}",
+                "先修复（或移走）该文件后重新预览", status="blocked",
+                proven_no_write=True)
         try:
             cli = self._wps_cli()
             if not cli.authenticated():
-                self._set_status("ready")
-                return {"ok": False, "reason": "尚未授权云文档，请先点击「去授权」"}
-            local = read_local_orders(cfg.excel_path, log=self.log)
-            if not any(local.values()):
-                self._set_status("ready")
-                return {"ok": False, "reason": "本地排单表里没有可同步的订单"}
-            ledger = SyncLedger()
-            plans = build_plan(cli, local_orders=local, tables=tables, target=target,
-                               ledger=ledger,
-                               marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
-                               run_date=_dt.date.today(),
-                               address_order=cfg.wps_address_order,
-                               sort_enabled=cfg.wps_sort_enabled,
-                               log=self.log)
-            self.log(f"[云同步] 目标日期 {target.isoformat()}，"
-                     f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}"
-                     + ("；按地址顺序重排整表" if cfg.wps_sort_enabled else "；已关闭排序"))
-            if not any(p.target_col for p in plans):
-                self.log("[云同步] 所有表都没有找到目标日期列，未写入任何内容", "WARN")
-            result = apply_plan(cli, plans, ledger=ledger,
-                                marker_enabled=cfg.wps_marker_enabled and not cfg.wps_test_mode,
-                                log=self.log)
-            summary = summarize_plan(plans)
-            for plan in plans:
-                for warning in plan.warnings:
-                    self.log(f"[云同步] {plan.sheet}：{warning}", "WARN")
-            # 逐表列出成功/失败，避免"完成 N 人"掩盖部分失败。
-            for item in result["sheets"]:
-                status = item.get("status")
-                if status == "ok":
-                    detail = item.get("reason") or f"{item.get('people', 0)} 人"
-                    self.log(f"[云同步] ✔ {item['sheet']}：{detail}", "OK")
-                    if item.get("sort_skipped"):
-                        # 排序被跳过时新客户没有按地址归位，必须在日志里点名，
-                        # 否则只会在预览里表现为一行小字（用户曾因此以为"排序失效"）。
-                        self.log(f"[云同步] ⚠ {item['sheet']}：{item['sort_skipped']}", "WARN")
-                elif status == "verify_failed":
-                    self.log(f"[云同步] ✘ {item['sheet']}：写入后回读校验未通过"
-                             f"（{'; '.join(item.get('problems', [])[:3])}）", "ERROR")
-                elif status == "failed":
-                    self.log(f"[云同步] ✘ {item['sheet']}：{item.get('reason', '写入失败')}", "ERROR")
-                elif status == "skipped":
-                    # 协作者还没加当天的列属于正常状态，用 INFO 而非 WARN。
-                    self.log(f"[云同步] — {item['sheet']}：{item.get('reason', '跳过')}")
-                if item.get("sort_mismatch"):
-                    self.log(f"[云同步] {item['sheet']}：云端实际排序位置与预测略有出入，"
-                             f"已按实际行号写入（数据无误）", "WARN")
-            level = "OK" if result["failed"] == 0 else "ERROR"
-            self.log(f"[云同步] 完成：更新 {summary['to_update']} 人、新增 {summary['to_append']} 人、"
-                     f"已完成 {summary['unchanged']} 人"
-                     + (f"、注意 {summary['warned']} 项" if summary["warned"] else "")
-                     + f"；成功 {result['written']} 张表，失败 {result['failed']} 张", level)
-            self._set_status("ready")
-            failed = [item["sheet"] for item in result["sheets"]
-                      if item.get("status") in ("failed", "verify_failed")]
-            return {"ok": result["failed"] == 0, "target_date": target.isoformat(),
-                    "summary": summary, "result": result,
-                    "text": format_plan(plans),
-                    "failed_sheets": failed,
-                    "reason": (f"以下表写入失败：{'、'.join(failed)}，详见日志" if failed else None),
-                    "test_mode": bool(cfg.wps_test_mode)}
+                return None, self._wps_reject(
+                    "wps_unauthorized", "尚未授权云文档，请先点击「去授权」",
+                    "完成云文档授权后重新预览", status="rejected",
+                    proven_no_write=True)
+            # data 非空时用**同一份字节**解析：哈希与解析必须来自同一次读取，
+            # 否则"哈希校验通过"的计划可能来自另一个版本的文件。
+            local = (read_local_orders_from_bytes(data, log=self.log)
+                     if data is not None
+                     else read_local_orders(cfg.excel_path, log=self.log))
+            plans = build_plan(
+                cli, local_orders=local, tables=tables,
+                target=_dt.date.fromisoformat(context["target_date"]),
+                ledger=ledger,
+                marker_enabled=bool(context["marker_enabled"]),
+                run_date=_dt.date.today(),
+                address_order=cfg.wps_address_order,
+                sort_enabled=bool(context["sort_enabled"]),
+                log=self.log)
         except WpsCloudError as exc:
-            self._set_status("ready")
             self.log(f"[云同步] 失败：{exc}", "ERROR")
-            return {"ok": False, "reason": str(exc)}
-        except Exception as exc:  # noqa: BLE001
-            self._set_status("ready")
+            return None, self._wps_reject("plan_failed", str(exc),
+                                          "检查云端状态/授权后重新预览",
+                                          status="failed", proven_no_write=True)
+        except Exception as exc:  # noqa: BLE001 - 不能把异常抛给前端
             self.log(f"[云同步] 异常：{type(exc).__name__}: {exc}", "ERROR")
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+            return None, self._wps_reject("unexpected", f"{type(exc).__name__}: {exc}",
+                                          "查看日志后重试", status="failed",
+                                          proven_no_write=True)
+        return list(plans), None
+
+    # ------------------------------------------------------------------
+    # 统一操作互斥
+    #
+    # 冲突**立即返回**（不排队、不等待）：占位只覆盖内存状态，绝不包住云端
+    # 往返或下载，因此不存在"持锁再请求持锁"的嵌套死锁。
+    # ------------------------------------------------------------------
+    def _reserve(self, mode: str, *, title: str = "",
+                 summary: dict[str, Any] | None = None,
+                 phase: str = "", next_action: str = ""
+                 ) -> tuple[Any, dict[str, Any] | None]:
+        """尝试占用操作槽位；冲突时返回 (None, 拒绝结果)。"""
+        from .operations import mode_title
+        reservation = self._operations.try_reserve(
+            mode, summary={"title": title or mode_title(mode), **(summary or {})},
+            phase=phase, next_action=next_action or "等待当前操作结束后重试")
+        if not reservation.granted:
+            payload = self._operations.conflict_payload(
+                reservation.conflict or {}, action=title or mode_title(mode))
+            self.log(f"[操作互斥] {payload['reason']}", "WARN")
+            return None, payload
+        return reservation.operation, None
+
+    def _guard_reserved(self, operation: Any, work: Any, *,
+                        label: str, action: str = "") -> dict[str, Any]:
+        """执行一个已占位的动作，保证**任何异常都会释放占位**并返回结构化错误。
+
+        占位泄漏的后果不是崩溃，而是"永久忙"：后续所有危险操作都会被拒绝。
+        因此从 reserve 成功那一刻起，保存配置、写密钥链、起线程、启动授权……
+        每一步失败都必须走这里。
+        """
+        try:
+            result = work()
+        except Exception as exc:  # noqa: BLE001 - 界面需要结构化原因，不能抛崩
+            self.log(f"[操作互斥] {label}启动失败：{type(exc).__name__}: {exc}", "ERROR")
+            self._operations.finish(operation, status="error",
+                                    reason=f"{type(exc).__name__}: {exc}")
+            return {"ok": False, "reason": "internal_error",
+                    "message": f"{label}启动失败：{type(exc).__name__}: {exc}",
+                    "next_action": "查看日志后重试", "action": action or label}
+        if isinstance(result, dict) and result.get("ok") is False:
+            # 业务性失败：把占位状态写成实际结论，避免显示成"还在跑"。
+            if self._operations.is_active(operation):
+                self._operations.finish(
+                    operation, status=str(result.get("status") or "rejected"),
+                    reason=str(result.get("reason") or result.get("code") or "")[:200],
+                    next_action=str(result.get("next_action") or ""))
+        return result if isinstance(result, dict) else {"ok": True}
+
+    def operation_status(self, operation_id: str = "") -> dict[str, Any]:
+        """查询当前活动操作与最近一次结果（前端据此禁用按钮/显示进度）。"""
+        return self._operations.status(operation_id)
+
+    def _conflict_reject(self, conflict: dict[str, Any], *,
+                         preview_id: str = "",
+                         action: str = "") -> dict[str, Any]:
+        """把占位冲突转成 WPS 入口的拒绝结果（保留 ok/status/reason 与两种统计）。
+
+        冲突发生在**消费预览令牌与任何云端写入之前**，因此可以如实声明
+        ``proven_no_write``：这次调用一行都没写。
+        """
+        payload = self._wps_reject(
+            "operation_conflict", str(conflict.get("reason") or "已有其他操作正在进行"),
+            str(conflict.get("next_action") or "等待当前操作结束后重试"),
+            status="rejected", preview_id=preview_id, proven_no_write=True,
+            action=action or "")
+        payload["conflicting_operation"] = conflict.get("conflicting_operation")
+        payload["operation_id"] = str(conflict.get("operation_id") or "")
+        return payload
+
+    def _wps_reject(self, code: str, reason: str, next_action: str = "", *,
+                    status: str = "rejected",
+                    summary: dict[str, Any] | None = None,
+                    preview_id: str = "",
+                    proven_no_write: bool = False,
+                    planned_summary: dict[str, Any] | None = None,
+                    execution_summary: dict[str, Any] | None = None,
+                    counts_source: str = "",
+                    **extra: Any) -> dict[str, Any]:
+        """WPS 预览/上传的统一失败结果。
+
+        默认按**最保守**口径返回执行摘要：``rows`` 全为 ``None``（无法证明）；
+        只有调用方明确知道"这次拒绝发生在任何云端写入之前"时才可传
+        ``proven_no_write=True``，把 ``rows`` 标成可证明的 0。
+        """
+        payload: dict[str, Any] = {
+            "ok": False,
+            "status": str(status),
+            "reason": redact(reason or code),
+            "code": str(code),
+            "next_action": str(next_action or ""),
+            "contract_version": 1,
+            "preview_id": str(preview_id or ""),
+            "summary": dict(summary or {"code": code}),
+            "planned_summary": planned_summary,
+            "execution_summary": (execution_summary if execution_summary is not None
+                                  else _execution_summary_default(
+                                      status=status, code=code,
+                                      next_action=next_action,
+                                      proven_no_write=proven_no_write,
+                                      counts_source=counts_source)),
+            "tables": [],
+            "blocked": [],
+            "warnings": [],
+            "text": "",
+        }
+        payload.update(extra)
+        return payload
+
+    def _preview_rejection(self, preview_id: str, code: str) -> dict[str, Any]:
+        if code == "preview_not_found":
+            reason = "预览不存在或已被清理，请重新预览"
+        elif code == "preview_expired":
+            reason = "预览已过期（超过 10 分钟），请重新预览"
+        elif code == "preview_consumed":
+            reason = "该预览已使用或已在处理中，不能重放，请重新预览"
+        elif code in ("preview_changed", "preview_invalidated"):
+            reason = "预览后内容或环境已变化，该预览已失效，请重新预览"
+        elif code == "missing_preview":
+            reason = "缺少 preview_id：无参上传已禁用，请先预览"
+        else:
+            reason = f"预览状态不可用（{code}），请重新预览"
+        return self._wps_reject(code, reason, "重新调用 wps_preview()",
+                                preview_id=preview_id, proven_no_write=True)
+
+    def wps_preview(self) -> dict[str, Any]:
+        """只读云端，生成结构化预览并发放 10 分钟一次性上传令牌。
+
+        不写云端、不动账本；成功结果的 ``preview_id`` 必须原样传给
+        :meth:`wps_upload`。``planned_summary`` 是**计划**口径，
+        ``execution_summary`` 此时只表示"尚未执行"。
+        """
+        cfg = self._config
+        if not cfg.wps_enabled:
+            return self._wps_reject(
+                "wps_disabled", "云文档同步已关闭，已拒绝预览，未读取也未写入任何云端内容",
+                "在「云文档同步」中开启后再试", status="rejected",
+                proven_no_write=True)
+        if not cfg.excel_path:
+            return self._wps_reject("no_local_file", "请先在「订单处理」里选择排单表",
+                                    "选择排单表后重新预览", status="rejected",
+                                    proven_no_write=True)
+        operation, conflict = self._reserve("wps_preview", title="云文档预览")
+        if conflict is not None:
+            return self._conflict_reject(conflict, action="云文档预览")
+        try:
+            result = self._wps_preview_impl()
+        except BaseException:
+            # 意外异常也必须先释放占位，否则一次预览失败会把整个程序锁死。
+            self._operations.finish(operation, status="error", reason="unexpected")
+            raise
+        self._finish_wps_operation(operation, result)
+        return result
+
+    def _wps_preview_impl(self) -> dict[str, Any]:
+        """``wps_preview`` 的实际实现（调用方已取占位）。"""
+        cfg = self._config
+        context, error = self._wps_context()
+        if error is not None:
+            return error
+        assert context is not None
+        # 先读一次字节快照；后面算指纹与解析计划都用它（禁止混合快照）。
+        local_bytes, local_sha = self._read_local_bytes()
+        if isinstance(local_bytes, dict):        # 读取失败：已经是拒绝结果
+            return local_bytes
+        plans, error = self._wps_build_plans(context, data=local_bytes)
+        if error is not None:
+            return error
+        assert plans is not None
+        try:
+            for plan in plans:
+                for warning in (getattr(plan, "warnings", None) or []):
+                    self.log(f"[云同步预览] {plan.sheet}：{warning}", "WARN")
+            text = format_plan(plans)
+            stats = summarize_plan(plans)
+        except Exception as exc:  # noqa: BLE001
+            return self._wps_reject("preview_format_failed",
+                                    f"{type(exc).__name__}: {exc}",
+                                    "查看日志后重试", status="failed",
+                                    proven_no_write=True)
+
+        tables = self._wps_structured_tables(plans)
+        blocked = self._wps_blocked_list(tables)
+        warnings = self._wps_warning_list(tables)
+        record = self._previews.create(
+            local_sha256=local_sha,
+            context=context,
+            context_fingerprint=plan_fingerprint([context]),
+            plan=tables,
+            plan_fingerprint=plan_fingerprint(plans),
+            summary=stats,
+            text=text,
+            tables=tables,
+            blocked=blocked,
+            warnings=warnings,
+            target_date=context["target_date"],
+            target_tables=self._wps_string_tables(self._wps_effective_tables()),
+        )
+        planned = planned_summary(plans, stats)
+        result: dict[str, Any] = {
+            "ok": True,
+            "status": "preview_ready",
+            "reason": "",
+            "code": "",
+            "next_action": "wps_upload(preview_id)",
+            "summary": stats,
+            "stats": stats,
+            "planned_summary": planned,
+            "execution_summary": execution_summary(
+                status="preview_ready", sheets=[], written=0, failed=0,
+                uncertain=False, next_action="wps_upload(preview_id)",
+                planned=planned, proven_no_write=True, executed=False),
+            "text": text,
+            "tables": tables,
+            "blocked": blocked,
+            "warnings": warnings,
+            "test_mode": bool(cfg.wps_test_mode),
+        }
+        result.update(self._previews.public(record))
+        return result
+
+    def wps_upload(self, preview_id: str = "") -> dict[str, Any]:
+        """真正写云端；必须传入 ``wps_preview()`` 返回的预览令牌。
+
+        执行前会重新只读构建计划并核对上下文与计划指纹；任何变化都在消费令牌
+        与写入之前拒绝。通过后消费令牌再 ``apply_plan``（带意图日志与恢复态）。
+        """
+        pid = str(preview_id or "").strip()
+        if not pid:
+            return self._wps_reject(
+                "missing_preview",
+                "无参上传已禁用：请先调用 wps_preview()，再传入 preview_id",
+                "重新预览并传入 preview_id", proven_no_write=True)
+        cfg = self._config
+        if not cfg.wps_enabled:
+            if pid:
+                # 作废手上这份旧令牌：重新开启后必须重新预览，不能拿旧 id 直接写。
+                self._previews.invalidate(pid, "preview_invalidated")
+            return self._wps_reject(
+                "wps_disabled", "云文档同步已关闭，已拒绝上传，未写入任何云端内容",
+                "在「云文档同步」中开启后重新预览", status="rejected",
+                preview_id=pid, proven_no_write=True)
+        if self.worker_alive():
+            return self._wps_reject(
+                "busy", "订单/闪时送任务正在运行，请先停止后再上传云文档",
+                "等待任务结束后重新上传", status="rejected", preview_id=pid,
+                proven_no_write=True)
+        operation, conflict = self._reserve("wps_upload",
+                                            title="云文档上传",
+                                            summary={"preview_id": pid})
+        if conflict is not None:
+            return self._conflict_reject(conflict, preview_id=pid,
+                                         action="云文档上传")
+        try:
+            result = self._wps_upload_impl(pid, operation)
+        except BaseException:
+            self._operations.finish(operation, status="error", reason="unexpected")
+            raise
+        self._finish_wps_operation(operation, result)
+        return result
+
+    def _finish_wps_operation(self, operation: Any, result: dict[str, Any]) -> None:
+        """按实际返回结果结束占位（状态如实反映这次调用，不一律写 success）。"""
+        if operation is None or not self._operations.is_active(operation):
+            return
+        allowed = {"success", "noop", "partial", "failed", "error", "rejected",
+                   "uncertain", "blocked", "not_started", "consumed",
+                   "preview_ready"}
+        raw = str(result.get("status") or "")
+        status = raw if raw in allowed else ("success" if result.get("ok") else "error")
+        self._operations.finish(
+            operation, status=status,
+            reason=str(result.get("code") or result.get("reason") or "")[:200],
+            summary={"ok": bool(result.get("ok")), "status": raw},
+            next_action=str(result.get("next_action") or "")[:200])
+
+    def _wps_upload_impl(self, pid: str, operation: Any) -> dict[str, Any]:
+        """``wps_upload`` 的实际实现（调用方已取占位）。"""
+        record, code = self._previews.get(pid)
+        if code:
+            return self._preview_rejection(pid, code)
+        assert record is not None
+        context, error = self._wps_context()
+        if error is not None:
+            self._previews.invalidate(pid, "preview_changed")
+            error["preview_id"] = pid
+            return error
+        assert context is not None
+        changed = self._wps_context_changes(record.context, context)
+        if changed:
+            self._previews.invalidate(pid, "preview_changed")
+            return self._wps_reject(
+                "preview_changed",
+                "预览后本地文件、目标表配置或日期上下文已变化，拒绝上传且未写入任何内容",
+                "重新调用 wps_preview()", preview_id=pid, proven_no_write=True,
+                changed=changed)
+        # 本地文件内容指纹：预览时算过一次，这里**必须重算**再比对，而且比对与
+        # 解析必须用**同一份字节**（先整份读进来）。
+        # 只比计划指纹不够 —— 改了不影响计划的内容（例如另一张无关子表、单元格格式、
+        # 或任何不会改变"要写什么"的编辑）不会被计划指纹发现，而用户的心智是
+        # "文件变了，预览就该作废"。
+        local_bytes, local_sha = self._read_local_bytes(preview_id=pid)
+        if isinstance(local_bytes, dict):        # 读取失败：已经是拒绝结果
+            return local_bytes
+        if record.local_sha256 and local_sha != record.local_sha256:
+            self._previews.invalidate(pid, "preview_changed")
+            self.log("[云同步] 本地排单表在预览后发生了变化，拒绝上传", "WARN")
+            return self._wps_reject(
+                "preview_changed",
+                "本地排单表在预览之后被修改过，拒绝上传且未写入任何内容",
+                "重新调用 wps_preview()", preview_id=pid,
+                proven_no_write=True,
+                changed=sorted(set(changed) | {"local_file"}))
+        plans, error = self._wps_build_plans(context, data=local_bytes)
+        if error is not None:
+            error.setdefault("preview_id", pid)
+            if error.get("code") == "local_state_blocked":
+                self._previews.invalidate(pid, "preview_changed")
+            return error
+        assert plans is not None
+        try:
+            fresh_tables = self._wps_structured_tables(plans)
+            fresh_fp = plan_fingerprint(plans)
+        except Exception as exc:  # noqa: BLE001
+            return self._wps_reject("unexpected", f"{type(exc).__name__}: {exc}",
+                                    "查看日志后重新预览", status="failed",
+                                    preview_id=pid,
+                                    counts_source="unknown_after_exception")
+        if fresh_fp != record.plan_fingerprint or fresh_tables != record.plan:
+            self._previews.invalidate(pid, "preview_changed")
+            return self._wps_reject(
+                "preview_changed",
+                "预览后云端计划已变化（有人改了表或本地表内容变了），拒绝上传且未写入任何内容",
+                "重新调用 wps_preview()", preview_id=pid, proven_no_write=True,
+                changed=sorted(set(changed) | {"plan"}))
+        consumed, consume_code = self._previews.consume(pid)
+        if consume_code:
+            return self._preview_rejection(pid, consume_code)
+        assert consumed is not None
+        return self._wps_apply_plan(plans, pid)
+
+    def _wps_apply_plan(self, plans: list[Any], preview_id: str) -> dict[str, Any]:
+        """消费令牌后的实际写入（已通过上下文与计划指纹校验）。"""
+        cfg = self._config
+        summary = summarize_plan(plans)
+        planned = planned_summary(plans, summary)
+        self._set_status("updating")
+        target_date = getattr(plans[0], "target_date", None) if plans else None
+        self.log(f"[云同步] 目标日期 "
+                 f"{target_date.isoformat() if target_date else '?'}，"
+                 f"{'测试模式（只写测试文件）' if cfg.wps_test_mode else '正式模式'}"
+                 + ("；按地址顺序重排整表" if cfg.wps_sort_enabled else "；已关闭排序"))
+        operation_id = ""
+        try:
+            ledger, journal = self._wps_ledger_and_journal()
+            cli = self._wps_cli()
+            result = apply_plan(
+                cli, plans, ledger=ledger,
+                marker_enabled=bool(cfg.wps_marker_enabled) and not bool(cfg.wps_test_mode),
+                log=self.log, journal=journal)
+            operation_id = str(result.get("operation_id") or "")
+        except (WpsCloudError, JournalError) as exc:
+            self.log(f"[云同步] 失败：{exc}", "ERROR")
+            self._set_status("ready")
+            blocked = type(exc).__name__ in ("LedgerCorruptError", "JournalError",
+                                            "JournalCorruptError")
+            return self._wps_reject(
+                "local_state_blocked" if blocked else "cloud_error", str(exc),
+                "先修复本地日志/账本后重新预览" if blocked
+                else "检查授权/云端状态后重新预览",
+                status="blocked" if blocked else "failed", preview_id=preview_id,
+                planned_summary=planned,
+                execution_summary=execution_summary(
+                    status="blocked" if blocked else "failed", sheets=[],
+                    written=0, failed=0, uncertain=None,
+                    next_action="fix_journal" if blocked else "repreview",
+                    planned=planned, executed=False),
+                summary_stats=summary)
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[云同步] 异常：{type(exc).__name__}: {exc}", "ERROR")
+            self._set_status("ready")
+            # 未捕获异常无法证明是否已写入：executed=False + 不宣称零写入。
+            return self._wps_reject(
+                "unexpected", f"{type(exc).__name__}: {exc}", "查看日志后重新预览",
+                status="failed", preview_id=preview_id, planned_summary=planned,
+                execution_summary=execution_summary(
+                    status="failed", sheets=[], written=0, failed=0,
+                    uncertain=None, next_action="manual_reconcile",
+                    planned=planned, executed=False),
+                counts_source="unknown_after_exception")
+
+        raw_sheets = result.get("sheets")
+        sheets = raw_sheets if isinstance(raw_sheets, list) else []
+        malformed = raw_sheets is not None and not isinstance(raw_sheets, list)
+        for item in sheets:
+            if not isinstance(item, dict):
+                continue
+            status = item.get("status")
+            if status == "ok":
+                self.log(f"[云同步] ✔ {item['sheet']}："
+                         f"{item.get('people', 0)} 行（{item.get('cells', 0)} 格）", "OK")
+                if item.get("sort_skipped"):
+                    self.log(f"[云同步] ⚠ {item['sheet']}：{item['sort_skipped']}", "WARN")
+                if item.get("ledger_error"):
+                    self.log(f"[云同步] ✘ {item['sheet']}：账本未记上"
+                             f"（{item['ledger_error']}），下次上传可能重复加餐", "ERROR")
+            elif status == "blocked":
+                self.log(f"[云同步] ⛔ {item['sheet']}：整表未写入（{item.get('reason')}）",
+                         "ERROR")
+            elif status == "stale_batch":
+                self.log(f"[云同步] ⛔ {item['sheet']}：拒绝写入（{item.get('reason')}）",
+                         "ERROR")
+            elif status in ("verify_failed",):
+                self.log(f"[云同步] ✘ {item['sheet']}：写入后回读校验未通过"
+                         f"（{'; '.join((item.get('problems') or [])[:3])}）", "ERROR")
+            elif status == "verify_unreadable":
+                self.log(f"[云同步] ⚠ {item['sheet']}：{item.get('reason')}", "WARN")
+            elif status == "failed":
+                self.log(f"[云同步] ✘ {item['sheet']}：{item.get('reason', '写入失败')}",
+                         "ERROR")
+            elif status == "skipped":
+                self.log(f"[云同步] — {item['sheet']}：{item.get('reason', '跳过')}")
+            elif status == "noop":
+                self.log(f"[云同步] — {item['sheet']}：本次无需改动")
+        # 用 .get 兜底：统计字典来自可被替换的实现，缺键不该把一次成功的上传
+        # 变成异常（日志行不值得让整个结果失败）。
+        planned_rows = int(summary.get("to_update", 0)) + int(summary.get("to_append", 0))
+        failed_sheets_count = int(result.get("failed", 0) or 0)
+        self.log(f"[云同步] 完成：计划改动 {planned_rows} 行，"
+                 f"成功 {result.get('written', 0)} 张表，失败 {failed_sheets_count} 张",
+                 "OK" if failed_sheets_count == 0 else "ERROR")
+        self._set_status("ready")
+
+        any_uncertain = any(bool(item.get("uncertain")) for item in sheets
+                            if isinstance(item, dict)) or bool(
+            result.get("journal_error"))
+        if not sheets and not malformed:
+            any_uncertain = None
+        if result["failed"] and not any_uncertain:
+            overall = "partial" if result["written"] else "failed"
+        elif any_uncertain:
+            overall = "uncertain"
+        else:
+            overall = "success"
+        next_action = ("manual_reconcile" if any_uncertain
+                       else "repreview" if result["failed"] else "none")
+        failed_sheets = [item["sheet"] for item in sheets
+                         if isinstance(item, dict)
+                         and item.get("status") not in ("ok", "noop")]
+        return {
+            "ok": failed_sheets_count == 0,
+            "status": overall,
+            "code": "",
+            "reason": ("" if failed_sheets_count == 0
+                       else f"以下表未完成：{'、'.join(failed_sheets)}，详见日志"),
+            "next_action": next_action,
+            "target_date": target_date.isoformat() if target_date else "",
+            "preview_id": preview_id,
+            "operation_id": operation_id,
+            "journal_path": str(result.get("journal_path") or ""),
+            "summary": summary,
+            "stats": summary,
+            "planned_summary": planned,
+            "execution_summary": execution_summary(
+                status=overall, sheets=sheets, written=result.get("written", 0),
+                failed=failed_sheets_count, uncertain=any_uncertain,
+                malformed=malformed, next_action=next_action, planned=planned,
+                # 执行器逐表给出证据后，才能真正声明"这次一个格子都没写"。
+                proven_no_write=bool(result.get("proven_no_write"))),
+            "result": result,
+            "text": format_plan(plans),
+            "tables": self._wps_structured_tables(plans),
+            "failed_sheets": failed_sheets,
+            "test_mode": bool(cfg.wps_test_mode),
+        }
+
+    # ------------------------------------------------------------------
+    # WPS：部分失败的只读恢复状态与人工处置
+    #
+    # 恢复入口**永不写云端**：它只重新只读核对云端并把结论写回本地日志。
+    # ``retire_guarded`` 只是让旧任务退出"待处理"，同日期 + 同云表的防重复
+    # 闸门仍然保留，必须靠实际云端核对（cloud_verified / cloud_untouched）
+    # 才能解除。
+    # ------------------------------------------------------------------
+    def wps_recovery_status(self) -> dict[str, Any]:
+        """只读 WPS 恢复查询：只读本地日志，不联网、不写任何文件。"""
+        try:
+            _ledger, journal = self._wps_ledger_and_journal()
+        except WpsCloudError as exc:
+            return recovery_status_error("wps_recovery_ledger_unreadable", str(exc))
+        except Exception as exc:  # noqa: BLE001
+            return recovery_status_error("wps_recovery_journal_unreadable", str(exc))
+        return recovery_status(journal=journal)
+
+    def wps_recovery_resolve(self, payload: dict[str, Any] | None = None,
+                             **options: Any) -> dict[str, Any]:
+        """人工处置未完成的云同步任务；**不会写云端**。
+
+        ``payload`` 需要 ``operation_id`` / ``decision`` / ``confirm``（与
+        decision 完全相同）/ ``note``（至少 4 字符），``retire_guarded`` 还要
+        ``confirm_structure_checked=True``。
+        ``cloud_verified`` / ``cloud_untouched`` 会重新只读核对云端，
+        证明不了就保持阻断。
+        """
+        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
+        if isinstance(payload, str) and payload.strip():
+            data.setdefault("operation_id", payload.strip())
+        for key, value in options.items():
+            if value is not None:
+                data[key] = value
+        try:
+            ledger, journal = self._wps_ledger_and_journal()
+        except WpsCloudError as exc:
+            return {"ok": False, "status": "blocked", "code": "ledger_unreadable",
+                    "reason": f"账本不可用：{exc}", "next_action": "fix_journal",
+                    "cloud_write": False, "changed": False, "operations": []}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "status": "blocked", "code": "journal_unreadable",
+                    "reason": f"意图日志不可用：{exc}", "next_action": "fix_journal",
+                    "cloud_write": False, "changed": False, "operations": []}
+        operation, conflict = self._reserve(
+            "wps_recovery_resolve", title="云同步恢复处置",
+            summary={"operation_ref": str(data.get("operation_id") or "")})
+        if conflict is not None:
+            conflict.update({"cloud_write": False, "changed": False, "operations": []})
+            return conflict
+        try:
+            result = self._wps_recovery_resolve_impl(data, ledger, journal)
+        except BaseException:
+            self._operations.finish(operation, status="error", reason="unexpected")
+            raise
+        status = "success" if result.get("ok") else "error"
+        self._operations.finish(operation, status=status,
+                                reason=str(result.get("reason") or ""))
+        return result
+
+    def _wps_recovery_resolve_impl(self, data: dict[str, Any], ledger: SyncLedger,
+                                   journal: SyncJournal) -> dict[str, Any]:
+        """``wps_recovery_resolve`` 的实际实现（调用方已取占位）。"""
+        decision = str(data.get("decision") or "")
+        cli = None
+        if decision in ("cloud_verified", "cloud_untouched"):
+            # 需要只读云端证明时才建 CLI：授权缺失时按"证不了"处理，不放行。
+            try:
+                cli = self._wps_cli()
+                if not cli.authenticated():
+                    return {"ok": False, "status": "rejected",
+                            "code": "wps_unauthorized",
+                            "reason": "尚未授权云文档，无法只读核对云端",
+                            "next_action": "完成云文档授权后重试",
+                            "cloud_write": False, "changed": False, "operations": []}
+            except WpsCloudError as exc:
+                return {"ok": False, "status": "rejected", "code": "wps_cli_missing",
+                        "reason": str(exc), "next_action": "修复 kdocs-cli 后重试",
+                        "cloud_write": False, "changed": False, "operations": []}
+        result = resolve_pending_operation(
+            str(data.get("operation_id") or ""), decision,
+            confirm=str(data.get("confirm") or ""),
+            note=str(data.get("note") or ""),
+            confirm_structure_checked=bool(data.get("confirm_structure_checked", False)),
+            ledger=ledger, journal=journal, cli=cli)
+        if result.get("ok"):
+            self.log(f"[云同步恢复] 处置 {data.get('operation_id')}："
+                     f"{result.get('reason_code') or result.get('status')}"
+                     f"（人工备注：{str(data.get('note') or '')[:60]}）", "WARN")
+        return result
 
     def wps_check_copies(self) -> dict[str, Any]:
         """核对"当前写入目标"与正式表是否结构一致（只读）。
@@ -1194,6 +2177,19 @@ class Bridge:
         副本就会过时，测试结果就不能代表线上真实情况。这个检查用来提前发现。
         """
         cfg = self._config
+        operation, conflict = self._reserve(
+            "wps_check_copies", title="副本一致性核对",
+            summary={"read_only": True, "cloud_write": False})
+        if conflict is not None:
+            conflict.update({"read_only": True})
+            return conflict
+        try:
+            return self._wps_check_copies_impl(cfg)
+        finally:
+            self._operations.finish(operation, status="success")
+
+    def _wps_check_copies_impl(self, cfg: AppConfig) -> dict[str, Any]:
+        """``wps_check_copies`` 的实际实现（调用方已取占位）。"""
         active = self._wps_effective_tables()
         production = cfg.wps_production_tables or {}
         try:
@@ -1295,10 +2291,16 @@ class Bridge:
             cli = self._wps_cli()
         except WpsCloudError as exc:
             return {"ok": False, "reason": str(exc)}
-        threading.Thread(target=self._wps_authorize_worker, args=(cli,), daemon=True).start()
+        operation, conflict = self._reserve(
+            "wps_authorize", title="云文档授权",
+            next_action="等待授权流程结束（浏览器确认后自动结束）")
+        if conflict is not None:
+            return conflict
+        threading.Thread(target=self._wps_authorize_worker, args=(cli, operation),
+                         daemon=True).start()
         return {"ok": True, "hint": "已启动授权，请按日志里的提示在浏览器中确认"}
 
-    def _wps_authorize_worker(self, cli: KdocsCli) -> None:
+    def _wps_authorize_worker(self, cli: KdocsCli, operation: Any = None) -> None:
         import subprocess
         try:
             proc = subprocess.run(cli.login_argv(), capture_output=True, text=True,
@@ -1314,35 +2316,66 @@ class Bridge:
         except Exception as exc:  # noqa: BLE001
             self.log(f"[云文档授权] 失败：{type(exc).__name__}: {exc}", "ERROR")
         finally:
+            self._operations.finish(operation, status="success")
             self._emit_event("wps:status", self.wps_status())
 
     def clear_password(self, mode: str = "order") -> dict[str, Any]:
         """删除本机密钥链里保存的密码。
 
         ``mode="sss"`` 删闪时送那把，**其余取值一律删管理后台那把**；账号为空时不调用
-        密钥链（没存过就没什么可删）。恒返回 ``{"ok": True}``。
+        密钥链（没存过就没什么可删）。
+
+        **如实报告结果**：密钥环不可用（例如 Linux 上没有 SecretService）或删除失败时
+        返回 ``ok=False`` 与原因，绝不能显示"已清除"却什么都没删 —— 用户会以为密码
+        已经不存在了。账号为空同理（没有可删的东西）。
         """
         if mode == "sss":
             account = self._config.sss_account.strip()
-            if account:
-                delete_sss_password(account)
-            self.log("已清除本机保存的闪时送密码")
+            label = "闪时送密码"
+            remove = delete_sss_password
         else:
             account = self._config.phone_number.strip()
-            if account:
-                delete_password(account)
-            self.log("已清除本机保存的密码")
-        return {"ok": True}
+            label = "密码"
+            remove = delete_password
+        if not account:
+            return {"ok": False, "removed": False,
+                    "reason": f"还没有填写账号，本机没有可清除的{label}",
+                    "next_action": "先填写账号再清除，或直接关闭窗口"}
+        if remove(account):
+            self.log(f"已清除本机保存的{label}")
+            return {"ok": True, "removed": True}
+        self.log(f"未能清除本机保存的{label}（系统密钥环不可用或本来就没保存过）", "WARN")
+        return {"ok": False, "removed": False,
+                "reason": f"系统密钥环拒绝或无法删除本机保存的{label}",
+                "next_action": "在系统密钥环里手动删除该条目，或检查密钥环服务是否可用"}
 
     def check_updates(self, manual: bool = False) -> dict[str, Any]:
         """启动更新检查（后台线程）。正在检查时返回 ``{"ok": False, "reason": "already_checking"}``。"""
         if self._update_checking:
             return {"ok": False, "reason": "already_checking"}
+        operation, conflict = self._reserve(
+            "check_update", title="检查更新", next_action="等待检查结束后重试")
+        if conflict is not None:
+            return {"ok": False, "reason": "operation_conflict",
+                    "message": conflict["reason"],
+                    "next_action": conflict["next_action"]}
         self._update_checking = True
+        self._update_check_operation = operation
         self._set_status("updating")
-        self.log("正在检查更新...")
-        threading.Thread(target=self._check_updates_worker, args=(bool(manual),), daemon=True).start()
-        return {"ok": True}
+
+        def _start() -> dict[str, Any]:
+            self.log("正在检查更新...")
+            threading.Thread(target=self._check_updates_worker,
+                             args=(bool(manual),), daemon=True).start()
+            return {"ok": True}
+
+        result = self._guard_reserved(operation, _start, label="检查更新")
+        if result.get("ok") is False:
+            # 线程没起来：把"正在检查"的标记与状态一起还原，别留下永久 busy。
+            self._update_checking = False
+            self._update_check_operation = None
+            self._set_status("ready")
+        return result
 
     def _check_updates_worker(self, manual: bool) -> None:
         try:
@@ -1366,17 +2399,28 @@ class Bridge:
             self._emit_event("update:error", {"message": str(exc)})
         finally:
             self._update_checking = False
+            operation, self._update_check_operation = getattr(
+                self, "_update_check_operation", None), None
+            self._operations.finish(operation, status="success")
 
     def install_update(self) -> dict[str, Any]:
         """安装已发现的更新；没有待安装版本时返回 ``{"ok": False, "reason": "no_release"}``。"""
         release = self._pending_release
         if release is None:
             return {"ok": False, "reason": "no_release"}
+        operation, conflict = self._reserve(
+            "install_update", title="安装更新",
+            next_action="更新安装完成后程序会自动重启")
+        if conflict is not None:
+            return {"ok": False, "reason": "operation_conflict",
+                    "message": conflict["reason"],
+                    "next_action": conflict["next_action"]}
         self.log(f"获取更新清单完成，正在下载版本 {release.version}...")
-        threading.Thread(target=self._install_update_worker, args=(release,), daemon=True).start()
+        threading.Thread(target=self._install_update_worker,
+                         args=(release, operation), daemon=True).start()
         return {"ok": True}
 
-    def _install_update_worker(self, release: ReleaseInfo) -> None:
+    def _install_update_worker(self, release: ReleaseInfo, operation: Any = None) -> None:
         try:
             download_and_install(
                 release,
@@ -1394,6 +2438,7 @@ class Bridge:
                 pass
         except Exception as exc:
             self._set_status("error")
+            self._operations.finish(operation, status="error", reason=str(exc))
             self._emit_event("update:install_error", {"message": str(exc)})
 
     def open_external(self, url: str) -> dict[str, Any]:
@@ -1547,6 +2592,17 @@ class Bridge:
 # ----------------------------------------------------------------------
 # 模块级工具
 # ----------------------------------------------------------------------
+def _execution_summary_default(*, status: str, code: str, next_action: str,
+                               proven_no_write: bool,
+                               counts_source: str = "") -> dict[str, Any]:
+    """拒绝路径的默认执行摘要：``proven_no_write`` 决定行数是否可证明为 0。"""
+    return execution_summary(
+        status=status, sheets=[], written=0, failed=0,
+        uncertain=None if not proven_no_write else False,
+        next_action=next_action or code, proven_no_write=proven_no_write,
+        executed=False, counts_source=counts_source)
+
+
 def _can_auto_install() -> bool:
     """Windows / Linux / macOS 打包版均支持自用自动更新。"""
     return (

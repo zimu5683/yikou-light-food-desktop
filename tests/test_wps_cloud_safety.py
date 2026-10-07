@@ -16,7 +16,7 @@ import datetime as dt
 
 import pytest
 
-from app.wps_cloud import (CloudOrder, SheetPlan, SyncLedger, WpsCloudError,
+from app.wps_cloud import (CloudOrder, SheetPlan, WpsCloudError,
                            _rollback_inserts, apply_plan, build_plan)
 
 BASE_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四",
@@ -361,24 +361,23 @@ def test_unexpected_exception_propagates_out_of_apply_plan(tmp_path):
 def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
     """README「任何失败都只写日志，不会影响本地排单任务」的**落点在这一层**。
 
-    ``wps_upload`` 末尾有 ``except Exception``，把任何异常转成
-    ``{"ok": False, "reason": "类型: 消息"}``，界面只会看到一条红色日志，
-    排单任务不会被云同步的意外错误带崩。
+    ``wps_upload`` 把任何异常转成 ``{"ok": False, "reason": "类型: 消息"}``，
+    界面只会看到一条红色日志，排单任务不会被云同步的意外错误带崩。
+    上传必须带一次性预览令牌，因此这里先预览再上传。
     """
     from app import bridge as bridge_module
     from app.bridge import Bridge
 
     bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._config.wps_enabled = True
     bridge._config.excel_path = tmp_path / "排单.xlsx"
     bridge._config.excel_path.write_bytes(b"x")
     monkeypatch.setattr(bridge_module, "effective_tables",
                         lambda _cfg: {"东湖中餐": {"file_id": "F1"}})
     monkeypatch.setattr(
-        bridge_module, "read_local_orders",
-        lambda path, log=None: {"东湖中餐": [
+        bridge_module, "read_local_orders_from_bytes",
+        lambda data, log=None: {"东湖中餐": [
             CloudOrder("东湖中餐", "某人", "小", "13800000000", "中餐", "经济", 6)]})
-    monkeypatch.setattr(bridge_module, "SyncLedger",
-                        lambda *a, **k: SyncLedger(tmp_path / "l.json"))
 
     class _Cli:
         path = "/fake/kdocs-cli"
@@ -387,15 +386,24 @@ def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
             return True
 
     monkeypatch.setattr(bridge, "_wps_cli", lambda: _Cli())
+    # 第一次调用（预览）返回空计划，之后（上传时的只读复核）抛意外异常。
+    calls = {"n": 0}
 
-    def boom(*_a, **_k):
+    def flaky_build_plan(*_a, **_k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
         raise KeyError("坏数据")
 
-    monkeypatch.setattr(bridge_module, "build_plan", boom)
+    monkeypatch.setattr(bridge_module, "build_plan", flaky_build_plan)
 
-    got = bridge.wps_upload()          # 不应抛
+    preview = bridge.wps_preview()
+    assert preview["ok"] is True
+
+    got = bridge.wps_upload(preview["preview_id"])   # 不应抛
 
     assert got["ok"] is False
     assert got["reason"] == "KeyError: '坏数据'"
     logs = [e["payload"] for e in bridge.drain_events(0)["events"] if e["event"] == "log"]
-    assert any(line["level"] == "ERROR" and "异常" in line["msg"] for line in logs)
+    assert any(line["level"] == "ERROR" and ("异常" in line["msg"] or "失败" in line["msg"])
+               for line in logs)

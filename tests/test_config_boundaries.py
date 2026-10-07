@@ -105,14 +105,55 @@ def test_order_date_is_also_trimmed():
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("given,expected", [
     (0, 1), (-5, 1), (1, 1), (4, 4), (20, 20), (99, 20),
-    (None, 4), ("abc", 4), ("7", 7),
+    (None, 8), ("abc", 8), ("7", 7),
 ])
 def test_sss_max_workers_is_clamped(given, expected):
     assert AppConfig(sss_max_workers=given).sss_max_workers == expected
 
 
+# ----------------------------------------------------------------------
+# 出厂默认值迁移：只改"仍是旧默认"的值，且只做一次
+# ----------------------------------------------------------------------
+
+def test_legacy_defaults_are_migrated_once():
+    """旧配置（缺 defaults_revision）里仍是旧出厂默认的值 → 迁移到新默认。"""
+    legacy = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
+                       defaults_revision=0)
+    assert legacy.sss_max_workers == 8
+    assert legacy.sss_read_timeout_s == 30.0
+    assert legacy.defaults_revision == 1
+
+
+def test_migration_keeps_user_chosen_values():
+    """用户显式改过的其它并发值必须原样保留（哪怕更保守）。"""
+    kept = AppConfig(sss_max_workers=3, sss_read_timeout_s=45.0,
+                     defaults_revision=0)
+    assert kept.sss_max_workers == 3
+    assert kept.sss_read_timeout_s == 45.0
+
+    already = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
+                        defaults_revision=1)
+    assert already.sss_max_workers == 4, "已迁移过的配置不能再被改动"
+    assert already.sss_read_timeout_s == 20.0
+
+
+def test_missing_revision_key_in_file_is_treated_as_legacy(tmp_path):
+    """磁盘上缺 defaults_revision 键 = 旧配置，加载时执行一次迁移。"""
+    import json
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"sss_max_workers": 4,
+                                "sss_read_timeout_s": 20.0}), encoding="utf-8")
+    loaded = AppConfig.load(path)
+    assert loaded.sss_max_workers == 8
+    assert loaded.sss_read_timeout_s == 30.0
+    loaded.save()
+    again = AppConfig.load(path)
+    assert again.defaults_revision == 1
+    assert again.sss_max_workers == 8
+
+
 @pytest.mark.parametrize("given,expected", [
-    (0, 1.0), (-3, 1.0), (20.0, 20.0), (500, 120.0), (None, 20.0), ("abc", 20.0),
+    (0, 1.0), (-3, 1.0), (20.0, 20.0), (500, 120.0), (None, 30.0), ("abc", 30.0),
 ])
 def test_sss_read_timeout_is_clamped(given, expected):
     assert AppConfig(sss_read_timeout_s=given).sss_read_timeout_s == expected

@@ -17,6 +17,19 @@ MIN_SPLIT_RATIO = 0.30
 MAX_SPLIT_RATIO = 0.55
 _CONFIG_SAVE_LOCK = threading.RLock()
 
+#: 出厂默认值迁移版本。
+#:
+#: * ``0``：旧配置（`config.json` 里没有 ``defaults_revision`` 这个键）；
+#: * ``1``：现行默认值（闪时送并发 8 路、读取超时 30 秒）。
+#:
+#: 迁移只做一次，而且**只在旧值仍等于旧出厂默认值时才改**：用户显式改过的
+#: 其它并发值必须原样保留（哪怕它比新默认更保守或更激进）。
+DEFAULTS_REVISION = 1
+_LEGACY_DEFAULT_SSS_MAX_WORKERS = 4
+_LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
+_DEFAULT_SSS_MAX_WORKERS = 8
+_DEFAULT_SSS_READ_TIMEOUT_S = 30.0
+
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
 # 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
 # 允许修改：协作者重建当月表后 file_id 会变，可在界面上更新。
@@ -218,9 +231,9 @@ class AppConfig:
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
     # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。
-    sss_max_workers: int = 4
+    sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
     # 闪时送 API 读取超时（秒）；与浏览器元素超时独立，慢响应不会误判失败。
-    sss_read_timeout_s: float = 20.0
+    sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S
     # 闪时送单均价（元）：>0 时只提示预计送完结算费用，不拦截下单。
     sss_unit_price: float = 1.9
     # 可选：平台若支持客户端幂等字段，填字段名（如 clientRequestId）后启用稳定 UUID。
@@ -249,6 +262,10 @@ class AppConfig:
     wps_sort_enabled: bool = True
     # {子表名: [地址, ...]}；空列表 = 该表按地址自然升序。
     wps_address_order: Dict[str, Any] = field(default_factory=default_wps_address_order)
+    # 权威未决日志路径；留空 = 固定的用户数据目录（不要从网址/账号推导）。
+    sss_uncertain_path: str = ""
+    # 出厂默认值迁移版本号（见模块顶部 DEFAULTS_REVISION）；旧配置缺键 = 0。
+    defaults_revision: int = DEFAULTS_REVISION
     config_path: Optional[str] = None
 
     def __init__(self, target_url: str = "https://m.icall.me/admin/#/login", phone_number: str = "",
@@ -275,8 +292,8 @@ class AppConfig:
                  sss_preflight: bool = False,
                  sss_store_id: int | None = None,
                  sss_store_name_cached: str = "",
-                 sss_max_workers: int = 4,
-                 sss_read_timeout_s: float = 20.0,
+                 sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS,
+                 sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S,
                  sss_unit_price: float = 1.9,
                  sss_idempotency_field: str = "",
                  wps_enabled: bool = False,
@@ -293,6 +310,8 @@ class AppConfig:
                  wps_marker_enabled: bool = True,
                  wps_sort_enabled: bool = True,
                  wps_address_order: Optional[Dict[str, Any]] = None,
+                 sss_uncertain_path: str = "",
+                 defaults_revision: int = DEFAULTS_REVISION,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
                  browser: Optional[str] = None) -> None:
@@ -341,13 +360,25 @@ class AppConfig:
         try:
             workers = int(sss_max_workers)
         except (TypeError, ValueError):
-            workers = 4
+            workers = _DEFAULT_SSS_MAX_WORKERS
         self.sss_max_workers = max(1, min(20, workers))
         try:
             read_timeout = float(sss_read_timeout_s)
         except (TypeError, ValueError):
-            read_timeout = 20.0
+            read_timeout = _DEFAULT_SSS_READ_TIMEOUT_S
         self.sss_read_timeout_s = max(1.0, min(120.0, read_timeout))
+        # ---- 出厂默认值一次性迁移（见 DEFAULTS_REVISION）----
+        try:
+            revision = int(defaults_revision)
+        except (TypeError, ValueError):
+            revision = 0
+        if revision < DEFAULTS_REVISION:
+            # 旧值仍等于旧出厂默认 → 迁移到新默认；用户改过的其它值一律保留。
+            if self.sss_max_workers == _LEGACY_DEFAULT_SSS_MAX_WORKERS:
+                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
+            if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
+                self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
+        self.defaults_revision = DEFAULTS_REVISION
         try:
             self.sss_unit_price = max(0.0, float(sss_unit_price))
         except (TypeError, ValueError):
@@ -376,6 +407,7 @@ class AppConfig:
         self.wps_marker_enabled = bool(wps_marker_enabled)
         self.wps_sort_enabled = bool(wps_sort_enabled)
         self.wps_address_order = normalize_wps_address_order(wps_address_order)
+        self.sss_uncertain_path = str(sss_uncertain_path or "").strip()
         self.config_path = config_path
         # Snapshot used by ``save`` to distinguish "this instance never touched
         # the field" from "another thread/process wrote a newer value".
@@ -430,6 +462,8 @@ class AppConfig:
             payload = json.loads(target.read_text(encoding="utf-8"))
             valid = {f.name for f in fields(cls)}
             values = {k: v for k, v in payload.items() if k in valid and k != "config_path"}
+            # 老配置里没有迁移版本号：按"旧版本"处理，让一次性迁移生效。
+            values.setdefault("defaults_revision", 0)
             config = cls(**values, config_path=str(target))
             config._last_seen_disk = dict(payload)
             return config

@@ -160,6 +160,9 @@ class OrderSearchNotFound(LookupError):
 BROWSER_DIR_NAME = "browser"
 BROWSER_DIR_ENV = "YIKOU_BROWSER_DIR"
 BROWSER_MANIFEST_NAME = "browser.json"
+# 内置目录里 Chromium 解包后的子目录名前缀（``chromium-<revision>``）。
+# 按 manifest 里的 revision 精确定位时用它拼 glob。
+CHROMIUM_DIR_PREFIX = "chromium-"
 # 内置目录里可执行文件的名字随 Playwright 版本变化，逐个探测；下面的 glob
 # 覆盖 ``browser/<name>-<revision>/chrome-<platform>/…`` 解包布局。
 _BROWSER_EXECUTABLE_NAMES = (
@@ -198,7 +201,13 @@ def bundled_browser_dir() -> Path:
 
 
 def find_bundled_browser() -> Path | None:
-    """在内置目录里定位 Chromium 可执行文件；缺失时返回 ``None``。"""
+    """在内置目录里定位 Chromium 可执行文件；缺失时返回 ``None``。
+
+    **优先按 ``browser.json`` 记的 revision 找**：本机解压安装、或更新器只补装缺失
+    目录时，新旧 revision 会并存，而目录名是**按字符串排序**的 —— ``chromium-1234``
+    排在 ``chromium-1243`` 前面，只看 glob 会一直用旧浏览器，尽管 manifest 里已经
+    写着新版本号。清单缺失或对应目录不在时才退回 glob 兜底。
+    """
     root = bundled_browser_dir()
     if not root.is_dir():
         return None
@@ -206,7 +215,14 @@ def find_bundled_browser() -> Path | None:
         direct = root / name
         if direct.is_file():
             return direct
-    for pattern in _BROWSER_EXECUTABLE_GLOBS:
+    revision = str(browser_manifest().get("revision") or "").strip()
+    patterns = _BROWSER_EXECUTABLE_GLOBS
+    if revision:
+        # 原来的 glob 以 ``*/`` 开头（对应 ``chromium-<revision>/``），
+        # 这里把那一层换成清单里的 revision：``chromium-1243/chrome-*/chrome``。
+        patterns = tuple(f"{CHROMIUM_DIR_PREFIX}{revision}/{pattern[2:]}"
+                         for pattern in _BROWSER_EXECUTABLE_GLOBS) + patterns
+    for pattern in patterns:
         for path in sorted(root.glob(pattern)):
             if path.is_file():
                 return path

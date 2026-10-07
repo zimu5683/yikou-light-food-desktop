@@ -125,3 +125,112 @@ def test_origin_from_url_rejects_urls_without_scheme_or_host(url):
 def test_origin_from_url_error_message_quotes_the_input():
     with pytest.raises(ValueError, match="无法从网址提取源"):
         origin_from_url("m.icall.me/x")
+
+
+# ----------------------------------------------------------------------
+# WAF 预热与 403 换新 Session 重试
+# ----------------------------------------------------------------------
+
+class _Resp:
+    def __init__(self, status_code=200, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("not json")
+        return self._payload
+
+
+class _Session:
+    """记录每个 Session 上的请求；可脚本化返回状态码序列。"""
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.headers = {}
+        self.calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    def get(self, url, **kwargs):
+        self.calls.append(("GET", url))
+        return _Resp(200, {})
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url))
+        status, payload = self.script.pop(0) if self.script else (200, {})
+        if status == "raise":
+            import requests
+            raise requests.ConnectionError("boom")
+        return _Resp(status, payload)
+
+    def close(self):
+        self.closed = True
+
+
+def _login_payload():
+    return {"code": 200, "data": {"token": "T", "uniacid": "U"}}
+
+
+def test_login_warms_up_before_posting(monkeypatch):
+    """登录前必须有一次只读 GET（让 WAF 建会话），然后再 POST。"""
+    from app import api_client
+
+    session = _Session([(200, _login_payload())])
+    client = api_client.AdminApiClient("https://admin.example.com/x", "u", "p")
+    client.session = session
+
+    client.login()
+
+    assert session.calls[0][0] == "GET", "先预热再登录"
+    assert session.calls[-1][0] == "POST"
+    assert client.token == "T" and client.uniacid == "U"
+
+
+def test_login_retries_once_after_403_with_a_new_session(monkeypatch):
+    """403 → 换新 Session + 重新预热 + 重试一次 → 成功。"""
+    from app import api_client
+
+    first = _Session([(403, {})])
+    second = _Session([(200, _login_payload())])
+    client = api_client.AdminApiClient("https://admin.example.com/x", "u", "p")
+    client.session = first
+    monkeypatch.setattr(api_client.requests, "Session", lambda: second)
+
+    client.login()
+
+    assert first.closed is True, "旧 Session 必须关掉（带着被拒的挑战状态）"
+    assert [call[0] for call in second.calls] == ["GET", "POST"], "新会话也要先预热"
+    assert client.token == "T"
+
+
+def test_login_still_403_after_retry_tells_the_user_to_use_the_browser(monkeypatch):
+    from app import api_client
+
+    first = _Session([(403, {})])
+    second = _Session([(403, {})])
+    client = api_client.AdminApiClient("https://admin.example.com/x", "u", "p")
+    client.session = first
+    monkeypatch.setattr(api_client.requests, "Session", lambda: second)
+
+    with pytest.raises(api_client.ApiError) as excinfo:
+        client.login()
+    assert "浏览器备用模式" in str(excinfo.value)
+    assert "重试过一次" in str(excinfo.value)
+
+
+def test_warmup_failure_does_not_block_login():
+    """预热失败（网络异常）不影响登录本身。"""
+    import requests
+
+    from app import api_client
+
+    class _BrokenWarmup(_Session):
+        def get(self, url, **kwargs):
+            raise requests.ConnectionError("warmup down")
+
+    session = _BrokenWarmup([(200, _login_payload())])
+    client = api_client.AdminApiClient("https://admin.example.com/x", "u", "p")
+    client.session = session
+    client.login()
+    assert client.token == "T"

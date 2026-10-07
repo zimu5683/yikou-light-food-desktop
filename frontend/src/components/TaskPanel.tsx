@@ -24,8 +24,20 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { DateField, Field, GhostButton, Stepper, TextInput } from '@/components/fields'
 import { useApp, type FieldErrors, type TaskMode } from '@/hooks/appContext'
-import { api, isApiReady, type OrderFormPayload, type SssFormPayload } from '@/lib/bridge'
+import {
+  api,
+  classifyOutcome,
+  isApiReady,
+  type OrderFormPayload,
+  type SssFormPayload,
+  type SssUncertainDecision,
+  type SssUncertainRecordView,
+  type SssUncertainResolveResult,
+  type SssUncertainReview,
+  type SssUncertainState,
+} from '@/lib/bridge'
 import { cn } from '@/lib/utils'
+import { canResolve as canResolveDecision, singleFlight } from '@/lib/interaction'
 import { modeError } from '@/lib/format'
 
 export function TaskPanel() {
@@ -241,7 +253,7 @@ function OrderForm() {
 /* ------------------------------------------------------------------ */
 
 function SssForm() {
-  const { config, passwords, startSss, workerAlive } = useApp()
+  const { config, passwords, startSss, workerAlive, operation, refreshOperation } = useApp()
   const [url, setUrl] = useState(config?.sss_url ?? '')
   const [account, setAccount] = useState(config?.sss_account ?? '')
   const [password, setPassword] = useState(passwords.sss ?? '')
@@ -453,6 +465,18 @@ function SssForm() {
           </span>
         </div>
       )}
+
+      <UncertainPanel
+        password={password}
+        workerAlive={workerAlive}
+        operationBlocked={Boolean(operation?.active)}
+        conflictText={
+          operation?.active
+            ? `当前正在执行：${operation.operation?.title ?? ''}`
+            : ''
+        }
+        onOperationChanged={refreshOperation}
+      />
 
       <Field label="商品名称" htmlFor="sss-product" helper="下单时商品“名称”的默认值">
         <TextInput
@@ -718,4 +742,336 @@ function useDebouncedSave(save: () => void, delay = 500): () => void {
   }, [cancel, delay])
   useEffect(() => cancel, [cancel])
   return trigger
+}
+
+
+/* ------------------------------------------------------------------ */
+/* 未决记录：只读核对 + 人工处置                                          */
+/*                                                                    */
+/* 闪时送接口没有客户端幂等键，"POST 已发出但结果未知"时重复提交会真的      */
+/* 多下一单。所以：                                                     */
+/*  * 只要还有 inflight/unresolved 记录，程序就拒绝再发下单请求；          */
+/*  * 这一块是唯一的出路 —— 只读核对（不下单）+ 人工处置（不发送创建订单请求）。*/
+/* ------------------------------------------------------------------ */
+
+const CLASSIFICATION_LABELS: Record<string, string> = {
+  station_confirmed: '站内已找到对应订单',
+  station_missing: '站内确认没有这一单',
+  station_found_other_day: '找到相似订单但日期不同',
+  scan_failed: '读取失败，无法判定',
+}
+
+function UncertainPanel({
+  password,
+  workerAlive,
+  operationBlocked,
+  conflictText,
+  onOperationChanged,
+}: {
+  password: string
+  workerAlive: boolean
+  operationBlocked: boolean
+  conflictText: string
+  onOperationChanged: () => Promise<void> | void
+}) {
+  const [state, setState] = useState<SssUncertainState | null>(null)
+  const [review, setReview] = useState<SssUncertainReview | null>(null)
+  const [busy, setBusy] = useState<'' | 'load' | 'review' | 'resolve'>('')
+  const [message, setMessage] = useState('')
+  const [selected, setSelected] = useState<string[]>([])
+  const [decision, setDecision] = useState<SssUncertainDecision>('keep')
+  const [note, setNote] = useState('')
+  // 处置用单飞包装：双击只发出一次（后端另有权威互斥与锁内校验）。
+  const resolveOnce = useRef(
+    singleFlight(async (payload: {
+      decision: SssUncertainDecision
+      confirm: string
+      note: string
+      record_ids: string[]
+    }) => api().sss_uncertain_resolve(payload)),
+  ).current
+
+  const load = useCallback(async () => {
+    if (!isApiReady()) return
+    setBusy((b) => (b === '' ? 'load' : b))
+    try {
+      const next = await api().sss_uncertain_records()
+      setState(next)
+      if (!next.ok) setMessage(next.reason ?? '未决记录不可读')
+    } catch (error) {
+      setMessage(`读取未决记录失败：${String(error)}`)
+    } finally {
+      setBusy((b) => (b === 'load' ? '' : b))
+    }
+  }, [])
+
+  useEffect(() => {
+    // 延后一拍再拉：effect 体内同步 setState 会触发级联渲染（lint 规则）。
+    const timer = setTimeout(() => void load(), 0)
+    return () => clearTimeout(timer)
+  }, [load])
+
+  const onReview = useCallback(async () => {
+    if (!isApiReady() || busy) return
+    setBusy('review')
+    setMessage('')
+    try {
+      const result = await api().start_sss_review({ password })
+      setReview(result)
+      setMessage(
+        result.ok
+          ? `只读核对完成：站内已确认 ${result.confirmed ?? 0}、站内没有 ${result.missing ?? 0}、` +
+              `日期不符 ${result.other_day ?? 0}、读取失败 ${result.scan_failed ?? 0}`
+          : `【${classifyOutcome({ status: (result as { status?: string }).status,
+                                   code: (result as { code?: string }).code,
+                                   ok: result.ok }).label}】` +
+              `${result.reason ?? '只读核对失败'}` +
+              (result.next_action ? ` —— 下一步：${result.next_action}` : ''),
+      )
+      await Promise.all([load(), onOperationChanged()])
+    } catch (error) {
+      setMessage(`只读核对失败：${String(error)}`)
+    } finally {
+      setBusy('')
+    }
+  }, [busy, load, onOperationChanged, password])
+
+  const onResolve = useCallback(async () => {
+    if (!isApiReady() || busy || selected.length === 0) return
+    setBusy('resolve')
+    setMessage('')
+    try {
+      const result: SssUncertainResolveResult = await resolveOnce({
+        decision,
+        confirm: decision,
+        note: note.trim(),
+        record_ids: selected,
+      })
+      setMessage(
+        result.ok
+          ? result.reason ?? '处置完成（未发送任何创建订单请求）'
+          : `【${classifyOutcome({ status: result.status, ok: result.ok }).label}】`
+            + `${result.reason ?? '处置被拒绝'}`
+            + (result.next_action ? ` —— 下一步：${result.next_action}` : ''),
+      )
+      if (result.ok) {
+        setSelected([])
+        setNote('')
+        await load()
+      }
+    } catch (error) {
+      setMessage(`处置失败：${String(error)}`)
+    } finally {
+      setBusy('')
+    }
+  }, [busy, decision, load, note, resolveOnce, selected])
+
+  const active = state?.counts.active ?? 0
+  const records = state?.records ?? []
+  const ids = records.map((record) => record.journal_id)
+  const allSelected = ids.length > 0 && ids.every((id) => selected.includes(id))
+
+  // 处置按钮的可用条件：station_absent 必须"已选记录全部是站内确认没有"。
+  // 与后端校验一一对应的可用条件（纯函数，在 lib/interaction.ts 里有测试）：
+  // "站内确认没有"必须证据新鲜且所选记录全部为 station_missing。
+  const resolveGate = canResolveDecision({
+    decision,
+    selected,
+    evidence: review?.ok
+      ? { results: review.results ?? [], created_at: review.created_at,
+          ttl_seconds: review.ttl_seconds }
+      : null,
+    note,
+  })
+  const canResolve = !busy && !operationBlocked && resolveGate.allowed
+  const resolveHint = resolveGate.reason
+
+  return (
+    <div className="mb-4 rounded-md border px-3 py-2.5 text-[11px] leading-relaxed">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-[12.5px] font-medium">
+            未决订单记录{active > 0 ? `（${active} 条待处理）` : ''}
+          </p>
+          <p className="mt-0.5 text-muted-foreground">
+            上一次下单若没拿到确定响应就会留在这里。有未决记录时程序拒绝再发下单请求，
+            需要先做只读核对或人工处置。
+          </p>
+        </div>
+        <GhostButton onClick={load} disabled={busy !== ''}>
+          {busy === 'load' ? '刷新中…' : '刷新'}
+        </GhostButton>
+      </div>
+
+      {state && !state.ok ? (
+        <p className="mt-2 text-destructive">
+          {state.journal_unreadable
+            ? `未决日志不可用（${state.reason}）：请先人工核对站内订单并修复该文件，`
+            : `${state.reason} `}
+          在此之前**不要**重新下单。
+        </p>
+      ) : null}
+
+      {state?.ok && records.length === 0 ? (
+        <p className="mt-2 text-muted-foreground">没有未决记录，可以正常下单。</p>
+      ) : null}
+
+      {state?.ok && records.length > 0 ? (
+        <>
+          <div className="mt-2 flex items-center gap-2">
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={(e) => setSelected(e.target.checked ? [...ids] : [])}
+              />
+              <span>全选</span>
+            </label>
+            <GhostButton onClick={onReview}
+                         disabled={busy !== '' || workerAlive || operationBlocked}
+                         title={operationBlocked ? conflictText : undefined}>
+              {busy === 'review' ? '核对中…' : '只读核对（不下单）'}
+            </GhostButton>
+          </div>
+
+          <div className="mt-2 space-y-1">
+            {records.map((record) => (
+              <UncertainRow
+                key={record.journal_id}
+                record={record}
+                checked={selected.includes(record.journal_id)}
+                classification={
+                  review?.results.find((item) => item.journal_id === record.journal_id)
+                    ?.classification
+                }
+                onToggle={(checked) =>
+                  setSelected((prev) =>
+                    checked
+                      ? [...prev, record.journal_id]
+                      : prev.filter((id) => id !== record.journal_id),
+                  )
+                }
+              />
+            ))}
+          </div>
+
+          {review?.ok ? (
+            <p className="mt-2 text-muted-foreground">
+              只读核对快照：
+              {(review.results ?? [])
+                .map(
+                  (item) =>
+                    `${item.name}（${CLASSIFICATION_LABELS[item.classification] ?? item.classification}）`,
+                )
+                .join('；')}
+            </p>
+          ) : null}
+
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            {(
+              [
+                ['keep', '保持阻断（只记备注）'],
+                ['station_present', '站内已有这些订单'],
+                ['station_absent', '确认站内没有（解除阻断）'],
+              ] as Array<[SssUncertainDecision, string]>
+            ).map(([value, label]) => (
+              <label key={value} className="flex items-center gap-1">
+                <input
+                  type="radio"
+                  name="sss-uncertain-decision"
+                  checked={decision === value}
+                  onChange={() => setDecision(value)}
+                />
+                <span>{label}</span>
+              </label>
+            ))}
+          </div>
+
+          {resolveHint && decision !== 'keep' ? (
+            <p className="mt-1 text-amber-600">{resolveHint}</p>
+          ) : null}
+
+          <textarea
+            rows={2}
+            className="mt-2 w-full resize-y rounded-[4px] border border-transparent bg-secondary px-2.5 py-1.5 font-mono text-[11px] leading-relaxed outline-none focus-visible:border-ring focus-visible:bg-card"
+            placeholder={
+              decision === 'keep' ? '备注（可选）' : '人工备注（至少 4 个字符）'
+            }
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+          />
+
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <GhostButton onClick={onResolve} disabled={!canResolve || operationBlocked}
+                         title={operationBlocked ? conflictText : undefined}>
+              {busy === 'resolve' ? '处置中…' : '确认处置'}
+            </GhostButton>
+            <span className="text-muted-foreground">
+              处置过程<b>不会发送创建订单请求</b>；解除阻断后，
+              只有你再点「开始下单」才会真正下单。
+            </span>
+          </div>
+        </>
+      ) : null}
+
+      {message ? (
+        <p
+          className={cn(
+            'mt-2',
+            message.includes('失败') || message.includes('没有') || message.includes('不可')
+              ? 'text-destructive'
+              : 'text-muted-foreground',
+          )}
+        >
+          {message}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function UncertainRow({
+  record,
+  checked,
+  classification,
+  onToggle,
+}: {
+  record: SssUncertainRecordView
+  checked: boolean
+  classification?: string
+  onToggle: (checked: boolean) => void
+}) {
+  return (
+    <label className="flex items-start gap-2 rounded border px-2 py-1">
+      <input
+        type="checkbox"
+        className="mt-0.5"
+        checked={checked}
+        onChange={(e) => onToggle(e.target.checked)}
+      />
+      <span className="min-w-0 flex-1">
+        <span className="font-medium">
+          {record.name}（{record.phone}）
+        </span>
+        <span className="ml-1 text-muted-foreground">
+          {record.delivery_time || record.delivery_date} · {record.sheet}
+          {record.door_num ? ` · ${record.door_num}` : ''}
+        </span>
+        <br />
+        <span className="text-muted-foreground">
+          {record.status === 'inflight' ? '已发出，等待响应' : '结果未知，等待对账'}
+          {record.created_at ? ` · ${record.created_at.replace('T', ' ')}` : ''}
+          {record.error ? ` · ${record.error}` : ''}
+        </span>
+        {classification ? (
+          <>
+            <br />
+            <span className="text-muted-foreground">
+              核对结论：{CLASSIFICATION_LABELS[classification] ?? classification}
+            </span>
+          </>
+        ) : null}
+      </span>
+    </label>
+  )
 }

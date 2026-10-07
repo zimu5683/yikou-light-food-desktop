@@ -23,6 +23,7 @@ import {
   pullBridgeEvents,
   type AddressInputRequest,
   type AppState,
+  type OperationStatusResult,
   type CaptchaRequest,
   type DecisionRequest,
   type OrderFormPayload,
@@ -56,6 +57,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const [updateAvailable, setAvailableState] = useState<UpdateAvailable | null>(null)
   const [mode, setMode] = useState<TaskMode>('order')
+  // 统一操作状态：前端用它禁用按钮；安全判定仍在后端（前端只是体验层）。
+  const [operation, setOperation] = useState<OperationStatusResult | null>(null)
   const logId = useRef(0)
 
   const appendLog = useCallback((entry: Omit<LogRow, 'id'>) => {
@@ -181,15 +184,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [applyEvent])
 
   // 轮询通道：drain_events 是 Python→JS 的可靠方向（evaluate_js 不可信）
+  //
+  // 同一条定时器里**顺带**刷新统一操作状态（每 ~1 秒一次，不是每轮都查）：
+  // 前端据此禁用按钮并显示"谁在跑、跑到哪一步"。这只是体验层，
+  // 真正的互斥与安全判定始终在后端。
   useEffect(() => {
     if (!ready || mocked) return
     let stopped = false
     let timer: number | undefined
+    let ticks = 0
     const poll = async () => {
       try {
         // pullBridgeEvents 内部维护 last_sequence/ACK 与 event_id 去重：
         // 只有成功 dispatch 后才推进 cursor，断线/刷新后可从断点重放。
         await pullBridgeEvents()
+        if (ticks++ % 7 === 0) {
+          const next = await api().operation_status()
+          if (!stopped) setOperation(next)
+        }
       } catch {
         /* 超时或窗口关闭：下一轮继续 */
       } finally {
@@ -204,25 +216,37 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [ready, mocked, applyEvent])
 
   // ---- 动作 ----
+  /** 主动刷新统一操作状态（动作完成后调用，避免最多一秒的显示延迟）。 */
+  const refreshOperation = useCallback(async () => {
+    if (!isApiReady()) return
+    try {
+      setOperation(await api().operation_status())
+    } catch {
+      /* 查询失败不影响操作本身 */
+    }
+  }, [])
+
   const startOrder = useCallback(async (payload: OrderFormPayload) => {
     const result = await api().start_order(payload)
+    await refreshOperation()
     if (result.ok) return null
-    if (result.reason === 'busy') {
+    if (result.reason === 'busy' || result.reason === 'operation_conflict') {
       toast.error(result.message ?? '已有任务正在运行，请先停止')
       return {}
     }
     return result.fields ?? {}
-  }, [])
+  }, [refreshOperation])
 
   const startSss = useCallback(async (payload: SssFormPayload) => {
     const result = await api().start_sss(payload)
+    await refreshOperation()
     if (result.ok) return null
-    if (result.reason === 'busy') {
+    if (result.reason === 'busy' || result.reason === 'operation_conflict') {
       toast.error(result.message ?? '已有任务正在运行，请先停止')
       return {}
     }
     return result.fields ?? {}
-  }, [])
+  }, [refreshOperation])
 
   const stopTask = useCallback(async () => {
     await api().stop_task().catch(() => {})
@@ -243,8 +267,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const clearPassword = useCallback(async (mode: 'order' | 'sss') => {
-    await api().clear_password(mode).catch(() => {})
-    toast.success(mode === 'sss' ? '已清除本机保存的闪时送密码' : '已清除本机保存的密码')
+    const label = mode === 'sss' ? '闪时送密码' : '密码'
+    try {
+      const result = await api().clear_password(mode)
+      if (result?.ok) {
+        toast.success(`已清除本机保存的${label}`)
+      } else {
+        // 密钥环拒绝时绝不能显示成功：用户会以为密码已经不存在了。
+        toast.error(result?.reason ?? `未能清除本机保存的${label}`, {
+          description: result?.next_action,
+        })
+      }
+    } catch (error) {
+      toast.error(`未能清除本机保存的${label}`, { description: String(error) })
+    }
   }, [])
 
   const checkUpdates = useCallback((manual: boolean) => {
@@ -300,6 +336,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       addressInput,
       updateProgress,
       workerAlive: status === 'running' || status === 'stopping',
+      operation,
+      refreshOperation,
       mode,
       setMode,
       startOrder,
@@ -320,7 +358,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       resolveAddressInput,
     }),
     [ready, mocked, version, status, frozen, config, passwords, logs, decision,
-      updateProgress, mode, captcha, addressInput, startOrder, startSss, stopTask, chooseExcel,
+      updateProgress, mode, captcha, addressInput, operation, refreshOperation,
+      startOrder, startSss, stopTask, chooseExcel,
       newTemplate, checkBrowser, clearPassword, checkUpdates, installUpdate,
       openExternal, requestClose, setSplitRatio, clearLogs, resolveDecision, resolveCaptcha,
       resolveAddressInput],

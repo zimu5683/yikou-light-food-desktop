@@ -77,6 +77,38 @@ def test_browser_manifest_defaults_when_absent(monkeypatch, tmp_path):
     assert automation.browser_version_warning() is None
 
 
+def test_bundled_browser_follows_manifest_revision_when_revisions_coexist(
+        monkeypatch, tmp_path):
+    """新旧 revision 并存时按 browser.json 的 revision 选，别按目录名字符串序。
+
+    字符串序里 ``chromium-1234`` < ``chromium-1243``，只看 glob 会一直用旧浏览器，
+    而本地解压安装、更新器"只补装缺失目录"都会让两个 revision 同时存在。
+    """
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
+    for revision in ("1234", "1243"):
+        exe = tmp_path / f"chromium-{revision}" / "chrome-linux64" / "chrome"
+        exe.parent.mkdir(parents=True)
+        exe.write_text("#!/bin/sh\n", encoding="utf-8")
+    (tmp_path / automation.BROWSER_MANIFEST_NAME).write_text(
+        automation.json.dumps({"revision": "1243", "browser_version": "153.0.8010.12"}),
+        encoding="utf-8",
+    )
+
+    chosen = automation.find_bundled_browser()
+
+    assert chosen is not None and "chromium-1243" in str(chosen), f"实际选中 {chosen}"
+
+
+def test_bundled_browser_falls_back_to_glob_without_manifest(monkeypatch, tmp_path):
+    """清单缺失（老安装包）时仍要能找到一个可用的 Chromium。"""
+    monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
+    exe = tmp_path / "chromium-1234" / "chrome-linux64" / "chrome"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    assert automation.find_bundled_browser() == exe
+
+
 def test_browser_version_warning_flags_playwright_mismatch(monkeypatch, tmp_path):
     monkeypatch.setenv("YIKOU_BROWSER_DIR", str(tmp_path))
     (tmp_path / automation.BROWSER_MANIFEST_NAME).write_text(
