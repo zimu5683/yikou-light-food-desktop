@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import random
+import re
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -25,6 +26,34 @@ AUTH_MESSAGE_KEYWORDS = (
     "登录态失效", "登录已失效", "登录过期", "登录已过期",
     "请重新登陆", "请重新登录", "unauthorized", "login expired",
 )
+
+_INTERNAL_ERROR_RE = re.compile(
+    r"\b(?:[a-z_$][\w$]*\.)*(?:[a-z_$][\w$]*)?(?:exception|error)\b"
+    r"|\b(?:stack\s*trace|traceback|internal\s+server\s+error)\b"
+    r"|系统异常|系统错误|服务异常|服务错误|服务器异常|服务器错误|内部异常|内部错误",
+    re.IGNORECASE,
+)
+
+
+def is_internal_error_payload(payload: Any) -> bool:
+    """响应体里是否是平台侧的技术异常（Java 异常类名 / 栈信息 / 系统异常文案）。
+
+    闪时送在受理超速或内部故障时会返回 HTTP 200 + ``code=500`` +
+    ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``。
+
+    与结果分类**无关**：本项目的 ``_check_success`` 仍只按 ``success`` 字段归类
+    （``success=false`` = 服务端明确拒绝，可人工重试）。这个判定只用于识别平台的
+    「快速驳回」特征（内部异常且 message 含 ``IndexOutOfBounds``），供提交节流
+    自适应放宽使用，不参与记录与重发语义。
+    """
+    if not isinstance(payload, dict):
+        return False
+    details = [str(payload.get(key) or "") for key in ("message", "msg")]
+    for key in ("exception", "exceptionClass", "exceptionType", "stackTrace", "traceback"):
+        if payload.get(key):
+            return True
+    details.append(str(payload.get("error") or ""))
+    return bool(_INTERNAL_ERROR_RE.search(" ".join(details)))
 
 
 def is_auth_expired_payload(payload: Any) -> bool:

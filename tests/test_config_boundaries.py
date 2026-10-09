@@ -104,11 +104,46 @@ def test_order_date_is_also_trimmed():
 # 数值字段的夹紧
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("given,expected", [
-    (0, 1), (-5, 1), (1, 1), (4, 1), (8, 1), (20, 1), (99, 1),
-    (None, 1), ("abc", 1), ("7", 1),
+    (0, 1), (-5, 1), (1, 1), (4, 4), (8, 8), (20, 20), (99, 20),
+    (None, 4), ("abc", 4), ("7", 7),
 ])
 def test_sss_max_workers_is_clamped(given, expected):
     assert AppConfig(sss_max_workers=given).sss_max_workers == expected
+
+
+@pytest.mark.parametrize("given,expected", [
+    (0, 0.0), (-5, 0.0), (2.5, 2.5), (10, 10.0), (999, 60.0),
+    (None, 2.5), ("abc", 2.5), ("3.5", 3.5),
+])
+def test_sss_submit_min_interval_is_clamped(given, expected):
+    # 出厂 2.5 秒（平台建单受理节奏约 1 单 / 2.1 秒 + 余量）；显式 0 = 关闭节流。
+    assert AppConfig(sss_submit_min_interval_s=given).sss_submit_min_interval_s == expected
+
+
+def test_sss_submit_min_interval_nan_falls_back_to_default():
+    assert AppConfig(sss_submit_min_interval_s=float("nan")).sss_submit_min_interval_s == 2.5
+
+
+def test_legacy_config_without_the_interval_gets_the_paced_default(tmp_path):
+    """旧 config.json 没有 sss_submit_min_interval_s：加载即按出厂默认 2.5 秒节流。"""
+    import json
+
+    from app.config import DEFAULTS_REVISION
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps({"sss_max_workers": 4,
+                                "defaults_revision": DEFAULTS_REVISION},
+                               ensure_ascii=False), encoding="utf-8")
+    loaded = AppConfig.load(path)
+    assert loaded.sss_submit_min_interval_s == 2.5
+    loaded.save()
+    assert AppConfig.load(path).sss_submit_min_interval_s == 2.5
+
+
+def test_explicit_zero_interval_survives_a_save_load_roundtrip(tmp_path):
+    """0 = 显式关闭节流，保存后不能被出厂默认覆盖回 2.5。"""
+    path = tmp_path / "config.json"
+    AppConfig(sss_submit_min_interval_s=0.0).save(path)
+    assert AppConfig.load(path).sss_submit_min_interval_s == 0.0
 
 
 # ----------------------------------------------------------------------
@@ -119,37 +154,50 @@ def test_legacy_defaults_are_migrated_once():
     """旧配置（缺 defaults_revision）里仍是旧出厂默认的值 → 迁移到新默认。"""
     legacy = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
                        defaults_revision=0)
-    assert legacy.sss_max_workers == 1
+    assert legacy.sss_max_workers == 4
     assert legacy.sss_read_timeout_s == 30.0
-    assert legacy.defaults_revision == 2
+    assert legacy.defaults_revision == 3
 
 
-def test_sss_create_workers_are_forced_to_one():
-    """闪时送创建订单暂时固定串行，不采用旧配置中的并发值。"""
-    kept = AppConfig(sss_max_workers=3, sss_read_timeout_s=45.0,
-                     defaults_revision=0)
-    assert kept.sss_max_workers == 1
-    assert kept.sss_read_timeout_s == 45.0
+def test_pinned_serial_workers_are_restored_to_default():
+    """上一代把并发强制写成 1 路排查（那个 1 不是用户选择）→ 迁移回默认 4 路。"""
+    legacy = AppConfig(sss_max_workers=1, sss_read_timeout_s=45.0,
+                       defaults_revision=0)
+    assert legacy.sss_max_workers == 4
+    assert legacy.sss_read_timeout_s == 45.0
 
-    already = AppConfig(sss_max_workers=4, sss_read_timeout_s=20.0,
-                        defaults_revision=2)
-    assert already.sss_max_workers == 1
-    assert already.sss_read_timeout_s == 20.0
+    pinned = AppConfig(sss_max_workers=1, sss_read_timeout_s=20.0,
+                       defaults_revision=2)
+    assert pinned.sss_max_workers == 4
+    assert pinned.sss_read_timeout_s == 30.0
+
+
+def test_explicit_workers_are_never_overwritten_by_defaults():
+    """已是当前迁移版本的配置：并发路数（含显式串行 1）原样保留。"""
+    assert AppConfig(sss_max_workers=8, defaults_revision=3).sss_max_workers == 8
+    assert AppConfig(sss_max_workers=1, defaults_revision=3).sss_max_workers == 1
+
+
+def test_serial_fallback_survives_a_save_load_round_trip(tmp_path):
+    """回退到串行的显式配置必须能落盘并重读，不能被默认值顶回来。"""
+    path = tmp_path / "config.json"
+    AppConfig(sss_max_workers=1).save(path)
+    assert AppConfig.load(path).sss_max_workers == 1
 
 
 def test_missing_revision_key_in_file_is_treated_as_legacy(tmp_path):
     """磁盘上缺 defaults_revision 键 = 旧配置，加载时执行一次迁移。"""
     import json
     path = tmp_path / "config.json"
-    path.write_text(json.dumps({"sss_max_workers": 4,
+    path.write_text(json.dumps({"sss_max_workers": 1,
                                 "sss_read_timeout_s": 20.0}), encoding="utf-8")
     loaded = AppConfig.load(path)
-    assert loaded.sss_max_workers == 1
+    assert loaded.sss_max_workers == 4
     assert loaded.sss_read_timeout_s == 30.0
     loaded.save()
     again = AppConfig.load(path)
-    assert again.defaults_revision == 2
-    assert again.sss_max_workers == 1
+    assert again.defaults_revision == 3
+    assert again.sss_max_workers == 4
 
 
 @pytest.mark.parametrize("given,expected", [

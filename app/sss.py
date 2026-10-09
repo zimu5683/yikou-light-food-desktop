@@ -31,7 +31,8 @@ from urllib.parse import urlencode
 
 try:
     from .api_client import (ApiError, SssApiClient, SssTransportError,
-                             auth_error_message, is_auth_expired_payload)
+                             auth_error_message, is_auth_expired_payload,
+                             is_internal_error_payload)
     from .automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -47,7 +48,8 @@ try:
                               platform_origin, resolve_records)
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from api_client import (ApiError, SssApiClient, SssTransportError,
-                            auth_error_message, is_auth_expired_payload)
+                            auth_error_message, is_auth_expired_payload,
+                            is_internal_error_payload)
     from automation import (
         BrowserNotFoundError,
         LocatorError,
@@ -92,10 +94,32 @@ _RECONCILE_POLL_INTERVAL_S = 0.5
 _PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 # 订单创建时间与本地批次起点的最大时钟偏差；用于排除其他设备更早创建的相似订单。
 _BATCH_CLOCK_SKEW_S = 120.0
-# 创建订单接口是非幂等 POST，且平台在并发请求下会间歇性返回
-# ``IndexOutOfBoundsException: Index: 0, Size: 0``。对真实创建请求强制串行，
-# 对账仍然只读且保留原有防重复流程。
-_SSS_CREATE_MAX_WORKERS = 1
+# 创建订单接口是非幂等 POST，且平台在并发请求下曾间歇性返回
+# ``IndexOutOfBoundsException: Index: 0, Size: 0``（2026-09 实测，未定根因）。
+# 当时为此把提交固定成 1 路串行排查；2026-10-08 恢复为配置值（默认 4 路），
+# 依赖的是"至少一次提交 + 站内对账确认"这条既有兜底：并发只影响并发度，
+# 不改变"POST 不自动重发、以对账结果为准"的语义。平台若再次出现与并发相关的
+# 间歇错误，把 ``sss_max_workers`` 配回 1 即可回到串行，不需要改代码。
+_SSS_CREATE_MAX_WORKERS_CEILING = 20  # 与 config._SSS_MAX_WORKERS_CEILING 保持一致
+# 配置对象缺 ``sss_max_workers`` 字段（或取值无法解析）时的保守回退：串行。
+# 正常路径上 ``AppConfig`` 始终带该字段（默认 4 路），因此这条只保护
+# 传了残缺 config 的调用方。
+_FALLBACK_SSS_CREATE_WORKERS = 1
+# 提交节流（2026-10-09 按服务端 v3.6.18 / commit 03413f6 移植）：平台对同一账号
+# 的建单受理节奏实测约 1 单 / 2.1 秒，超速的 POST 会在约 0.3-1 秒内被快速驳回
+# （HTTP 200 + code=500 + ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``，
+# 且每个请求都消耗一个平台订单序列号）。4 路滚动补位下被驳回的车道会立刻补发
+# 下一单，实际发送节奏可达约 1.37 POST/秒（约 3 倍超速），于是每轮约 2/3 被驳回。
+# 这里令相邻两次 POST 的**起点**至少间隔 ``sss_submit_min_interval_s``（出厂
+# 2.5 秒，0 = 关闭），并发路数不变；出现快速驳回特征时自动放宽间隔自保。
+# 节流只影响发送节奏，不改变任何结果分类、记录与重发语义。
+# 注意：2.1 秒是现场观察到的受理节奏，不是已证实的平台硬限速（见
+# docs/闪时送周期失败与序号跳号排查-2026-10-09.md §5.3），2.5 秒是保守试探值。
+_SUBMIT_FAST_REJECT_MAX_S = 1.5          # 「快速驳回」的耗时上限（秒）
+_SUBMIT_INTERVAL_PENALTY_FACTOR = 1.5    # 每次自动放宽的倍数
+_SUBMIT_INTERVAL_PENALTY_MAX_S = 10.0    # 自动放宽的上限（秒）
+_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5 # 出厂默认提交最小间隔（秒）
+_SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
 # 对账页大小。实测 2026-09-10：100 条/页每页约 2.0s；改成 1000 条/页反而要
 # 17.9s，所以宁可多翻几页也不要放大单页体积。
 _LIST_PAGE_SIZE = 100
@@ -1395,22 +1419,163 @@ def _emit_reconciliation(callback: Callable[[str], Any] | None, label: str,
                     f"重复 {reconciliation.duplicate_count} 单")
 
 
+def resolve_create_workers(config: Any) -> int:
+    """本批创建订单的并发路数：取配置值并夹到 ``[1, _SSS_CREATE_MAX_WORKERS_CEILING]``。
+
+    1 = 串行（平台限流或担心并发时的回退值）。
+    """
+    try:
+        workers = int(getattr(config, "sss_max_workers",
+                              _FALLBACK_SSS_CREATE_WORKERS))
+    except (TypeError, ValueError):
+        workers = _FALLBACK_SSS_CREATE_WORKERS
+    return max(1, min(_SSS_CREATE_MAX_WORKERS_CEILING, workers))
+
+
+def resolve_submit_min_interval_s(config: Any) -> float:
+    """本批提交的最小间隔（秒）：取配置值并夹到 ``[0, 60]``；0 = 关闭节流。
+
+    拿不到配置（缺字段或取值不可解析）时按出厂默认（2.5 秒）保守节流——宁可
+    按节奏慢发，也不要全速连发触发平台的快速驳回（内部异常，且每个请求都会
+    消耗一个平台订单序列号）。
+    """
+    try:
+        interval = float(getattr(config, "sss_submit_min_interval_s",
+                                 _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S))
+    except (TypeError, ValueError):
+        interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+    if interval != interval:  # NaN
+        interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+    return max(0.0, min(_SSS_SUBMIT_MIN_INTERVAL_CEILING_S, interval))
+
+
+def _emit_round_summary(callback: Callable[[str], Any] | None,
+                        latencies: list[float],
+                        started_at: float,
+                        min_interval_s: float | None = None) -> None:
+    """本轮提交的实测汇总：并发到底有没有用，全看这一行。
+
+    吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。启用提交节流时补一句当前
+    生效的最小间隔，便于与平台受理节奏（现场观察约 1 单 / 2.1 秒）对照。
+    """
+    if not latencies:
+        return
+    wall = max(0.0, time.perf_counter() - started_at)
+    average = sum(latencies) / len(latencies)
+    throughput = (len(latencies) / wall) if wall > 0 else 0.0
+    message = (f"本轮提交 {len(latencies)} 单，耗时 {wall:.1f} 秒，"
+               f"每单平均 {average:.1f} 秒（吞吐 {throughput:.2f} 单/秒）")
+    try:
+        pacing = float(min_interval_s) if min_interval_s else 0.0
+    except (TypeError, ValueError):
+        pacing = 0.0
+    if pacing > 0:
+        message += f"；提交最小间隔 {pacing:g} 秒"
+    _emit(callback, message)
+
+
+def _is_rate_reject_response(response: Any) -> bool:
+    """平台「受理超速」特征的快速驳回：内部异常且 message 含 ``IndexOutOfBounds``。
+
+    2026-10-09 现场（见 docs/闪时送周期失败与序号跳号排查-2026-10-09.md）：超过
+    平台受理节奏的建单请求在约 0.3-1 秒内返回
+    ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``，且仍会消耗一个
+    平台订单序列号。该判定只用于提交节奏的自适应放宽（``_SubmitPacer.penalize``），
+    不参与任何结果分类、记录或重发语义。
+    """
+    if not isinstance(response, dict) or not is_internal_error_payload(response):
+        return False
+    message = str(response.get("message") or response.get("msg") or "")
+    return "IndexOutOfBounds" in message
+
+
+class _SubmitPacer:
+    """提交节流：令相邻两次 POST 的起点至少间隔 ``interval`` 秒。
+
+    4 路滚动补位下，被快速驳回的车道能在 0.36 秒内补发下一单，实际发送节奏
+    会被推到远超平台受理节奏的水平。这里在 POST 之前统一排队，让发送起点按
+    最小间隔错开；出现平台的快速驳回特征时自动放宽间隔（``penalize``）。
+    节流只影响节奏，不改变任何结果分类与重发语义。
+    """
+
+    def __init__(self, interval_s: float) -> None:
+        self._lock = Lock()
+        self._interval = max(0.0, float(interval_s or 0.0))
+        self._ceiling = max(_SUBMIT_INTERVAL_PENALTY_MAX_S, self._interval)
+        self._next_allowed = 0.0  # time.perf_counter 时间基准
+
+    def wait(self, stop_event: Any = None,
+             halted: Callable[[], bool] | None = None) -> bool:
+        """阻塞到可以发送下一次 POST；返回 False = 等待期间停止/中止（未发送）。
+
+        节流关闭（间隔为 0）时不等待也不中止，行为与未引入节流前完全一致；
+        等待路径上出现停止、401 或余额不足时返回 False，调用方应把该任务记为
+        「未发送」（它确实没有发出）。
+        """
+        if self._interval <= 0.0:
+            return True
+
+        def aborted() -> bool:
+            if halted is not None and halted():
+                return True
+            return stop_event is not None and bool(stop_event.is_set())
+
+        while True:
+            if aborted():
+                return False
+            with self._lock:
+                now = time.perf_counter()
+                if now >= self._next_allowed:
+                    self._next_allowed = now + self._interval
+                    return True
+                delay = min(self._next_allowed - now, 0.25)
+            time.sleep(delay)
+
+    def penalize(self) -> float | None:
+        """平台快速驳回后放宽间隔；返回放宽后的值，未启用/已到上限时返回 None。"""
+        with self._lock:
+            if self._interval <= 0.0 or self._interval >= self._ceiling:
+                return None
+            self._interval = min(self._ceiling,
+                                 self._interval * _SUBMIT_INTERVAL_PENALTY_FACTOR)
+            return self._interval
+
+    @property
+    def interval(self) -> float:
+        """当前生效的最小间隔（秒）。"""
+        with self._lock:
+            return self._interval
+
+
 def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              submit: Callable[[dict[str, Any]], dict[str, Any]],
                              stop_event: Any,
                              callback: Callable[[str], Any] | None,
                              max_workers: int = 4,
-                             on_stop: Callable[[], None] | None = None) -> _SubmitResult:
+                             on_stop: Callable[[], None] | None = None,
+                             min_interval_s: float = 0.0) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。
 
     同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
     ``uncertain``，由调用方查询订单列表确认，绝不在此处自动重发。
+
+    ``min_interval_s`` > 0 时启用全局提交节流（见 `_SubmitPacer`）：相邻两次
+    POST 的**起点**至少间隔该值，贴近平台对同一账号的建单受理节奏；出现平台
+    快速驳回特征时自动放宽间隔。0 = 关闭节流（行为与引入节流前完全一致）。
+    结束后输出一行本轮汇总（见 `_emit_round_summary`）。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
+    try:
+        pacing = max(0.0, float(min_interval_s or 0.0))
+    except (TypeError, ValueError):
+        pacing = 0.0
+    pacer = _SubmitPacer(pacing)
     iterator = iter(tasks)
     in_flight: dict[Any, dict[str, Any]] = {}
     stop_closed = False
+    latencies: list[float] = []
+    round_started = time.perf_counter()
 
     def halted() -> bool:
         return bool(stop_event.is_set() or result.auth_error or result.balance_error)
@@ -1418,9 +1583,16 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     def run_one(task: dict[str, Any]) -> tuple[str, str, str]:
         if stop_event.is_set():
             return task["identifier"], "stopped", ""
-        started = time.perf_counter()
+        if not pacer.wait(stop_event, halted):
+            # 节流等待期间收到停止/中止：请求确实没有发出，按「未发送」处理
+            # （与在派发前被停止拦下同义，不引入任何新的重发行为）。
+            return task["identifier"], "stopped", ""
+        interval_at_send = pacer.interval
+        started = time.perf_counter()  # 计时只量 HTTP 本身，不含节流等待
+        response: Any = None
         try:
-            _check_success(submit(task["payload"]))
+            response = submit(task["payload"])
+            _check_success(response)
         except _AuthExpired as exc:
             state, detail = "auth", str(exc)
         except _BalanceDepleted as exc:
@@ -1431,7 +1603,22 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             state, detail = "failure", str(exc)
         else:
             state, detail = "success", ""
-        _trace(f"POST {task['identifier']}: {time.perf_counter() - started:.2f}s -> {state}")
+        elapsed = time.perf_counter() - started
+        # 平台「受理超速」的快速驳回：自动放宽提交节奏（自保）。桌面版把
+        # ``success=false`` 的平台拒绝归类为显式失败（可人工重试），与把平台内部
+        # 异常归为 uncertain 的服务端不同；因此这里按「响应特征 + 快速返回」判定，
+        # 两种分类都接受，只放宽节奏，不改变分类与重发语义。
+        if (state in ("uncertain", "failure")
+                and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
+                and _is_rate_reject_response(response)):
+            widened = pacer.penalize()
+            if widened is not None:
+                _emit(callback, "平台快速驳回（疑似建单受理超速）；"
+                                f"提交最小间隔自动放宽到 {widened:g} 秒"
+                                "（结果分类与重发语义不变）")
+        latencies.append(elapsed)
+        _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}"
+               f"；min_interval_s={interval_at_send:.3f}")
         return task["identifier"], state, detail
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1473,6 +1660,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                 elif state == "balance" and not result.balance_error:
                     result.balance_error = detail
         result.stopped = bool(result.stopped or stop_event.is_set())
+    _emit_round_summary(callback, latencies, round_started, pacer.interval)
     return result
 
 
@@ -1879,12 +2067,17 @@ def _run_reconciled_submission(
         max_workers: int,
         relogin: Callable[[], None] | None = None,
         journal: "_JournalHooks | None" = None,
+        submit_min_interval_s: float = 0.0,
         ) -> tuple[_Reconciliation | None, bool]:
     """执行"先对账、提交、再对账"的至少一次语义。
 
     返回 ``(最终对账结果, 是否完成了最终对账)``。平台接口没有客户端幂等
     键，因此这里不承诺 exactly-once：只保证非幂等 POST 不自动重试，提交后
     通过列表对账确认；对账延迟时只读轮询，绝不立即重复 POST。
+
+    ``submit_min_interval_s`` > 0 时，每轮提交的相邻 POST 起点至少间隔该值
+    （见 `_SubmitPacer`；每轮新建一个节流器，0 = 关闭）。节流只影响发送节奏，
+    不改变分类、记录与重发语义。
 
     ``journal`` 非空时：每个 POST 在发出前先落一条 ``inflight`` 记录，
     本轮结束后未获确认的保持活跃；站内确认后才 ``resolved``。任何一步写盘
@@ -1949,7 +2142,8 @@ def _run_reconciled_submission(
         submit, close = submit_factory()
         try:
             result = _submit_tasks_concurrent(round_tasks, submit, stop_event,
-                                             callback, workers, on_stop=close)
+                                             callback, workers, on_stop=close,
+                                             min_interval_s=submit_min_interval_s)
         finally:
             close()
         if journal is not None:
@@ -2283,12 +2477,8 @@ def run_sss_job(config: Any, stop_event: Any,
     use_fixed_address = bool(getattr(config, "sss_use_fixed_address", False))
     goods_name = str(getattr(config, "sss_product_name", "") or "轻食")
     api_mode = bool(getattr(config, "api_mode", True))
-    try:
-        configured_workers = int(getattr(config, "sss_max_workers", 1))
-    except (TypeError, ValueError):
-        configured_workers = 1
-    configured_workers = max(1, min(20, configured_workers))
-    max_workers = _SSS_CREATE_MAX_WORKERS
+    max_workers = resolve_create_workers(config)
+    submit_min_interval_s = resolve_submit_min_interval_s(config)
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 
@@ -2486,8 +2676,11 @@ def run_sss_job(config: Any, stop_event: Any,
             if not allowed:
                 return lock
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，创建订单串行 1 路"
-                  f"（原配置 {configured_workers} 路），读取超时 {read_timeout_s:g}s")
+                  f"开始下单：共 {len(tasks)} 单，创建订单 {max_workers} 路"
+                  f"{'串行' if max_workers == 1 else '并发'}提交，"
+                  f"读取超时 {read_timeout_s:g}s"
+                  + (f"，提交最小间隔 {submit_min_interval_s:g}s"
+                     if submit_min_interval_s > 0 else ""))
             submit_start = time.perf_counter()
             try:
                 final, reconciled = _run_reconciled_submission(
@@ -2500,6 +2693,7 @@ def run_sss_job(config: Any, stop_event: Any,
                     max_workers,
                     relogin=relogin,
                     journal=journal_hooks,
+                    submit_min_interval_s=submit_min_interval_s,
                 )
             finally:
                 lock.release()
@@ -2641,7 +2835,9 @@ def run_sss_job(config: Any, stop_event: Any,
             if not allowed:
                 return lock
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行")
+                  f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行"
+                  + (f"，提交最小间隔 {submit_min_interval_s:g}s"
+                     if submit_min_interval_s > 0 else ""))
             submit_start = time.perf_counter()
 
             def submit_browser(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2682,9 +2878,12 @@ def run_sss_job(config: Any, stop_event: Any,
                     stop_event,
                     progress_callback,
                     decision_callback,
+                    # 浏览器分支只有单个 page，Playwright 同步 API 非线程安全，
+                    # 因此这里固定串行；并发只作用于纯接口分支。
                     max_workers=1,
                     relogin=relogin_browser,
                     journal=journal_hooks,
+                    submit_min_interval_s=submit_min_interval_s,
                 )
             finally:
                 lock.release()

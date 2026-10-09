@@ -290,6 +290,265 @@ def test_submit_tasks_concurrent_faster_than_serial():
     assert concurrent_elapsed < serial_elapsed / 2
 
 
+def test_submit_tasks_concurrent_keeps_configured_workers_in_flight():
+    """并发的**确定性**证据：同一时刻确实有 ``max_workers`` 个 POST 在途。
+
+    不依赖墙钟（CI 上墙钟断言会假失败，见 tests/test_bridge_wps_copy_check.py
+    的同类说明）：4 个 worker 必须同时在途屏障才会通过，串行执行只会超时。
+    """
+    import threading
+    from types import SimpleNamespace
+
+    assert sss.resolve_create_workers(SimpleNamespace(sss_max_workers=4)) == 4
+    assert sss.resolve_create_workers(SimpleNamespace(sss_max_workers=1)) == 1
+
+    lock = threading.Lock()
+    in_flight = 0
+    max_in_flight = 0
+    barrier = threading.Barrier(4, timeout=5)
+
+    def submit(payload):
+        nonlocal in_flight, max_in_flight
+        with lock:
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+        try:
+            barrier.wait()
+        finally:
+            with lock:
+                in_flight -= 1
+        return {"success": True}
+
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(8)]
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    result = sss._submit_tasks_concurrent(tasks, submit, Stop(), None, max_workers=4)
+
+    assert result.succeeded == {f"t{i}" for i in range(8)}
+    assert result.failures == []
+    assert max_in_flight == 4, "并发度没有生效（仍在串行提交）"
+    assert max_in_flight <= 4, "在途请求数不得超过配置的并发路数"
+
+
+@pytest.mark.parametrize("given,expected", [
+    (1, 1), (4, 4), (8, 8), (20, 20), (99, 20), (0, 1), (-3, 1),
+    (None, 1), ("abc", 1), ("7", 7),
+])
+def test_resolve_create_workers_clamps_config(given, expected):
+    """配置里的并发路数被夹到 [1, 20]；残缺取值回退串行而不是静默放大。"""
+    from types import SimpleNamespace
+
+    assert sss.resolve_create_workers(SimpleNamespace(sss_max_workers=given)) == expected
+
+
+def test_resolve_create_workers_defaults_to_four():
+    """出厂默认 4 路；配置对象缺字段这种异常入参回退 1 路（串行）。"""
+    from types import SimpleNamespace
+
+    from app.config import AppConfig
+
+    assert sss.resolve_create_workers(AppConfig()) == 4
+    assert sss.resolve_create_workers(SimpleNamespace()) == 1
+
+
+# ----------------------------------------------------------------------
+# 提交节流（平台对同一账号的建单受理节奏约 1 单 / 2.1 秒，超速会被快速驳回）
+# 2026-10-09 移植自服务端 v3.6.18（commit 03413f6）；只加节奏控制，不改结果分类。
+# ----------------------------------------------------------------------
+INTERNAL_ERROR = "java.lang.IndexOutOfBoundsException: Index: 0, Size: 0"
+
+
+class _NeverStopped:
+    def is_set(self):
+        return False
+
+
+def test_min_interval_spaces_post_starts():
+    """配置提交最小间隔后，相邻两次 POST 的起点至少间隔该值。"""
+    import time
+
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(4)]
+    starts = []
+
+    def submit(payload):
+        starts.append(time.perf_counter())
+        return {"success": True}
+
+    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), None,
+                                          max_workers=4, min_interval_s=0.15)
+    assert result.succeeded == {f"t{i}" for i in range(4)}
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert len(gaps) == 3
+    assert all(gap >= 0.12 for gap in gaps), gaps
+
+
+def test_zero_interval_keeps_immediate_dispatch_without_penalty():
+    """0 = 关闭节流：不排队等待、也不自动放宽（与引入节流前的行为一致）。"""
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(3)]
+    logs = []
+
+    def submit(payload):
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), logs.append,
+                                          max_workers=3)
+    # 桌面版把 success=false 的平台响应归为显式失败（可人工重试），与服务端把
+    # 内部异常归为 uncertain 不同——本次移植只加节流，不改这个分类。
+    assert {identifier for identifier, _detail in result.failures} == {
+        f"t{i}" for i in range(3)}
+    assert result.succeeded == set()
+    assert not any("自动放宽" in message for message in logs)
+    assert not any("提交最小间隔" in message for message in logs)
+
+
+def test_platform_fast_reject_widens_the_submit_interval():
+    """平台快速驳回（IndexOutOfBounds）后自动放宽间隔，且分类不变。"""
+    import time
+
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(4)]
+    starts = []
+    logs = []
+
+    def submit(payload):
+        starts.append(time.perf_counter())
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), logs.append,
+                                          max_workers=4, min_interval_s=0.15)
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert len(result.failures) == 4 and not result.succeeded
+    # 首次驳回即放宽到 0.225 秒，之后继续放宽：最后一个间隔应明显大于最初间隔。
+    assert gaps[-1] >= 0.3, gaps
+    assert gaps[-1] > gaps[0]
+    assert any("自动放宽" in message for message in logs)
+
+
+def test_pacer_penalty_stops_at_its_ceiling():
+    pacer = sss._SubmitPacer(4.0)
+    assert pacer.wait() is True
+    assert pacer.penalize() == pytest.approx(6.0)
+    assert pacer.penalize() == pytest.approx(9.0)
+    assert pacer.penalize() == pytest.approx(10.0)  # 13.5 → 夹到上限
+    assert pacer.penalize() is None  # 已到上限，不再放宽
+
+
+def test_pacer_aborts_waiting_on_stop_or_halt():
+    """节流等待期间出现停止/401/余额不足：请求未发出，返回 False。"""
+    from threading import Event
+
+    pacer = sss._SubmitPacer(4.0)
+    stopped = Event()
+    stopped.set()
+    assert pacer.wait(stopped) is False
+    assert pacer.wait(Event(), halted=lambda: True) is False
+
+
+def test_disabled_pacer_never_waits_or_aborts():
+    """关闭节流时不引入任何新的等待/中止语义（保持原有行为）。"""
+    from threading import Event
+
+    pacer = sss._SubmitPacer(0.0)
+    assert pacer.penalize() is None
+    stopped = Event()
+    stopped.set()
+    assert pacer.wait(stopped) is True
+
+
+def test_rate_reject_signature_only_matches_the_over_rate_error():
+    assert sss._is_rate_reject_response(
+        {"success": False, "message": INTERNAL_ERROR}) is True
+    assert sss._is_rate_reject_response(
+        {"success": False, "message": "地址无效"}) is False
+    assert sss._is_rate_reject_response(
+        {"success": False, "message": "java.lang.RuntimeException: 其他异常"}) is False
+    assert sss._is_rate_reject_response(None) is False
+
+
+def test_submission_trace_records_the_active_interval(monkeypatch):
+    """埋点带上请求发出时生效的提交最小间隔，供后续取证对照。
+
+    服务端把该值写进逐单诊断记录（``min_interval_s``）；桌面版没有诊断文件，
+    对应的逐单记录就是 ``YIKOU_SSS_TRACE=1`` 的 POST 埋点，字段名保持一致。
+    """
+    traces = []
+    monkeypatch.setattr(sss, "_trace", traces.append)
+    task = {"identifier": "t0", "payload": {"i": 0}}
+
+    def submit(payload):
+        return {"success": True}
+
+    sss._submit_tasks_concurrent([task], submit, _NeverStopped(), None, 1,
+                                 min_interval_s=2.5)
+    assert any("min_interval_s=2.500" in message for message in traces), traces
+
+
+def test_pacing_wait_aborts_on_halt_without_sending():
+    """节流等待期间出现 401（halted）：该任务确实没有发出，不算失败也不算未知。
+
+    「未发送」与「已发送未知」是两种不同语义：前者重登后可以补发，后者必须
+    先查站。节流只允许把等待中被中止的任务归入前者，且不产生任何 POST。
+    """
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(2)]
+    posts = []
+
+    def submit(payload):
+        posts.append(payload["i"])
+        raise sss._AuthExpired("401")
+
+    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), None,
+                                          max_workers=2, min_interval_s=2.5)
+    assert len(posts) == 1, "被中止的节流等待不能发出 POST"
+    assert result.auth_error == "401"
+    not_posted = [task["identifier"] for task in tasks
+                  if task["payload"]["i"] not in posts]
+    assert len(not_posted) == 1
+    recorded = ({identifier for identifier, _detail in result.failures}
+                | {identifier for identifier, _detail in result.uncertain}
+                | result.succeeded)
+    assert not_posted[0] not in recorded
+
+
+def test_round_summary_reports_the_active_pacing():
+    """本轮汇总行（对齐服务端 v3.6.18）：耗时/吞吐 + 生效的提交最小间隔。"""
+    logs = []
+    tasks = [{"identifier": "t0", "payload": {}}]
+
+    def submit(payload):
+        return {"success": True}
+
+    sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), logs.append, 1,
+                                 min_interval_s=2.5)
+    assert any("本轮提交 1 单" in message and "；提交最小间隔 2.5 秒" in message
+               for message in logs), logs
+
+
+@pytest.mark.parametrize("given,expected", [
+    (2.5, 2.5), (0, 0.0), (3, 3.0), (-1, 0.0), (999, 60.0), ("4.5", 4.5),
+])
+def test_resolve_submit_min_interval_takes_the_config_value_clamped(given, expected):
+    from types import SimpleNamespace
+
+    assert sss.resolve_submit_min_interval_s(
+        SimpleNamespace(sss_submit_min_interval_s=given)) == expected
+
+
+def test_resolve_submit_min_interval_falls_back_to_paced_default():
+    """配置残缺/坏值时按出厂默认（2.5 秒）保守节流，而不是全速连发。"""
+    from types import SimpleNamespace
+
+    from app.config import AppConfig
+
+    assert sss.resolve_submit_min_interval_s(AppConfig()) == 2.5
+    assert sss.resolve_submit_min_interval_s(SimpleNamespace()) == 2.5
+    assert sss.resolve_submit_min_interval_s(
+        SimpleNamespace(sss_submit_min_interval_s="abc")) == 2.5
+    assert sss.resolve_submit_min_interval_s(
+        SimpleNamespace(sss_submit_min_interval_s=float("nan"))) == 2.5
+
+
 def test_submit_tasks_concurrent_reports_failures():
     tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(4)]
 
@@ -1453,6 +1712,168 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
     assert result["uncertain"] is True
     assert posts == []
     assert any("缺少 records/list" in msg for msg in logs)
+
+
+def test_configured_workers_reach_the_submission_call_site(monkeypatch, tmp_path):
+    """配置的并发路数必须真的传到提交层，且日志如实打印（不再被硬编码成 1 路）。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "B1", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            raise AssertionError(f"提交被替换后不应再查站：{path}")
+
+        def post_json(self, path, body=None):
+            raise AssertionError("提交被替换后不应发出 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    seen: list[int] = []
+
+    def fake_run(tasks, factory, fetch_json, stop_event, callback, decision_callback,
+                 max_workers, **kwargs):
+        seen.append(max_workers)
+        return sss._Reconciliation(set(), [], 0, 0), True
+
+    monkeypatch.setattr(sss, "_run_reconciled_submission", fake_run)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=False, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
+        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_unit_price=1.9, sss_read_timeout_s=30.0, sss_idempotency_field="",
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert seen == [4], "配置的 4 路并发没有传到提交层"
+    assert any("创建订单 4 路并发提交" in msg for msg in logs), logs
+    assert result["processed"] == 1
+
+
+@pytest.mark.parametrize("interval,in_seconds", [(2.5, "2.5s"), (0.0, None)])
+def test_configured_submit_interval_reaches_the_submission_call_site(
+        monkeypatch, tmp_path, interval, in_seconds):
+    """提交最小间隔必须真的传到提交层；开始行只在启用时追加间隔（0 = 关闭）。"""
+    from openpyxl import Workbook
+    from types import SimpleNamespace
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "午餐"
+    ws.append(["午餐", None, None, None])
+    ws.append(["姓名", "门牌号", "电话", "送达时间"])
+    ws.append(["张三", "B1", "13800000001", "11:00"])
+    path = tmp_path / "闪时送.xlsx"
+    wb.save(path)
+    wb.close()
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def fetch_captcha(self):
+            return b"\x89PNG fake"
+
+        def login(self, code):
+            pass
+
+        def get_json(self, path):
+            if "queryStoreAddresses" in path:
+                return {"success": True,
+                        "result": {"records": [{"id": 211053, "name": "一口轻食"}],
+                                   "total": 1}}
+            if "get-login-user-account" in path:
+                return {"success": True,
+                        "result": {"totalAmount": 500.0, "freezeAmount": 0.0}}
+            raise AssertionError(f"提交被替换后不应再查站：{path}")
+
+        def post_json(self, path, body=None):
+            raise AssertionError("提交被替换后不应发出 POST")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sss, "SssApiClient", FakeClient)
+
+    seen: list[float] = []
+
+    def fake_run(tasks, factory, fetch_json, stop_event, callback, decision_callback,
+                 max_workers, **kwargs):
+        seen.append(kwargs.get("submit_min_interval_s"))
+        return sss._Reconciliation(set(), [], 0, 0), True
+
+    monkeypatch.setattr(sss, "_run_reconciled_submission", fake_run)
+
+    cfg = SimpleNamespace(
+        sss_excel_path=str(path), sss_order_source="excel", sss_account="18758187837",
+        sss_dry_run=False, sss_preflight=False, sss_store_name="一口轻食",
+        sss_common_address="嗯哼", sss_use_fixed_address=True,
+        sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
+        sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        element_timeout_ms=8000, sss_url="https://example.invalid",
+        sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
+        sss_submit_min_interval_s=interval,
+        sss_unit_price=1.9, sss_read_timeout_s=30.0, sss_idempotency_field="",
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
+    )
+
+    class Stop:
+        def is_set(self):
+            return False
+
+    logs = []
+    result = sss.run_sss_job(cfg, Stop(), logs.append, password="x",
+                             captcha_callback=lambda img: "1234")
+
+    assert seen == [interval], "配置的提交最小间隔没有传到提交层"
+    start_lines = [msg for msg in logs if "开始下单" in msg]
+    assert start_lines, logs
+    if in_seconds is None:
+        assert "提交最小间隔" not in start_lines[0], start_lines[0]
+    else:
+        assert f"，提交最小间隔 {in_seconds}" in start_lines[0], start_lines[0]
+    assert result["processed"] == 1
 
 
 def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):

@@ -21,12 +21,25 @@ _CONFIG_SAVE_LOCK = threading.RLock()
 #:
 #: * ``0``：旧配置（``config.json`` 里没有 ``defaults_revision`` 这个键）；
 #: * ``2``：闪时送创建订单固定串行提交、读取超时 30 秒。
+#: * ``3``：创建订单恢复 4 路并发（``sss_max_workers`` 重新生效）、读取超时 30 秒。
 #:
-#: 老版本的 4 / 8 路并发设置在下单接口稳定性核实前统一降为 1 路。
-DEFAULTS_REVISION = 2
+#: 第 2 代为了排查平台并发下的 ``IndexOutOfBoundsException`` 把并发统一压成
+#: 1 路串行——那个 1 不是用户选择；第 3 代迁回默认 4 路，此后并发路数真正由
+#: 用户配置决定（想回到串行，把 ``sss_max_workers`` 配成 1 即可，不改代码）。
+DEFAULTS_REVISION = 3
 _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S = 20.0
-_DEFAULT_SSS_MAX_WORKERS = 1
+_LEGACY_DEFAULT_SSS_MAX_WORKERS = 1
+_DEFAULT_SSS_MAX_WORKERS = 4
 _DEFAULT_SSS_READ_TIMEOUT_S = 30.0
+#: 建单提交最小间隔（秒）出厂默认：贴合 2026-10-09 现场观察到的平台建单受理节奏
+#: （约 1 单 / 2.1 秒，见 design/SSS-TIMING-FINDINGS.md）+ 余量。这是保守节奏
+#: 参数，不是已证实的平台硬限速；0 = 关闭节流（回到改动前的全速行为）。
+#: 旧配置缺这个键时按此默认值直接生效（无需迁移），显式写入的 0 原样保留。
+_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5
+_SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
+#: 并发路数上限（夹紧用）。平台是否按账号限流尚无定论，放开上限前先看
+#: ``design/SSS-TIMING-FINDINGS.md`` 的实测结论。
+_SSS_MAX_WORKERS_CEILING = 20
 
 # 本地排单子表 -> 云端排单表（WPS 云文档 file_id）。
 # 表名映射来自用户确认：本地「衣锦」= 云端「校门口」（云端表标题写的是「衣锦汇总」）。
@@ -235,10 +248,14 @@ class AppConfig:
     # 门店 id 缓存：按门店名命中后跳过门店列表查询（门店几乎不变）。
     sss_store_id: int | None = None
     sss_store_name_cached: str = ""
-    # 批量下单并发 worker 数（1 = 串行，用于服务端限流时回退）。
+    # 批量下单并发 worker 数（默认 4；1 = 串行，平台限流或对账压力大时回退）。
     sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS
     # 闪时送 API 读取超时（秒）；与浏览器元素超时独立，慢响应不会误判失败。
     sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S
+    # 建单提交最小间隔（秒）：任意两次 POST 的「起点」至少间隔该值，并发路数不变。
+    # 出厂 2.5 秒（平台受理节奏约 1 单 / 2.1 秒 + 余量）；0 = 关闭节流。
+    # 无界面入口，与 sss_max_workers 同策略：改 config.json 生效。
+    sss_submit_min_interval_s: float = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
     # 闪时送单均价（元）：>0 时只提示预计送完结算费用，不拦截下单。
     sss_unit_price: float = 1.9
     # 可选：平台若支持客户端幂等字段，填字段名（如 clientRequestId）后启用稳定 UUID。
@@ -299,6 +316,7 @@ class AppConfig:
                  sss_store_name_cached: str = "",
                  sss_max_workers: int = _DEFAULT_SSS_MAX_WORKERS,
                  sss_read_timeout_s: float = _DEFAULT_SSS_READ_TIMEOUT_S,
+                 sss_submit_min_interval_s: float = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S,
                  sss_unit_price: float = 1.9,
                  sss_idempotency_field: str = "",
                  wps_enabled: bool = False,
@@ -362,12 +380,26 @@ class AppConfig:
         self.sss_preflight = bool(sss_preflight)
         self.sss_store_id = int(sss_store_id) if sss_store_id not in (None, "") else None
         self.sss_store_name_cached = str(sss_store_name_cached or "")
-        self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
+        try:
+            workers = int(sss_max_workers)
+        except (TypeError, ValueError):
+            workers = _DEFAULT_SSS_MAX_WORKERS
+        self.sss_max_workers = max(1, min(_SSS_MAX_WORKERS_CEILING, workers))
         try:
             read_timeout = float(sss_read_timeout_s)
         except (TypeError, ValueError):
             read_timeout = _DEFAULT_SSS_READ_TIMEOUT_S
         self.sss_read_timeout_s = max(1.0, min(120.0, read_timeout))
+        try:
+            submit_interval = float(sss_submit_min_interval_s)
+        except (TypeError, ValueError):
+            submit_interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+        if submit_interval != submit_interval:  # NaN
+            submit_interval = _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S
+        # 新字段无需迁移：旧 config.json 没有这个键时，构造默认值（出厂 2.5 秒）
+        # 直接生效；显式写入的 0（关闭节流）按原值保留。
+        self.sss_submit_min_interval_s = max(
+            0.0, min(_SSS_SUBMIT_MIN_INTERVAL_CEILING_S, submit_interval))
         # ---- 出厂默认值一次性迁移（见 DEFAULTS_REVISION）----
         try:
             revision = int(defaults_revision)
@@ -376,6 +408,10 @@ class AppConfig:
         if revision < DEFAULTS_REVISION:
             if self.sss_read_timeout_s == _LEGACY_DEFAULT_SSS_READ_TIMEOUT_S:
                 self.sss_read_timeout_s = _DEFAULT_SSS_READ_TIMEOUT_S
+            # 只迁"仍是上一代被强制写死的值"：用户自己配成 1 路的（若将来有）
+            # 或其它显式并发值都保持不变。
+            if self.sss_max_workers == _LEGACY_DEFAULT_SSS_MAX_WORKERS:
+                self.sss_max_workers = _DEFAULT_SSS_MAX_WORKERS
         self.defaults_revision = DEFAULTS_REVISION
         try:
             self.sss_unit_price = max(0.0, float(sss_unit_price))
