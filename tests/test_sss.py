@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import threading
 
 import pytest
 
@@ -2244,3 +2245,46 @@ def test_store_option_step_falls_back_when_override_hardcodes_default():
 
 def test_sss_locators_store_option_uses_store_token():
     assert SSS_LOCATORS["一口轻食选项"]["candidates"][0]["has_text"] == "{store}"
+
+
+def test_serial_submission_runs_in_the_calling_thread():
+    """单路提交必须在**调用线程**内联执行（回归：2026-10-11 线上事故）。
+
+    浏览器表单模式的 ``submit`` 驱动 Playwright 同步 API，而 Playwright 把
+    greenlet 绑定在创建它的线程上：把 submit 丢进 ThreadPoolExecutor 工作线程
+    会每单立刻抛 ``Cannot switch to a different thread``（102 单全部瞬间失败、
+    每单平均 0.0 秒，表单一次都没打开）。max_workers=1 时不存在流水线提速，
+    内联执行语义等价且规避线程约束。
+    """
+    caller = threading.current_thread()
+    seen = []
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(3)]
+
+    def submit(payload):
+        seen.append(threading.current_thread())
+        return {"success": True}
+
+    sss._submit_tasks_concurrent(tasks, submit, threading.Event(), None, 1,
+                                 min_interval_s=0)
+    assert seen and all(thread is caller for thread in seen), (
+        "单路提交必须留在调用线程（Playwright 同步 API 线程约束）")
+
+
+def test_serial_submission_failure_detail_is_emitted_immediately():
+    """失败/未知明细要立刻逐单透出：收尾对账失败时它们是唯一的现场证据。"""
+    logs: list[str] = []
+    tasks = [{"identifier": "t0", "payload": {"i": 0}}]
+
+    def submit(payload):
+        raise RuntimeError("boom-细节")
+
+    sss._submit_tasks_concurrent(tasks, submit, threading.Event(), logs.append, 1)
+    assert any("提交失败：t0" in m and "boom-细节" in m for m in logs), logs
+
+    def submit_uncertain(payload):
+        raise sss._SubmissionUncertain("弹窗没关上")
+
+    logs.clear()
+    sss._submit_tasks_concurrent(tasks, submit_uncertain, threading.Event(),
+                                 logs.append, 1)
+    assert any("提交结果未知：t0" in m and "弹窗没关上" in m for m in logs), logs

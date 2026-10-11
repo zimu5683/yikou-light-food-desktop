@@ -1792,10 +1792,16 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              max_workers: int = 4,
                              on_stop: Callable[[], None] | None = None,
                              min_interval_s: float = 0.0) -> _SubmitResult:
-    """有界并发提交，停止、401、余额不足后不再派发新任务。
+    """有界并发提交，停止、401、余额不足后不再派发新任务。同一轮最多保留
+    ``max_workers`` 个在途 POST。请求超时或断链只记录为 ``uncertain``，由调用方
+    查询订单列表确认，绝不在此处自动重发。
 
-    同一轮最多保留 ``max_workers`` 个在途 POST。请求超时或断链只记录为
-    ``uncertain``，由调用方查询订单列表确认，绝不在此处自动重发。
+    ``max_workers == 1`` 时**在本函数的调用线程内串行执行**，不经过执行器线程：
+    Playwright 同步 API 把 greenlet 绑定在创建它的线程上，浏览器表单分支的
+    ``submit`` 一旦被丢进 ``ThreadPoolExecutor`` 工作线程就会每单立刻抛
+    ``Cannot switch to a different thread``（2026-10-11 实测，102 单全部瞬间
+    失败、每单平均 0.0 秒）。串行本来就轮不到流水线提速，内联执行语义完全
+    等价，还省掉线程切换。
 
     ``min_interval_s`` > 0 时启用全局提交节流（见 `_SubmitPacer`）：相邻两次
     POST 的**起点**至少间隔该值，贴近平台对同一账号的建单受理节奏；出现平台
@@ -1809,9 +1815,6 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     except (TypeError, ValueError):
         pacing = 0.0
     pacer = _SubmitPacer(pacing)
-    iterator = iter(tasks)
-    in_flight: dict[Any, dict[str, Any]] = {}
-    stop_closed = False
     latencies: list[float] = []
     round_started = time.perf_counter()
 
@@ -1859,6 +1862,42 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                f"；min_interval_s={interval_at_send:.3f}")
         return task["identifier"], state, detail
 
+    def classify(identifier: str, state: str, detail: str) -> None:
+        if state == "success":
+            result.succeeded.add(identifier)
+            if len(result.succeeded) % _PROGRESS_EVERY_N == 0:
+                _emit(callback, f"本轮收到成功响应 {len(result.succeeded)}/{len(tasks)} 单")
+        elif state == "failure":
+            result.failures.append((identifier, detail))
+            # 立即透出：收尾对账失败时这些明细是唯一的现场证据
+            # （2026-10-11 的跨线程崩溃就因为对账失败而整批详情丢失）。
+            _emit(callback, f"提交失败：{identifier}：{detail}")
+        elif state == "uncertain":
+            result.uncertain.append((identifier, detail))
+            _emit(callback, f"提交结果未知：{identifier}：{detail}")
+        elif state == "auth" and not result.auth_error:
+            result.auth_error = detail
+        elif state == "balance" and not result.balance_error:
+            result.balance_error = detail
+
+    if workers == 1:
+        # 内联串行：submit 在调用线程内执行（Playwright 同步 API 的线程约束，
+        # 见 docstring）。停止/中止/节流语义与并发路径逐字一致。
+        for task in tasks:
+            if halted():
+                break
+            identifier, state, detail = run_one(task)
+            classify(identifier, state, detail)
+        if stop_event.is_set() and on_stop is not None:
+            on_stop()
+        result.stopped = bool(result.stopped or stop_event.is_set())
+        _emit_round_summary(callback, latencies, round_started, pacer.interval)
+        return result
+
+    iterator = iter(tasks)
+    in_flight: dict[Any, dict[str, Any]] = {}
+    stop_closed = False
+
     with ThreadPoolExecutor(max_workers=workers) as executor:
         exhausted = False
         while in_flight or not exhausted:
@@ -1885,18 +1924,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                     identifier, state, detail = future.result()
                 except Exception as exc:  # pragma: no cover - run_one already contains errors
                     identifier, state, detail = task["identifier"], "uncertain", str(exc)
-                if state == "success":
-                    result.succeeded.add(identifier)
-                    if len(result.succeeded) % _PROGRESS_EVERY_N == 0:
-                        _emit(callback, f"本轮收到成功响应 {len(result.succeeded)}/{len(tasks)} 单")
-                elif state == "failure":
-                    result.failures.append((identifier, detail))
-                elif state == "uncertain":
-                    result.uncertain.append((identifier, detail))
-                elif state == "auth" and not result.auth_error:
-                    result.auth_error = detail
-                elif state == "balance" and not result.balance_error:
-                    result.balance_error = detail
+                classify(identifier, state, detail)
         result.stopped = bool(result.stopped or stop_event.is_set())
     _emit_round_summary(callback, latencies, round_started, pacer.interval)
     return result
