@@ -4,8 +4,10 @@
 《闪时送.xlsx》读取订单（午餐/晚餐两表），再在闪时送平台逐单创建预约单。
 
 默认使用纯接口模式：直接请求闪时送 HTTP 接口完成登录与下单；用户只需在应用内
-输入图形验证码，不再弹出浏览器。备用浏览器模式仍会启动 Playwright，自动填写
-账号密码后由用户在浏览器中输入图形验证码。
+输入图形验证码，不再弹出浏览器。备用浏览器表单模式会启动 Playwright，自动填写
+账号密码后由用户在浏览器中输入图形验证码；下单则按原 ``闪时送.py`` 脚本的
+「创建订单」弹窗流程逐单操作（预约单 → 门店 → 常用地址 → 送达时间 →
+姓名/电话/名称/门牌号 → 确定），结果分类与对账语义和接口分支完全一致。
 
 干跑模式：配置 ``sss_dry_run = true`` 时只组装并打印下单报文，不真实提交。
 凭据与路径由 GUI 通过 :class:`AppConfig` 传入，不写入源码。
@@ -36,8 +38,11 @@ try:
     from .automation import (
         BrowserNotFoundError,
         LocatorError,
+        _build_locator,
         _emit,
+        _find_by_candidates,
         _launch_browser,
+        _locator_failure,
     )
     from .locators import SSS_LOCATORS, load_sss_locators
     from .sss_import import ImportRefused, prepare_day_orders
@@ -53,8 +58,11 @@ except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from automation import (
         BrowserNotFoundError,
         LocatorError,
+        _build_locator,
         _emit,
+        _find_by_candidates,
         _launch_browser,
+        _locator_failure,
     )
     from locators import SSS_LOCATORS, load_sss_locators
     from sss_import import ImportRefused, prepare_day_orders
@@ -94,6 +102,13 @@ _RECONCILE_POLL_INTERVAL_S = 0.5
 _PREFILTER_ZERO_RETRY_DELAY_S = 2.0
 # 订单创建时间与本地批次起点的最大时钟偏差；用于排除其他设备更早创建的相似订单。
 _BATCH_CLOCK_SKEW_S = 120.0
+# 浏览器表单模式（原 闪时送.py 弹窗流程）的等待节奏。
+_UI_CREATE_BTN_TIMEOUT_MS = 30_000      # 打开弹窗：点「创建订单」（含首屏加载）
+_UI_STEP_TIMEOUT_MS = 10_000            # 弹窗内常规步骤（下拉/地址/输入框）
+_UI_FINAL_CONFIRM_TIMEOUT_MS = 15_000   # 最终确定按钮
+_UI_MODAL_CLOSE_TIMEOUT_S = 90.0        # 点最终确定后等弹窗遮罩收场的总时限
+_UI_MODAL_POLL_MS = 5_000               # 遮罩轮询单次等待
+_UI_RECOVER_TIMEOUT_MS = 50_000         # 弹窗收场后等「创建订单」恢复可点
 # 创建订单接口是非幂等 POST，且平台在并发请求下曾间歇性返回
 # ``IndexOutOfBoundsException: Index: 0, Size: 0``（2026-09 实测，未定根因）。
 # 当时为此把提交固定成 1 路串行排查；2026-10-08 恢复为配置值（默认 4 路），
@@ -458,6 +473,229 @@ def _minimize_window(browser: Any, callback: Callable[[str], Any] | None) -> Non
         _emit(callback, "浏览器已最小化（任务栏可见，需要输验证码时再还原）")
     except Exception:
         pass
+
+
+# ===================== 浏览器表单模式（原 闪时送.py 弹窗流程） =====================
+#
+# 浏览器模式（api_mode=False）的下单按原 ``闪时送.py`` 脚本驱动「创建订单」
+# 弹窗，不再在页面会话里 fetch 直调建单接口。登录仍由 :func:`_ensure_logged_in`
+# 自动完成，随后每一单执行：
+#
+#   创建订单 → 等弹窗（即时单）→ 订单类型选「预约单」→ 分单方式选门店
+#   （默认「一口轻食」）→ 常用地址 → 地址选项（默认「嗯哼」）→ 地址确定
+#   → 填送达时间 → 时间确定 → 姓名/电话/名称/门牌号 → 最终确定 → 等弹窗收场
+#
+# 结果分类必须遵守与接口分支相同的契约（见 run_sss_job 中 submit_browser 注释）：
+#   * 最终确定点击**之前**的任何失败 —— 普通异常（这一单确定没有创建，
+#     未决日志按“未落单”关闭，允许人工重试）；
+#   * 最终确定点击后无法确认弹窗收场 —— ``_SubmissionUncertain``（结果未知，
+#     由站内只读对账定论，绝不自动重发）；
+#   * 「创建订单」按钮消失 —— ``_AuthExpired``（登录态丢失，触发统一重登）；
+#   * 弹窗正常收场 —— 返回 ``{"success": True}``（仍以站内对账为最终确认）。
+
+_JS_CLICK_EVENTS = """
+(el) => {
+  const opts = {bubbles: true, cancelable: true, view: window};
+  el.dispatchEvent(new MouseEvent('mousedown', opts));
+  el.dispatchEvent(new MouseEvent('mouseup', opts));
+  el.dispatchEvent(new MouseEvent('click', opts));
+}
+"""
+
+
+def _ui_click(page: Any, step: dict[str, Any], timeout_ms: int, desc: str,
+              *, pick: str = "first") -> Any:
+    """按候选链定位并点击；常规点击被遮挡时回退 JS 派发完整鼠标事件。
+
+    ``pick="last"`` 取最后一个匹配（antd 弹窗按打开顺序追加在 body 末尾，
+    因此叠在「创建订单」弹窗之上的地址弹窗的按钮是最后一个匹配 —— 原脚本
+    用绝对 xpath 选 div[8] 也是同一个道理）。定位不到时保存现场截图并抛
+    普通异常（调用上下文里即“确定未创建”）。
+    """
+    locator, _index = _find_by_candidates(page, step, timeout_ms)
+    if locator is None:
+        raise _locator_failure(page, desc)
+    if pick == "last":
+        locator = locator.last
+    try:
+        locator.click(timeout=timeout_ms)
+    except Exception:  # noqa: BLE001 - 遮挡/时序问题，回退 JS 事件模拟
+        handle = locator.first.element_handle(timeout=1000)
+        if handle is None:
+            raise _locator_failure(page, desc) from None
+        page.evaluate(_JS_CLICK_EVENTS, handle)
+    return locator
+
+
+def _ui_fill(page: Any, step: dict[str, Any], value: str, timeout_ms: int,
+             desc: str) -> Any:
+    """按候选链定位输入框并清空填入（fill 自带清空语义，等价原脚本“全选+删除”）。"""
+    locator, _index = _find_by_candidates(page, step, timeout_ms)
+    if locator is None:
+        raise _locator_failure(page, desc)
+    locator.fill(str(value), timeout=timeout_ms)
+    return locator
+
+
+def _ui_present(page: Any, step: dict[str, Any], timeout_ms: int, desc: str) -> Any:
+    """按候选链等待元素出现（不点击）。"""
+    locator, _index = _find_by_candidates(page, step, timeout_ms)
+    if locator is None:
+        raise _locator_failure(page, desc)
+    return locator
+
+
+def _ui_wait_modal_closed(page: Any, locators: dict[str, Any],
+                          callback: Callable[[str], Any] | None) -> None:
+    """等待「创建订单」弹窗彻底收场（原脚本：遮罩消失 + 创建订单恢复可点）。
+
+    只能在最终确定点击**之后**调用：此刻订单是否已创建无法从页面断言，
+    任何一步等待超时都按“结果未知”抛 ``_SubmissionUncertain``，交给站内
+    只读对账定论，绝不在这里判“失败”（误判失败会导致下一次重复下单）。
+    """
+    deadline = time.monotonic() + _UI_MODAL_CLOSE_TIMEOUT_S
+    while True:
+        try:
+            if time.monotonic() >= deadline:
+                raise _SubmissionUncertain(
+                    f"最终确定已点击，但 {_UI_MODAL_CLOSE_TIMEOUT_S:g} 秒内弹窗遮罩未收场，"
+                    "无法确认订单是否已创建")
+            page.wait_for_selector(".ant-modal-mask", state="hidden",
+                                   timeout=_UI_MODAL_POLL_MS)
+            break
+        except _SubmissionUncertain:
+            raise
+        except Exception:  # noqa: BLE001 - 遮罩还在/页面短暂忙，轮询到总时限为止
+            time.sleep(0.3)
+            continue
+    _emit(callback, "确认弹窗已收场，等待页面恢复…")
+    recover_step = _resolve(locators, "创建订单")
+    candidates = recover_step.get("candidates") if isinstance(recover_step, dict) else None
+    if candidates:
+        try:
+            _build_locator(page, candidates[0]).wait_for(
+                state="visible", timeout=_UI_RECOVER_TIMEOUT_MS)
+        except Exception as exc:  # noqa: BLE001 - 页面恢复不了就无法确认结果
+            raise _SubmissionUncertain(
+                f"弹窗收场后「创建订单」按钮未恢复（{type(exc).__name__}），"
+                "无法确认订单状态") from exc
+    time.sleep(0.5)
+
+
+def _store_option_step(locators: dict[str, Any], store_name: str) -> dict[str, Any]:
+    """解析门店选项步骤；旧版覆盖文件里门店文字写死时按同构候选动态构造。
+
+    表单里选的门店必须与报文指纹里的 ``storeId``（按 ``store_name`` 解析）
+    指向同一家门店，否则站内对账会把刚下的单当成“别人的订单”。
+    """
+    resolved = _substitute_tokens(_resolve(locators, "一口轻食选项"),
+                                  store=store_name, label=store_name)
+    if store_name != "一口轻食" and all(
+            store_name not in json.dumps(candidate, ensure_ascii=False)
+            for candidate in resolved.get("candidates", [])):
+        resolved = {"candidates": [
+            {"css": ".ant-select-dropdown .ant-select-item-option", "has_text": store_name},
+            {"text": store_name},
+        ]}
+    return resolved
+
+
+def _ui_dismiss_modal(page: Any) -> None:
+    """表单中途失败后 best-effort 关掉残留弹窗，避免污染下一单的表单状态。"""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:  # noqa: BLE001 - 收尾动作失败不影响原异常上抛
+        pass
+
+
+def _ui_create_order(page: Any, payload: dict[str, Any], locators: dict[str, Any],
+                     *, store_name: str, address_label: str,
+                     callback: Callable[[str], Any] | None) -> dict[str, Any]:
+    """按原 ``闪时送.py`` 的弹窗流程创建一笔预约单（浏览器表单模式的提交器）。
+
+    姓名/电话/门牌/送达时间/商品名一律从 ``payload``（与接口分支同一套
+    ``build_order_payload`` 报文）读取，保证“表单里填什么”与“指纹/对账
+    期望什么”完全一致；门店与常用地址在表单里按 ``store_name`` 与
+    ``address_label``（常用地址标签，默认「嗯哼」）选择，浏览器分支的报文
+    地址也必须来自同一条常用地址记录（见 run_sss_job 浏览器分支的地址
+    准备注释）。
+
+    返回 ``{"success": True}``；异常分类契约见本节开头的模块注释。
+    """
+    address = payload.get("receiveAddress")
+    address = address if isinstance(address, dict) else {}
+    goods_detail = payload.get("goodsDetail")
+    goods_name = ""
+    if isinstance(goods_detail, list) and goods_detail and isinstance(goods_detail[0], dict):
+        goods_name = str(goods_detail[0].get("goodsName") or "")
+    name = str(payload.get("receiveName") or "")
+    phone = str(payload.get("receivePhone") or "")
+    door = str(address.get("doorNum") or "")
+    expected_time = str(payload.get("expectedDeliveryTime") or "")
+
+    def step(key: str, **tokens: str) -> dict[str, Any]:
+        return _substitute_tokens(_resolve(locators, key), **tokens)
+
+    # 0. 登录态守卫：「创建订单」按钮消失 = 已被登出
+    if not page.locator("text=创建订单").count():
+        raise _AuthExpired("登录态已失效（「创建订单」按钮未找到）")
+
+    def open_and_fill_form() -> None:
+        """打开弹窗并把表单填到“只差最终确定”；任何失败都发生在提交之前。"""
+        # 1. 打开「创建订单」弹窗并等它出现
+        _ui_click(page, step("创建订单"), _UI_CREATE_BTN_TIMEOUT_MS, "点击创建订单")
+        _ui_present(page, step("订单弹窗"), _UI_STEP_TIMEOUT_MS, "创建订单弹窗未出现")
+
+        # 2. 订单类型：即时单 → 预约单（第二候选兼容上一单残留的“已选预约单”）
+        _ui_click(page, step("订单类型下拉"), _UI_STEP_TIMEOUT_MS, "打开订单类型下拉")
+        _ui_click(page, step("预约单选项"), _UI_STEP_TIMEOUT_MS, "选择预约单")
+
+        # 3. 分单方式：自动分单 → 门店（默认「一口轻食」）
+        _ui_click(page, step("分单下拉", store=store_name), _UI_STEP_TIMEOUT_MS,
+                  "打开分单下拉")
+        _ui_click(page, _store_option_step(locators, store_name),
+                  _UI_STEP_TIMEOUT_MS, f"选择门店「{store_name}」")
+
+        # 4. 常用地址：打开 → 选地址 → 确定（确定按钮常被遮挡，交给 JS 回退）
+        _ui_click(page, step("常用地址"), _UI_STEP_TIMEOUT_MS, "打开常用地址")
+        _ui_click(page, step("地址选项", label=address_label), _UI_STEP_TIMEOUT_MS,
+                  f"选择常用地址「{address_label}」")
+        _ui_click(page, step("地址确定"), _UI_STEP_TIMEOUT_MS, "确认常用地址",
+                  pick="last")
+
+        # 5. 送达时间：点开选择器 → 全选删除 → 逐字键入 → 确定
+        delivery_input = _ui_present(page, step("送达时间输入"), _UI_STEP_TIMEOUT_MS,
+                                     "定位送达时间输入框")
+        delivery_input.click(timeout=_UI_STEP_TIMEOUT_MS)
+        try:
+            delivery_input.press("ControlOrMeta+a", timeout=_UI_STEP_TIMEOUT_MS)
+        except Exception:  # noqa: BLE001 - 旧内核不认 ControlOrMeta 时退回 Control
+            delivery_input.press("Control+a", timeout=_UI_STEP_TIMEOUT_MS)
+        delivery_input.press("Delete", timeout=_UI_STEP_TIMEOUT_MS)
+        delivery_input.type(expected_time, timeout=_UI_STEP_TIMEOUT_MS)
+        _ui_click(page, step("时间确定"), _UI_STEP_TIMEOUT_MS, "确认送达时间")
+
+        # 6. 收件信息（fill 自带清空，等价原脚本“全选+删除再输入”）
+        _ui_fill(page, step("顾客姓名"), name, _UI_STEP_TIMEOUT_MS, "填顾客姓名")
+        _ui_fill(page, step("顾客电话"), phone, _UI_STEP_TIMEOUT_MS, "填顾客电话")
+        _ui_fill(page, step("商品名称"), goods_name, _UI_STEP_TIMEOUT_MS, "填商品名称")
+        _ui_fill(page, step("门牌号"), door, _UI_STEP_TIMEOUT_MS, "填门牌号")
+
+    try:
+        open_and_fill_form()
+    except Exception:
+        # 中途失败：弹窗还开着（可能残留半填数据），best-effort 关掉再上抛，
+        # 否则下一单会在脏表单上继续操作。
+        _ui_dismiss_modal(page)
+        raise
+
+    # 7. 最终确定：从这里开始结果才可能未知
+    _ui_click(page, step("最终确定"), _UI_FINAL_CONFIRM_TIMEOUT_MS, "点击最终确定")
+
+    # 8. 等弹窗收场（遮罩消失 + 创建订单恢复），失败即结果未知
+    _ui_wait_modal_closed(page, locators, callback)
+    return {"success": True}
 
 
 def build_order_payload(order: dict[str, Any], is_dinner: bool, store_id: int,
@@ -2345,8 +2583,11 @@ def run_sss_job(config: Any, stop_event: Any,
     ``config.sss_dry_run`` 为真时只组装并打印报文，不真实提交（且跳过
     登录与门店/地址查询，无需验证码）。
     ``captcha_callback`` 在纯接口模式接收验证码 PNG 字节，返回用户输入的验证码。
-    下单阶段串行提交（创建订单接口固定 1 路），提交前后均会
-    查询站内订单列表；状态不确定时绝不直接重复 POST。
+
+    提交路径分两种（``config.api_mode``）：纯接口模式按 ``sss_max_workers``
+    并发 POST 建单接口；浏览器表单模式（默认关闭）启动 Playwright，登录后按
+    原 ``闪时送.py`` 脚本的「创建订单」弹窗流程逐单操作，固定串行。两条路径
+    都会做提交前后的站内订单列表对账；状态不确定时绝不直接重复提交。
     """
     load_start = time.perf_counter()
     now = _dt.datetime.now()
@@ -2742,6 +2983,20 @@ def run_sss_job(config: Any, stop_event: Any,
         finally:
             client.close()
 
+    # 浏览器表单模式的前置配置检查：弹窗里选的就是「常用地址」，报文指纹必须
+    # 与之指向同一处；没有配置常用地址标签就无法保证一致性，直接拒绝（未登录）。
+    if not common_address:
+        _emit(progress_callback,
+              "错误：浏览器表单模式需要配置常用地址标签（界面上的「常用地址」，"
+              "默认「嗯哼」），表单按它选择收货地址")
+        return _result({
+            "status": "config_error", "processed": total, "created": 0,
+            "submitted": 0, "previewed": 0, "stopped": True, "partial": False,
+            "reconciled": False, "uncertain": False,
+            "reason": "browser_ui_mode_requires_common_address",
+            "semantics": "pre-submit-config-guard",
+        })
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -2774,11 +3029,18 @@ def run_sss_job(config: Any, stop_event: Any,
                 return payload
 
             def prepare_browser_session_data() -> tuple[int, dict[str, Any]]:
+                # 表单流程在弹窗里选择的就是「常用地址」，报文指纹必须与之一致；
+                # 固定地址坐标只有纯接口模式消费（表单里无处填写坐标）。
+                if use_fixed_address:
+                    _emit(progress_callback,
+                          f"浏览器表单模式：报文地址改用常用地址「{common_address}」"
+                          "（固定地址配置仅在纯接口模式生效）")
                 _emit(progress_callback, "读取门店与常用地址…")
                 prep_start = time.perf_counter()
                 store_id, address = _prepare_store_and_address(
                     fetch_json, config, store_name, common_address,
-                    use_fixed_address, progress_callback, parallel=False,
+                    False,  # 表单选的是常用地址，指纹必须与之一致
+                    progress_callback, parallel=False,
                     store_cache_callback=store_cache_callback)
                 _emit(progress_callback,
                       f"门店与地址准备耗时 {(time.perf_counter() - prep_start):.1f} 秒")
@@ -2835,40 +3097,29 @@ def run_sss_job(config: Any, stop_event: Any,
             if not allowed:
                 return lock
             _emit(progress_callback,
-                  f"开始下单：共 {len(tasks)} 单，浏览器模式固定串行"
+                  f"开始下单：共 {len(tasks)} 单，浏览器表单模式（创建订单弹窗）串行提交"
                   + (f"，提交最小间隔 {submit_min_interval_s:g}s"
                      if submit_min_interval_s > 0 else ""))
             submit_start = time.perf_counter()
 
             def submit_browser(payload: dict[str, Any]) -> dict[str, Any]:
-                """浏览器分支的单次下单提交，**异常归类必须与接口分支完全一致**。
+                """浏览器表单模式的单笔下单（原 ``闪时送.py`` 弹窗流程）。
 
-                为什么必须在这里分类：``_submit_tasks_concurrent`` 只把显式标记的
-                ``_SubmissionUncertain`` / ``SssTransportError`` 当作"结果未知"，
-                其余异常都会归为 ``failure``，而未决日志会把 ``failure`` 当作
-                "服务端明确拒绝"直接关闭记录 —— 一旦真把网络错误归成 failure，
-                下一次运行就能重复下单。所以：
+                异常归类契约与接口分支完全一致（见 ``_submit_tasks_concurrent``）：
 
-                * ``page.evaluate`` 抛错（fetch 失败 / 页面崩了 / 窗口被关）→ 结果未知；
-                * 非 2xx（含 502/504 这类网关错误）→ 结果未知；
-                * 响应不是 JSON、或空响应 → 结果未知；
-                * 只有 401 / 明确的登录态失效才算"需要重登"；
-                * 明确的 ``success: false`` 交给上层按"服务端拒绝"处理（可安全关闭记录）。
+                * 最终确定点击**之前**的任何失败（按钮/输入框定位不到、送达时间
+                  确定失败等）→ 普通异常按 ``failure`` 处理 —— 此刻确定没有创建
+                  订单，未决日志按“未落单”关闭，可安全人工重试；
+                * 最终确定点击后无法确认弹窗收场 → ``_SubmissionUncertain``，
+                  结果未知，由站内只读对账定论，绝不自动重发；
+                * 「创建订单」按钮消失 → ``_AuthExpired``，触发统一重登。
+
+                成功返回 ``{"success": True}``；订单最终以站内对账确认为准。
                 """
-                try:
-                    http, resp = _submit_order(page, payload)
-                except Exception as exc:  # noqa: BLE001 - 传输层失败一律未知
-                    raise _SubmissionUncertain(
-                        f"浏览器提交未取得可确认响应：{type(exc).__name__}: {exc}") from exc
-                if http == 401 or is_auth_expired_payload(resp):
-                    raise _AuthExpired(auth_error_message(resp, fallback="浏览器会话登录态失效"))
-                if http and not 200 <= int(http) < 300:
-                    raise _SubmissionUncertain(
-                        f"浏览器提交返回 HTTP {http}，无法确认订单是否已创建")
-                if not isinstance(resp, dict) or not resp:
-                    raise _SubmissionUncertain(
-                        "浏览器提交返回空响应或非 JSON，无法确认订单是否已创建")
-                return resp
+                return _ui_create_order(
+                    page, payload, locators,
+                    store_name=store_name, address_label=common_address,
+                    callback=progress_callback)
 
             try:
                 final, reconciled = _run_reconciled_submission(
@@ -2915,11 +3166,6 @@ def run_sss_job(config: Any, stop_event: Any,
         reconciled=reconciled, pending_active=pending_active,
         journal_error=journal_hooks.error, prepared_any=journal_hooks.prepared_any,
         idempotency_field=idempotency_field))
-
-
-def _submit_order(page: Any, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    http, resp = _sss_api(page, "POST", _CREATE_ORDER_PATH, payload)
-    return http, resp
 
 
 __all__ = ["run_sss_job", "load_sss_orders", "compute_delivery_time",

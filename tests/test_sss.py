@@ -2018,3 +2018,229 @@ def test_expected_delivery_date_rolls_over_month_boundary():
 
     assert expected_delivery_date(dt.datetime(2026, 9, 30, 20, 0)) == dt.date(2026, 10, 1)
     assert expected_delivery_date(dt.datetime(2026, 12, 31, 16, 0)) == dt.date(2027, 1, 1)
+
+
+# ===================== 浏览器表单模式（原 闪时送.py 弹窗流程） =====================
+#
+# FakePage/FakeLocator 只实现 _ui_create_order 用到的 Playwright 最小表面：
+# 候选链定位（css/text/placeholder 的“是否可见”由 visible 集合决定）、点击、
+# 填充、按键、遮罩 hidden 轮询。真实浏览器交互不在离线测试范围（与旧约定一致）。
+
+
+class FakeLocator:
+    def __init__(self, page, key, found, picked=""):
+        self._page, self._key, self._found, self.picked = page, key, found, picked
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        self.picked = "last"
+        return self
+
+    def filter(self, has_text=None, has_text_re=None):
+        key = has_text if has_text else self._key
+        return FakeLocator(self._page, key,
+                           self._found and key in self._page.visible, self.picked)
+
+    def count(self):
+        return 1 if self._found else 0
+
+    def wait_for(self, state="visible", timeout=None):
+        if not self._found:
+            raise TimeoutError(f"fake wait timeout: {self._key}")
+
+    def click(self, timeout=None):
+        self._page.record("click", self._key, self.picked)
+
+    def fill(self, value, timeout=None):
+        self._page.record("fill", self._key, str(value))
+
+    def press(self, key, timeout=None):
+        self._page.record("press", self._key, key)
+
+    def type(self, text, timeout=None):
+        self._page.record("type", self._key, str(text))
+
+    def element_handle(self, timeout=None):
+        return object() if self._found else None
+
+
+class FakePage:
+    def __init__(self, visible, mask_visible=True):
+        self.visible = set(visible)
+        self.mask_visible = mask_visible
+        self.actions = []
+        self.on_click = None
+
+    def record(self, kind, key, value=""):
+        self.actions.append((kind, key, value))
+        if kind == "click" and self.on_click:
+            self.on_click(key, value)
+
+    # ---- _build_locator 的最小表面 ----
+    def locator(self, selector):
+        if selector == "text=创建订单":
+            return FakeLocator(self, "创建订单", "创建订单" in self.visible)
+        return FakeLocator(self, selector, selector in self.visible)
+
+    def get_by_text(self, text):
+        return FakeLocator(self, text, text in self.visible)
+
+    def get_by_placeholder(self, placeholder):
+        return FakeLocator(self, placeholder, placeholder in self.visible)
+
+    def get_by_role(self, role, **kwargs):
+        name = str(kwargs.get("name") or role)
+        return FakeLocator(self, name, name in self.visible)
+
+    def wait_for_selector(self, selector, state=None, timeout=None):
+        if state == "hidden":
+            if self.mask_visible:
+                raise TimeoutError("fake mask still visible")
+            return None
+        raise AssertionError(f"unexpected wait_for_selector: {selector} {state}")
+
+    def wait_for_timeout(self, ms):
+        pass
+
+    def evaluate(self, script, arg=None):
+        self.record("evaluate", "js", "")
+        return None
+
+
+_NAME_INPUT_XPATH = "//*[contains(text(),'名称')]/following::input[1]"
+
+
+def _ui_visible_set():
+    """一次完整表单流程需要可见的全部元素键（按候选链第一个命中项取键）。"""
+    return {
+        "创建订单", "即时单", "预约单", "自动分单", "一口轻食",
+        "常用地址", "嗯哼", "确定",
+        ".ant-picker-ok button",
+        ".ant-modal-footer .ant-btn-primary",  # 地址确定/最终确定的 css 候选
+        "请选择日期时间",  # 送达时间输入 placeholder
+        "#receiveName", "#receiveMobile", _NAME_INPUT_XPATH, "#doorNum",
+    }
+
+
+def _ui_payload():
+    import datetime as dt2
+
+    order = {"row": 3, "name": "张三", "door": "A101", "phone": "13800000001"}
+    address = {"lnt": 119.728224, "lat": 30.256632,
+               "areaCode": "330110", "addressDetail": "浙江农林大学东湖校区"}
+    return sss.build_order_payload(order, False, 211053, address, "轻食",
+                                   now=dt2.datetime(2026, 10, 11, 10, 0))
+
+
+def test_ui_create_order_success_drives_full_form_flow(monkeypatch, tmp_path):
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    page = FakePage(_ui_visible_set(), mask_visible=True)
+    # 点下最终确定（pick != last 的“确定”）后模拟服务端受理、弹窗收场
+    page.on_click = lambda key, picked: (
+        setattr(page, "mask_visible", False)
+        if key == "确定" and picked == "" else None)
+
+    result = sss._ui_create_order(
+        page, _ui_payload(), SSS_LOCATORS, store_name="一口轻食",
+        address_label="嗯哼", callback=None)
+
+    assert result == {"success": True}
+    clicks = [a for a in page.actions if a[0] == "click"]
+    keys = [(k, picked) for _kind, k, picked in clicks]
+    # 弹窗流程的关键点击按顺序出现：创建订单 → 预约单 → 门店 → 地址 → 确定(last)
+    assert keys.index(("创建订单", "")) < keys.index(("预约单", ""))
+    assert keys.index(("预约单", "")) < keys.index(("一口轻食", ""))
+    assert keys.index(("一口轻食", "")) < keys.index(("嗯哼", ""))
+    assert ("嗯哼", "") in keys
+    # 地址弹窗的确定取最后一个匹配（pick="last"），最终确定是普通 pick
+    assert ("确定", "last") in keys
+    assert ("确定", "") in keys
+    fills = {key: value for kind, key, value in page.actions if kind == "fill"}
+    assert fills["#receiveName"] == "张三"
+    assert fills["#receiveMobile"] == "13800000001"
+    assert fills[_NAME_INPUT_XPATH] == "轻食"
+    assert fills["#doorNum"] == "A101"
+    # 送达时间：全选删除后逐字键入报文里的 expectedDeliveryTime
+    typed = [value for kind, key, value in page.actions if kind == "type"]
+    assert typed == ["2026-10-11 11:00:00"]
+    presses = [value for kind, key, value in page.actions if kind == "press"]
+    assert presses == ["ControlOrMeta+a", "Delete"]
+
+
+def test_ui_create_order_raises_auth_expired_when_logged_out():
+    visible = _ui_visible_set()
+    visible.discard("创建订单")
+    page = FakePage(visible)
+    with pytest.raises(sss._AuthExpired):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=None)
+
+
+def test_ui_create_order_fails_before_final_confirm_keeps_no_uncertainty(monkeypatch, tmp_path):
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    visible = _ui_visible_set()
+    visible.discard("#receiveName")  # 中途丢一个输入框
+    page = FakePage(visible)
+    with pytest.raises(sss.LocatorError):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=None)
+    # 最终确定从未被点击 → 这单确定没有创建（failure 语义，不是 uncertain）
+    assert ("确定", "") not in page.actions
+
+
+def test_ui_create_order_uncertain_when_modal_never_closes(monkeypatch):
+    monkeypatch.setattr(sss, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sss, "_UI_MODAL_POLL_MS", 100)
+    page = FakePage(_ui_visible_set(), mask_visible=True)  # 遮罩永远不收场
+    with pytest.raises(sss._SubmissionUncertain):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=None)
+
+
+def test_ui_create_order_uncertain_when_create_button_never_recovers(monkeypatch):
+    monkeypatch.setattr(sss, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sss, "_UI_MODAL_POLL_MS", 100)
+    page = FakePage(_ui_visible_set(), mask_visible=True)
+
+    def on_click(key, picked):
+        if key == "确定" and picked == "":
+            page.mask_visible = False       # 遮罩收场
+            page.visible.discard("创建订单")  # 但页面再也没恢复
+    page.on_click = on_click
+    with pytest.raises(sss._SubmissionUncertain):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=None)
+
+
+def test_store_option_step_substitutes_store_name_from_config():
+    default = sss._store_option_step(SSS_LOCATORS, "一口轻食")
+    assert default["candidates"][0]["has_text"] == "一口轻食"
+    other = sss._store_option_step(SSS_LOCATORS, "东门店")
+    assert other["candidates"][0]["has_text"] == "东门店"
+
+
+def test_store_option_step_falls_back_when_override_hardcodes_default():
+    """旧版 sss_locators.json 把门店文字写死成「一口轻食」：换门店名时兜底。"""
+    override = {"一口轻食选项": {"candidates": [
+        {"css": ".ant-select-dropdown .ant-select-item-option", "has_text": "一口轻食"},
+        {"text": "一口轻食"},
+    ]}}
+    step = sss._store_option_step(override, "东门店")
+    assert step["candidates"][0]["has_text"] == "东门店"
+    assert step["candidates"][1]["text"] == "东门店"
+
+
+def test_sss_locators_store_option_uses_store_token():
+    assert SSS_LOCATORS["一口轻食选项"]["candidates"][0]["has_text"] == "{store}"

@@ -177,8 +177,10 @@ SSS_LOCATORS: Dict[str, Any] = {
         ],
     },
     "订单类型下拉": {
+        # 第二候选兼容“上一单已选中预约单、弹窗未重置”的残留状态。
         "candidates": [
             {"css": ".ant-select-selector", "has_text": "即时单"},
+            {"css": ".ant-select-selector", "has_text_re": "即时单|预约单"},
             {"css": "span.ant-select-selection-item", "has_text": "即时单"},
             {"text": "即时单"},
         ],
@@ -190,16 +192,20 @@ SSS_LOCATORS: Dict[str, Any] = {
         ],
     },
     "分单下拉": {
+        # 第二候选兼容“上一单已选中门店”的残留状态（{store} 按配置替换）。
         "candidates": [
             {"css": ".ant-select-selector", "has_text": "自动分单"},
+            {"css": ".ant-select-selector", "has_text_re": "自动分单|{store}"},
             {"css": "span.ant-select-selection-item", "has_text": "自动分单"},
             {"text": "自动分单"},
         ],
     },
     "一口轻食选项": {
+        # 门店文字由 sss_store_name（默认“一口轻食”）通过 {store} 动态替换；
+        # 旧版覆盖文件里写死的「一口轻食」由 sss._store_option_step 兜底。
         "candidates": [
-            {"css": ".ant-select-dropdown .ant-select-item-option", "has_text": "一口轻食"},
-            {"text": "一口轻食"},
+            {"css": ".ant-select-dropdown .ant-select-item-option", "has_text": "{store}"},
+            {"text": "{store}"},
         ],
     },
     "常用地址": {

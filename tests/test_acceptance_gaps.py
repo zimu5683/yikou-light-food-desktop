@@ -639,54 +639,151 @@ def test_keep_keeps_blocking_and_never_writes(tmp_path: Path):
 
 
 # ======================================================================
-# A19：浏览器（Playwright）路径 —— POST 前留痕 + 异常归类与接口路径一致
+# A19：浏览器表单路径 —— 提交前留痕 + 异常归类与接口路径一致
 # ======================================================================
 
+class _FakeLocator:
+    """候选链定位用的假定位器：key 在 page.visible 里才算可见。"""
+
+    def __init__(self, page, key, found, picked=""):
+        self._page, self._key, self._found, self.picked = page, key, found, picked
+
+    @property
+    def first(self):
+        return self
+
+    @property
+    def last(self):
+        self.picked = "last"
+        return self
+
+    def filter(self, has_text=None, has_text_re=None):
+        key = has_text if has_text else self._key
+        return _FakeLocator(self._page, key,
+                            self._found and key in self._page.visible, self.picked)
+
+    def count(self):
+        return 1 if self._found else 0
+
+    def wait_for(self, state="visible", timeout=None):
+        if not self._found:
+            raise TimeoutError(f"fake wait timeout: {self._key}")
+
+    def click(self, timeout=None):
+        self._page._click(self._key, self.picked)
+
+    def fill(self, value, timeout=None):
+        self._page.form[self._key] = str(value)
+
+    def press(self, _key, timeout=None) -> None: ...
+
+    def type(self, text, timeout=None):
+        self._page.form["__typed__"] = str(text)
+
+    def element_handle(self, timeout=None):
+        return object() if self._found else None
+
+
+class _FakeKeyboard:
+    def __init__(self, page):
+        self._page = page
+
+    def press(self, key):
+        if key == "Escape":
+            self._page.mask_visible = False
+
+
 class _FakePage:
-    """只实现 sss.py 浏览器分支用到的那几个方法。"""
+    """浏览器表单分支的假页面。
 
-    def __init__(self, *, list_records=None, post_result=None,
-                 post_raises: BaseException | None = None,
-                 post_http: int = 200):
+    evaluate() 只服务 GET（门店/常用地址/余额/列表对账）；建单走 UI 表单：
+    ``visible`` 集合决定候选链能否命中，点下最终确定（普通 pick 的「确定」）
+    视为服务端受理成功 —— 订单进入列表供对账、遮罩收场。
+    ``modal_never_closes`` / ``create_never_recovers`` 模拟"最终确定已点击但
+    结果无法确认"的两种故障，此时**不**落单（对应服务端实际拒绝/超时的
+    未知结果，由只读对账判缺、未决日志保持 unresolved）。
+    """
+
+    _ADDR_DETAIL = "浙江农林大学东湖校区"
+
+    def __init__(self, *, list_records=None, modal_never_closes=False,
+                 create_never_recovers=False, missing_element=""):
         self.calls: list[tuple[str, str]] = []
-        self.posts: list[dict] = []
+        self.confirms: list[dict] = []
         self._list_records = list_records or []
-        self._post_result = post_result
-        self._post_raises = post_raises
-        self._post_http = post_http
+        self._modal_never_closes = modal_never_closes
+        self._create_never_recovers = create_never_recovers
+        self.visible = {
+            "创建订单", "即时单", "预约单", "自动分单", "一口轻食",
+            "常用地址", "嗯哼", "确定",
+            ".ant-picker-ok button",
+            ".ant-modal-footer .ant-btn-primary",
+            "请选择日期时间",
+            "#receiveName", "#receiveMobile",
+            "//*[contains(text(),'名称')]/following::input[1]",
+            "#doorNum",
+        }
+        if missing_element:
+            self.visible.discard(missing_element)
+        self.form: dict[str, str] = {}
+        self.mask_visible = True
+        self.keyboard = _FakeKeyboard(self)
 
-    # main.py 里用到的页面动作（本测试不走到）
+    def _click(self, key: str, picked: str) -> None:
+        self.calls.append(("click", f"{key}@{picked or 'first'}"))
+        if key == "确定" and picked == "":  # 最终确定（地址确定是 pick="last"）
+            self.confirms.append(dict(self.form))
+            if self._modal_never_closes:
+                return  # 结果未知：遮罩收不了场，不落单，交由只读对账判定
+            self.mask_visible = False  # 遮罩收场
+            if self._create_never_recovers:
+                self.visible.discard("创建订单")  # 但「创建订单」不恢复：同样结果未知
+                return
+            self._list_records = [*self._list_records, {
+                "recipientName": self.form.get("#receiveName", ""),
+                "recipientPhone": [self.form.get("#receiveMobile", "")],
+                "recipientAddress": f"{self._ADDR_DETAIL}"
+                                    f"{self.form.get('#doorNum', '')}",
+                "expectedDeliveryTime": self.form.get("__typed__", ""),
+                "status": 2,
+            }]
+            self.mask_visible = False
+            if self._create_never_recovers:
+                self.visible.discard("创建订单")
+
+    # ---- 候选链定位表面（_build_locator 消费） ----
+    def locator(self, selector):
+        if selector == "text=创建订单":
+            return _FakeLocator(self, "创建订单", "创建订单" in self.visible)
+        return _FakeLocator(self, selector, selector in self.visible)
+
+    def get_by_text(self, text):
+        return _FakeLocator(self, text, text in self.visible)
+
+    def get_by_placeholder(self, placeholder):
+        return _FakeLocator(self, placeholder, placeholder in self.visible)
+
+    def get_by_role(self, role, **kwargs):
+        name = str(kwargs.get("name") or role)
+        return _FakeLocator(self, name, name in self.visible)
+
+    # ---- 其它 ----
     def goto(self, *_a, **_k) -> None: ...
-    def locator(self, *_a, **_k):
-        raise AssertionError("本测试不应调用页面元素定位")
-    def wait_for_selector(self, *_a, **_k) -> None: ...
+
+    def wait_for_selector(self, selector, state=None, timeout=None):
+        if state == "hidden":
+            if self.mask_visible:
+                raise TimeoutError("fake mask still visible")
+            return None
+        raise AssertionError(f"unexpected wait_for_selector: {selector} {state}")
+
     def wait_for_timeout(self, *_a, **_k) -> None: ...
-    def fill(self, *_a, **_k) -> None: ...
 
     def evaluate(self, _js: str, arg: dict) -> str:
         method = str(arg.get("method") or "")
         path = str(arg.get("path") or "")
-        body = arg.get("body")
         self.calls.append((method, path))
-        if method == "POST":
-            self.posts.append(body or {})
-            if self._post_raises is not None:
-                raise self._post_raises
-            payload = (self._post_result
-                       if self._post_result is not None else {"success": True})
-            if payload.get("success") and 200 <= int(self._post_http) < 300:
-                # 站内真的落单了：把它加进列表，后续只读对账才可能确认。
-                address = (body or {}).get("receiveAddress") or {}
-                self._list_records = [*self._list_records, {
-                    "recipientName": (body or {}).get("receiveName"),
-                    "recipientPhone": [(body or {}).get("receivePhone")],
-                    "recipientAddress": f"{address.get('addressDetail', '')}"
-                                        f"{address.get('doorNum', '')}",
-                    "expectedDeliveryTime": (body or {}).get("expectedDeliveryTime"),
-                    "status": 2,
-                }]
-            return json.dumps({"http": self._post_http,
-                               "text": json.dumps(payload, ensure_ascii=False)})
+        assert method != "POST", "表单模式下建单不再走页面内 fetch POST"
         if "list" in path:
             payload = {"success": True, "result": {"records": self._list_records,
                                                   "total": len(self._list_records)}}
@@ -694,6 +791,12 @@ class _FakePage:
             payload = {"success": True, "result": [{"name": "一口轻食", "id": 7}]}
         elif "account" in path:
             payload = {"success": True, "result": {"totalAmount": 1000.0}}
+        elif "customerAddress" in path:
+            # 「嗯哼」常用地址（2026-09-05 实测字段结构：code=区划码、position=地址）
+            payload = {"success": True, "result": [{
+                "id": 75812, "name": "嗯哼", "longitude": "119.728224",
+                "latitude": "30.256632", "code": "330110",
+                "position": self._ADDR_DETAIL}]}
         else:
             payload = {"success": True, "result": []}
         return json.dumps({"http": 200, "text": json.dumps(payload, ensure_ascii=False)})
@@ -738,8 +841,8 @@ def browser_env(tmp_path, monkeypatch):
     return cfg, page
 
 
-def test_browser_path_writes_inflight_before_post(browser_env, tmp_path):
-    """A19：浏览器路径也必须在 POST 之前留下 inflight 记录。"""
+def test_browser_path_writes_inflight_before_submit(browser_env, tmp_path):
+    """A19：浏览器表单路径也必须在最终确定（提交动作）之前留下 inflight 记录。"""
     cfg, page = browser_env
     journal_path = Path(cfg.sss_uncertain_path)
     seen_statuses: list[str] = []
@@ -759,11 +862,12 @@ def test_browser_path_writes_inflight_before_post(browser_env, tmp_path):
         sss_module.append_records = original
 
     assert result["created"] == 2, "假实现里两单都应成功"
-    assert page.posts, "浏览器路径应该真的发出 POST"
-    assert "inflight" in seen_statuses, "POST 之前必须先写 inflight"
-    assert seen_statuses.index("inflight") < len(seen_statuses), seen_statuses
+    assert len(page.confirms) == 2, "表单路径应该真的点下最终确定"
+    assert all(method != "POST" for method, _path in page.calls), (
+        "表单模式下建单不再走页面内 fetch POST")
+    assert "inflight" in seen_statuses, "最终确定之前必须先写 inflight"
 
-    # POST 之后收尾对账在站内找到了这两单 → 记录被标记为 resolved（这正是设计语义：
+    # 提交之后收尾对账在站内找到了这两单 → 记录被标记为 resolved（这正是设计语义：
     # 只有"站内确实已有"才算确认），闸门随之解除。
     records = load_journal(journal_path)["records"]
     assert records and all(record["status"] == "resolved" for record in records), (
@@ -774,28 +878,31 @@ def test_browser_path_writes_inflight_before_post(browser_env, tmp_path):
     assert state["blocked"] is False
 
 
-def test_browser_path_transport_error_is_unknown_not_failure(browser_env):
-    """A19：浏览器提交遇到网络错误 → 必须留 unresolved，不能当成"明确拒绝"。"""
+def test_browser_path_modal_stuck_is_unknown_not_failure(browser_env, monkeypatch):
+    """A19：最终确定点击后弹窗收不了场 → 必须留 unresolved，不能当成"明确拒绝"。"""
     cfg, page = browser_env
-    page._post_raises = RuntimeError("Target page, context or browser has been closed")
+    monkeypatch.setattr(sss_module, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sss_module, "_UI_MODAL_POLL_MS", 100)
+    page._modal_never_closes = True
 
     run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
                 password="pw", captcha_callback=lambda _img: "1234")
 
     records = load_journal(Path(cfg.sss_uncertain_path))["records"]
-    assert records, "网络错误后必须留下未决记录"
+    assert records, "结果未知后必须留下未决记录"
     assert all(record["status"] == "unresolved" for record in records), (
-        "传输层错误绝不能被记成「服务端拒绝」——那样下一次运行就能重复下单")
+        "弹窗收不了场绝不能被记成「未落单」——那样下一次运行就能重复下单")
     state = blocking_state(Path(cfg.sss_uncertain_path),
                            delivery_date=sss_module.expected_delivery_date().isoformat(),
                            account=cfg.sss_account, origin="https://sss.example.com")
     assert state["blocked"] is True
 
 
-def test_browser_path_gateway_error_is_unknown(browser_env):
-    """网关 5xx 同样是"没拿到可确认响应"，不能当拒绝。"""
+def test_browser_path_stuck_page_after_modal_close_is_unknown(browser_env, tmp_path):
+    """遮罩收场但「创建订单」不恢复：同样是"没拿到可确认结果"。"""
+    _write_sss_excel(tmp_path, rows=1)  # 单单场景，避免把重登路径搅进来
     cfg, page = browser_env
-    page._post_http = 502
+    page._create_never_recovers = True
 
     run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
                 password="pw", captcha_callback=lambda _img: "1234")
@@ -804,10 +911,10 @@ def test_browser_path_gateway_error_is_unknown(browser_env):
     assert records and all(record["status"] == "unresolved" for record in records)
 
 
-def test_browser_path_explicit_rejection_closes_the_record(browser_env):
-    """反向锁：服务端明确 success:false 时可以安全关闭记录（否则永远卡住）。"""
+def test_browser_path_pre_submit_failure_closes_the_record(browser_env):
+    """反向锁：最终确定**之前**的确定性失败（这一单确定没创建）可以安全关闭记录。"""
     cfg, page = browser_env
-    page._post_result = {"success": False, "message": "商品已下架"}
+    page.visible.discard("#receiveName")  # 表单中途丢失姓名输入框
 
     run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
                 password="pw", captcha_callback=lambda _img: "1234")
