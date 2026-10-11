@@ -149,11 +149,36 @@ def test_find_by_candidates_skips_missing_and_returns_first_hit():
 
 
 def test_find_by_candidates_returns_none_when_all_miss():
+    """整个 timeout 内轮询候选链仍未命中 → 返回 None（不是一次扫描就放弃）。"""
     page = _StubPage()
     step = {"candidates": [{"css": "a"}, {"role": "tab", "name_re": "x"}, {"text": "y"}]}
     element, index = automation._find_by_candidates(page, step, 1000)
     assert element is None and index == -1
-    assert [call[0] for call in page.calls] == ["locator", "role", "text"]
+    # 轮询语义：候选链在 timeout 内被反复扫描（2026-10-12 修复：一次性扫描会把
+    # “弹窗入场动画/异步列表稍后才出现”的元素误判为缺失）。
+    assert [call[0] for call in page.calls][:3] == ["locator", "role", "text"]
+    assert len(page.calls) > 3, "miss 时应在 timeout 内轮询重试"
+
+
+def test_find_by_candidates_polls_until_element_appears(monkeypatch):
+    """元素在第 3 轮扫描时才出现：轮询必须等到它，而不是立即判缺失。"""
+    page = _StubPage()
+    late = _StubLocator(count=1)
+    state = {"scans": 0}
+
+    def counting_text(text):
+        page.calls.append(("text", text))
+        state["scans"] += 1
+        if state["scans"] >= 3:  # 第 3 轮起 css 候选（每轮先扫）才命中
+            return late
+        return _StubLocator()
+
+    page.get_by_text = counting_text
+    monkeypatch.setattr(automation.time, "sleep", lambda _s: None)
+    step = {"candidates": [{"css": "a"}, {"text": "y"}]}
+    element, index = automation._find_by_candidates(page, step, 5000)
+    assert element is late and index == 1
+    assert state["scans"] >= 3
 
 
 def test_label_reads_value_from_parent_text():

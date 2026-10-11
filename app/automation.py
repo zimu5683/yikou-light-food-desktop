@@ -336,19 +336,41 @@ def _build_locator(page: Any, candidate: dict[str, Any]) -> Any:
     return locator
 
 
-def _find_by_candidates(page: Any, step: dict[str, Any], timeout: int) -> tuple[Any, int]:
-    """Return ``(locator, candidate_index)`` for the first candidate that matches."""
-    for index, candidate in enumerate(step.get("candidates", [])):
-        try:
-            locator = _build_locator(page, candidate)
-            if locator.count() == 0:
+def _find_by_candidates(page: Any, step: dict[str, Any], timeout: int,
+                        pick: str = "first") -> tuple[Any, int]:
+    """Return ``(locator, candidate_index)`` for the first candidate that matches.
+
+    在 ``timeout``（毫秒）内**轮询**整条候选链，而不是一次性扫描：antd 弹窗有
+    入场动画、常用地址列表等数据按接口异步加载，点击后的数百毫秒到数秒里元素
+    可能尚不存在。一次性扫描会把“稍后才出现”的元素误判为缺失（2026-10-12
+    实测：创建订单弹窗刚打开就被判“弹窗未出现”、常用地址列表未加载完就被判
+    无数据），轮询语义与原 闪时送.py 的 WebDriverWait 一致。
+
+    ``pick`` 控制多匹配时的窄化：``"last"`` 取最后一个匹配（antd 弹窗按打开
+    顺序追加在 body 末尾，叠在创建订单弹窗之上的地址弹窗按钮是最后一个匹配）。
+    必须在窄化处直接取端，不能先 ``.first`` 再 ``.last`` 链式覆盖——后者不会
+    生效（本地夹具实测两点都落在第一个弹窗上）。
+    """
+    deadline = time.monotonic() + max(0, int(timeout)) / 1000.0
+    while True:
+        for index, candidate in enumerate(step.get("candidates", [])):
+            try:
+                locator = _build_locator(page, candidate)
+                if locator.count() == 0:
+                    continue
+                if "index" in candidate:
+                    narrowed = locator.nth(int(candidate["index"]))
+                elif pick == "last":
+                    narrowed = locator.last
+                else:
+                    narrowed = locator.first
+                narrowed.wait_for(state="visible", timeout=min(max(timeout, 1), 1000))
+                return narrowed, index
+            except Exception:
                 continue
-            narrowed = locator.nth(int(candidate["index"])) if "index" in candidate else locator.first
-            narrowed.wait_for(state="visible", timeout=min(max(timeout, 1), 3000))
-            return narrowed, index
-        except Exception:
-            continue
-    return None, -1
+        if time.monotonic() >= deadline:
+            return None, -1
+        time.sleep(0.2)
 
 
 def _save_failure_snapshot(page: Any, step_name: str) -> Path:

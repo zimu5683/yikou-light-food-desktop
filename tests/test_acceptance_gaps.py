@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sys
 import threading
 import types
@@ -658,6 +659,10 @@ class _FakeLocator:
         return self
 
     def filter(self, has_text=None, has_text_re=None):
+        # 生产代码把 has_text_re 编译成 re.Pattern 经 has_text 传入
+        # （如“确\s*定”容忍两字按钮空隙）：假实现不改命中判定。
+        if isinstance(has_text, re.Pattern):
+            has_text = None
         key = has_text if has_text else self._key
         return _FakeLocator(self._page, key,
                             self._found and key in self._page.visible, self.picked)
@@ -731,7 +736,9 @@ class _FakePage:
 
     def _click(self, key: str, picked: str) -> None:
         self.calls.append(("click", f"{key}@{picked or 'first'}"))
-        if key == "确定" and picked == "":  # 最终确定（地址确定是 pick="last"）
+        # 最终确定（地址确定是 pick="last"）；首选候选是 css（has_text_re），
+        # 命中 key 是 css 字符串，文本“确定”仅作旧候选链兜底。
+        if key in ("确定", ".ant-modal-footer .ant-btn-primary") and picked == "":
             self.confirms.append(dict(self.form))
             if self._modal_never_closes:
                 return  # 结果未知：遮罩收不了场，不落单，交由只读对账判定

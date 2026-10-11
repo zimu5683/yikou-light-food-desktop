@@ -509,14 +509,13 @@ def _ui_click(page: Any, step: dict[str, Any], timeout_ms: int, desc: str,
 
     ``pick="last"`` 取最后一个匹配（antd 弹窗按打开顺序追加在 body 末尾，
     因此叠在「创建订单」弹窗之上的地址弹窗的按钮是最后一个匹配 —— 原脚本
-    用绝对 xpath 选 div[8] 也是同一个道理）。定位不到时保存现场截图并抛
-    普通异常（调用上下文里即“确定未创建”）。
+    用绝对 xpath 选 div[8] 也是同一个道理；窄化在定位引擎内完成，先 ``.first``
+    再 ``.last`` 的链式覆盖不会生效）。定位不到时保存现场截图并抛普通异常
+    （调用上下文里即“确定未创建”）。
     """
-    locator, _index = _find_by_candidates(page, step, timeout_ms)
+    locator, _index = _find_by_candidates(page, step, timeout_ms, pick=pick)
     if locator is None:
         raise _locator_failure(page, desc)
-    if pick == "last":
-        locator = locator.last
     try:
         locator.click(timeout=timeout_ms)
     except Exception:  # noqa: BLE001 - 遮挡/时序问题，回退 JS 事件模拟

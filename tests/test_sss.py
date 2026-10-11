@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import re
 import threading
 
 import pytest
@@ -1541,6 +1542,7 @@ def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
         sss_product_name="轻食", api_mode=True,
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1619,6 +1621,7 @@ def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
         sss_product_name="轻食", api_mode=True,
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1694,6 +1697,7 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
         sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1930,6 +1934,7 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
         sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
+        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -2042,6 +2047,10 @@ class FakeLocator:
         return self
 
     def filter(self, has_text=None, has_text_re=None):
+        # 生产代码把 has_text_re 编译成 re.Pattern 经 has_text 传入
+        # （如“确\s*定”容忍两字按钮空隙）：假实现不改命中判定。
+        if isinstance(has_text, re.Pattern):
+            has_text = None
         key = has_text if has_text else self._key
         return FakeLocator(self._page, key,
                            self._found and key in self._page.visible, self.picked)
@@ -2142,10 +2151,11 @@ def test_ui_create_order_success_drives_full_form_flow(monkeypatch, tmp_path):
 
     monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
     page = FakePage(_ui_visible_set(), mask_visible=True)
-    # 点下最终确定（pick != last 的“确定”）后模拟服务端受理、弹窗收场
+    # 点下最终确定（普通 pick 的主按钮）后模拟服务端受理、弹窗收场。
+    # 候选链首选是 css（has_text_re），命中 key 是 css 字符串而非文本“确定”。
     page.on_click = lambda key, picked: (
         setattr(page, "mask_visible", False)
-        if key == "确定" and picked == "" else None)
+        if key in ("确定", ".ant-modal-footer .ant-btn-primary") and picked == "" else None)
 
     result = sss._ui_create_order(
         page, _ui_payload(), SSS_LOCATORS, store_name="一口轻食",
@@ -2159,9 +2169,11 @@ def test_ui_create_order_success_drives_full_form_flow(monkeypatch, tmp_path):
     assert keys.index(("预约单", "")) < keys.index(("一口轻食", ""))
     assert keys.index(("一口轻食", "")) < keys.index(("嗯哼", ""))
     assert ("嗯哼", "") in keys
-    # 地址弹窗的确定取最后一个匹配（pick="last"），最终确定是普通 pick
-    assert ("确定", "last") in keys
-    assert ("确定", "") in keys
+    # 地址弹窗的确定取最后一个匹配（pick="last"），最终确定是普通 pick；
+    # 两者首选候选都是 css（has_text_re），命中 key 是 css 字符串。
+    assert (".ant-modal-footer .ant-btn-primary", "last") in keys
+    assert (".ant-modal-footer .ant-btn-primary", "") in keys
+    assert ("确定", "last") not in keys and ("确定", "") not in keys
     fills = {key: value for kind, key, value in page.actions if kind == "fill"}
     assert fills["#receiveName"] == "张三"
     assert fills["#receiveMobile"] == "13800000001"
@@ -2215,7 +2227,7 @@ def test_ui_create_order_uncertain_when_create_button_never_recovers(monkeypatch
     page = FakePage(_ui_visible_set(), mask_visible=True)
 
     def on_click(key, picked):
-        if key == "确定" and picked == "":
+        if key in ("确定", ".ant-modal-footer .ant-btn-primary") and picked == "":
             page.mask_visible = False       # 遮罩收场
             page.visible.discard("创建订单")  # 但页面再也没恢复
     page.on_click = on_click

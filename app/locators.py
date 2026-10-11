@@ -222,10 +222,11 @@ SSS_LOCATORS: Dict[str, Any] = {
         ],
     },
     "地址确定": {
+        # antd 给两字按钮自动插空隙（“确 定”），文本匹配必须容忍空白。
         "candidates": [
-            {"css": ".ant-modal-footer .ant-btn-primary", "has_text": "确定"},
-            {"css": ".ant-btn-primary", "has_text": "确定"},
-            {"role": "button", "name_re": "确定|确认"},
+            {"css": ".ant-modal-footer .ant-btn-primary", "has_text_re": "确\\s*定"},
+            {"css": ".ant-btn-primary", "has_text_re": "确\\s*定"},
+            {"role": "button", "name_re": "确\\s*定|确\\s*认"},
         ],
     },
     "送达时间输入": {
@@ -265,10 +266,12 @@ SSS_LOCATORS: Dict[str, Any] = {
         ],
     },
     "最终确定": {
+        # antd 两字按钮带空隙（“确 定”），has_text_re 容忍空白；
+        # 结构候选（modal 内唯一主按钮）兜底。
         "candidates": [
-            {"css": ".ant-modal-footer .ant-btn-primary", "has_text": "确定"},
+            {"css": ".ant-modal-footer .ant-btn-primary", "has_text_re": "确\\s*定"},
             {"css": ".ant-modal .ant-btn-primary"},
-            {"role": "button", "name_re": "确定|确认"},
+            {"role": "button", "name_re": "确\\s*定|确\\s*认"},
         ],
     },
 }
