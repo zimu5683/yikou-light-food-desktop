@@ -1016,7 +1016,13 @@ def _collect_tasks(orders_by_sheet: dict[str, list[dict[str, Any]]],
         is_dinner = sheet_name == "晚餐"
         expected_time = compute_delivery_time(is_dinner, now)
         for order in orders:
-            identifier = f"第 {order['row']} 行 {order.get('name') or '未填写'}"
+            # 标识必须带表名（餐次）：午餐与晚餐的同一行同一姓名是两个任务，
+            # 只写「第 N 行 姓名」会让确认集合 set[str] 把它们折叠成一单
+            # （created 少算且 missing 为空），错误归集字典也会互相串台。
+            # 与 _stable_client_request_id、_validate_sss_orders 的
+            # 「表名 + 行号」口径对齐（D07）。
+            identifier = (f"{sheet_name} 第 {order['row']} 行 "
+                          f"{order.get('name') or '未填写'}")
             fingerprint = _payload_fingerprint(
                 build_order_payload(order, is_dinner, store_id, address, goods_name,
                                     expected_time=expected_time),
@@ -1450,15 +1456,33 @@ def _address_combo(fingerprint: OrderFingerprint) -> str:
 
 
 def _addresses_compatible(record_address: str, task_address: str) -> bool:
-    """地址是否指向同一处：折叠后相等，或一方包含另一方。
+    """地址是否指向同一处：折叠后相等，或一方以**非数字边界**包含另一方。
 
     列表接口的地址是整串拼接（可能带省市区前缀、空格或“号”等尾缀），而任务
     地址由 ``addressDetail`` 与门牌拼成，两边很难逐字相等；用包含关系兼容
     这些格式差异，避免把同一订单误判成“其他订单”而重复提交。
+
+    但包含关系不能跨过门牌数字：``…b1`` 是 ``…b10`` 的前缀，只看子串会把
+    不同门牌的订单判成同址（D06：站内 B10 顶替本次 B1 任务，导致漏下单）。
+    因此取较短串在较长串里逐个出现位置检查，只有被包含片段两侧的相邻字符
+    都不是数字才算同址；门牌数字边界被吞并的一律判为不同地址——与
+    ``_fingerprint_compatibility`` 的 fail-closed 口径一致：已知字段冲突即
+    按他人订单忽略，不做任何新猜测。
     """
     if record_address == task_address:
         return True
-    return record_address in task_address or task_address in record_address
+    shorter, longer = sorted((record_address, task_address), key=len)
+    if not shorter:
+        return False
+    start = longer.find(shorter)
+    while start != -1:
+        end = start + len(shorter)
+        left = longer[start - 1] if start > 0 else ""
+        right = longer[end:end + 1]
+        if not (left.isdigit() or right.isdigit()):
+            return True
+        start = longer.find(shorter, start + 1)
+    return False
 
 
 def _fingerprint_compatibility(record: OrderFingerprint,
@@ -1487,22 +1511,65 @@ def _fingerprint_compatibility(record: OrderFingerprint,
     return False, False
 
 
-def _list_records(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], int | None]:
-    """兼容闪时送列表响应的 ``result``/``data`` 两层分页结构。"""
+class _ListPage(tuple):
+    """订单列表响应的一页：``(records, total)`` 外加响应自报的分页元数据。
+
+    继承 ``tuple`` 是为了保留 ``records, total = _list_records(payload)`` 的二元
+    解包语义（``tools/`` 下的只读探针脚本仍这么用），同时把响应里的
+    ``size``/``pages``/``current`` 一并带出来。
+
+    为什么必须带出来：请求 ``pageSize=100`` 而服务端实际只给 10 条/页时，
+    用请求值判断结束会在第 1 页（10 < 100）就误判「已读完」，第 2 页的已有
+    订单被当成「站内不存在」重复下单（D11，2026-10-13 排查记录）。
+    """
+
+    def __new__(cls, records: list[dict[str, Any]], total: int | None = None,
+                size: int | None = None, pages: int | None = None,
+                current: int | None = None) -> "_ListPage":
+        page = super().__new__(cls, (records, total))
+        page.records = records
+        page.total = total
+        page.size = size
+        page.pages = pages
+        page.current = current
+        return page
+
+
+def _as_int(value: Any) -> int | None:
+    """把响应里的计数字段读成整数；读不出（缺失/坏值）一律 ``None``。"""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _list_records(payload: dict[str, Any]) -> _ListPage:
+    """兼容闪时送列表响应的 ``result``/``data`` 两层分页结构。
+
+    除 ``records``/``total`` 外还读回服务端自报的 ``size``/``pages``/``current``
+    （页号也可能叫 ``pageNo``），供翻页结束判定使用。
+    """
     for container in (payload.get("result"), payload.get("data"), payload):
         if isinstance(container, list):
-            return ([item for item in container if isinstance(item, dict)], None)
+            return _ListPage([item for item in container if isinstance(item, dict)], None)
         if not isinstance(container, dict):
             continue
         records = container.get("records")
         if records is None:
             records = container.get("list")
         if isinstance(records, list):
-            try:
-                total = int(container.get("total")) if container.get("total") is not None else None
-            except (TypeError, ValueError):
-                total = None
-            return ([item for item in records if isinstance(item, dict)], total)
+            current = container.get("current")
+            if current is None:
+                current = container.get("pageNo")
+            return _ListPage(
+                [item for item in records if isinstance(item, dict)],
+                _as_int(container.get("total")),
+                _as_int(container.get("size")),
+                _as_int(container.get("pages")),
+                _as_int(current),
+            )
         # 服务端对不支持的过滤参数返回 success:true + 无 records 的空壳
         # （2026-09-10 实测：带 startTime/endTime/statusList 即如此）。调用方
         # 已改为无过滤参数 + 本地过滤；此处保留 fail-closed，但报错必须点名
@@ -1564,11 +1631,17 @@ def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
 
     ``prefilter`` 非空时只作为服务端粗筛条件（缩小翻页范围）；无论服务端返回
     什么，送达日与活跃状态的判定一律由本地过滤负责，判定标准不因预筛改变。
+
+    翻页结束按**响应自报**的分页元数据判定（``pages``/``current`` 优先，其次
+    ``total``，再次实际页大小 ``size``）；请求值 ``pageSize`` 只用来发请求，
+    不再用来猜结束。三样元数据都没有、无法证明已读完时抛 ``LookupError``：
+    「读不到」绝不能被当成「站内没有」后继续下单（D11）。
     """
     wanted_days = {_task_fingerprint(task).expected_delivery_time[:10] for task in tasks}
     records: list[dict[str, Any]] = []
     page_no = 1
     page_size = _LIST_PAGE_SIZE
+    seen = 0
     sweep_started = time.perf_counter()
     page_count = 0
     prefilter_active = bool(prefilter)
@@ -1587,23 +1660,46 @@ def _list_pending_orders(fetch_json: Callable[[str], dict[str, Any]],
         if payload.get("success") is False:
             raise LookupError(str(payload.get("message") or "订单列表查询失败"))
         try:
-            page_records, total = _list_records(payload)
+            page = _list_records(payload)
         except LookupError:
             # 服务端对某些查询参数返回 success:true 的「空壳」（无 records）。
             # 埋点里连同完整查询串与原始报文一起记录，便于定位是哪个参数触发。
             _trace(f"list page {page_no} 结构异常，查询串={query} "
                    f"原始报文={json.dumps(payload, ensure_ascii=False)[:400]}")
             raise
-        _trace(f"list page {page_no}: {page_seconds:.2f}s 返回 {len(page_records)} 条 total={total}")
+        page_records = page.records
+        _trace(f"list page {page_no}: {page_seconds:.2f}s 返回 {len(page_records)} 条 "
+               f"total={page.total} size={page.size} pages={page.pages} "
+               f"current={page.current}")
         if not page_records:
             break
         for record in page_records:
             if _record_active_for_days(record, wanted_days):
                 records.append(record)
-        if len(page_records) < page_size:
-            break
-        if total is not None and page_no * page_size >= total:
-            break
+        seen += len(page_records)
+        # 翻页是否读完，以响应自报的分页元数据为准，绝不拿请求值 pageSize 猜：
+        # 服务端把每页压到 10 条时，`len(page_records) < page_size` 会在第 1 页
+        # 就成立，把第 2 页的已有订单当成「站内不存在」重复下单（D11）。
+        if page.current is not None and page.current != page_no:
+            raise LookupError(
+                f"订单列表分页异常：请求第 {page_no} 页，响应自称第 {page.current} 页"
+                "（服务端可能忽略了 pageNo），无法确认已读完，为避免重复下单已停止")
+        if page.pages is not None and page.pages >= 1 and page.current is not None:
+            if page.current >= page.pages:
+                break
+        elif page.total is not None:
+            if seen >= page.total:
+                break
+        elif page.size is not None:
+            if len(page_records) < page.size:
+                break
+        else:
+            # 服务端既没给读完的证据（total/pages）也没自报实际页大小：无法证明
+            # 已读完，按既有 fail-closed 口径停止（对照「响应缺少 records」）。
+            raise LookupError(
+                f"订单列表分页无法确认：请求 pageSize={page_size}，"
+                f"返回 {len(page_records)} 条，响应无 total/pages/size 分页信息，"
+                "无法确认已读完，为避免重复下单已停止")
         page_no += 1
     else:
         raise LookupError("订单列表分页超过 100 页，拒绝继续下单")
@@ -1670,7 +1766,8 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
                      fetch_json: Callable[[str], dict[str, Any]],
                      *, created_after: float | None = None,
                      created_before: float | None = None,
-                     prefilter: dict[str, Any] | None = None) -> _Reconciliation:
+                     prefilter: dict[str, Any] | None = None,
+                     consumed: Counter[OrderFingerprint] | None = None) -> _Reconciliation:
     """按订单身份对账，兼容列表接口的概要结构。
 
     匹配以「姓名 + 电话 + 预约时间」为核心；站内明确给出、却与任务不一致的
@@ -1683,6 +1780,14 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
 
     ``prefilter`` 只是服务端粗筛（参见 ``_build_list_prefilter``），不改变
     任何本地判定标准。
+
+    ``consumed`` 是**已消费站内记录**的账目：``{指纹: 已占用条数}``，表示这些
+    记录已经被别的任务当作完成证据用掉了（调用方按轮次跨轮记账）。核对时先从
+    可见条数里扣除，再切分 confirmed/missing —— 一条站内记录只能充当一条任务
+    的完成证据。不扣除时，同一张旧记录会在每一轮对账里被重新数一遍，先确认
+    「第 3 行 张三」、收尾再确认「第 4 行 张三」，把只成功 0 单、站内仅 1 单的
+    批次误报成两单全部完成（D09）。记录缺 id 时无法证明「这一条」是新证据，
+    按已占用处理：宁可少确认，也不多确认。
     """
     expected = Counter(_task_fingerprint(task) for task in tasks)
     waiting: dict[OrderFingerprint, list[dict[str, Any]]] = {}
@@ -1730,12 +1835,19 @@ def _reconcile_tasks(tasks: list[dict[str, Any]],
     confirmed: set[str] = set()
     missing: list[dict[str, Any]] = []
     duplicate_count = 0
+    already_used = consumed or Counter()
+    matched_count = 0
     for fingerprint, grouped_tasks in waiting.items():
         on_site = actual[fingerprint]
-        confirmed.update(task["identifier"] for task in grouped_tasks[:min(len(grouped_tasks), on_site)])
-        missing.extend(grouped_tasks[min(len(grouped_tasks), on_site):])
-        duplicate_count += max(0, on_site - len(grouped_tasks))
-    return _Reconciliation(confirmed, missing, duplicate_count, sum(actual.values()))
+        # 跨轮扣除：已经被别的任务用掉的站内记录不再参与本轮匹配，日志里的
+        # 「站内匹配 x/y 单」也随之只统计真正可用的证据（与 confirmed 一致）。
+        available = max(0, on_site - already_used.get(fingerprint, 0))
+        matched_count += available
+        confirmed.update(task["identifier"]
+                         for task in grouped_tasks[:min(len(grouped_tasks), available)])
+        missing.extend(grouped_tasks[min(len(grouped_tasks), available):])
+        duplicate_count += max(0, available - len(grouped_tasks))
+    return _Reconciliation(confirmed, missing, duplicate_count, matched_count)
 
 
 def _emit_reconciliation(callback: Callable[[str], Any] | None, label: str,
@@ -2111,7 +2223,8 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
                     created_after: float | None = None,
                     attempts: int = 1,
                     prefilter: dict[str, Any] | None = None,
-                    zero_retry_delay: float | None = None) -> _Reconciliation | None:
+                    zero_retry_delay: float | None = None,
+                    consumed: Counter[OrderFingerprint] | None = None) -> _Reconciliation | None:
     """只读对账；列表延迟时有限轮询，绝不因“暂时查不到”而重发 POST。
 
     ``prefilter`` 非空时先用服务端粗筛对账；只要粗筛没有得出「全部匹配」，
@@ -2122,6 +2235,9 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
     ``zero_retry_delay`` 为秒数时：预筛窗口返回「一条都没有」会先等这么久
     再重查一次，用于覆盖「刚写入、列表还读不到」的情况。只应在**提交后**的
     对账里启用——提交前站内本就没有本批订单，重查纯属浪费。
+
+    ``consumed`` 原样透传给每一次核对（预筛、零条重查、全量兜底），语义见
+    :func:`_reconcile_tasks`：已消费的站内记录不能再次充当完成证据。
     """
     if prefilter is None and _SSS_SERVER_PREFILTER:
         prefilter = _build_list_prefilter(tasks)
@@ -2135,7 +2251,7 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
     for attempt in range(attempts):
         try:
             reconciliation = _reconcile_tasks(tasks, fetch_json, created_after=created_after,
-                                              prefilter=prefilter)
+                                              prefilter=prefilter, consumed=consumed)
         except Exception as exc:
             last_error = str(exc)
             if attempt + 1 < attempts:
@@ -2157,7 +2273,8 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
             time.sleep(zero_retry_delay)
             try:
                 reconciliation = _reconcile_tasks(
-                    tasks, fetch_json, created_after=created_after, prefilter=prefilter)
+                    tasks, fetch_json, created_after=created_after, prefilter=prefilter,
+                    consumed=consumed)
             except Exception as exc:
                 last_error = str(exc)
                 reconciliation = None
@@ -2185,7 +2302,8 @@ def _safe_reconcile(tasks: list[dict[str, Any]],
             _emit(callback, f"{label}：时间窗失效，本次以无过滤全量扫描结论为准")
         _emit(callback, f"{label}：服务端预筛{why}，正在用无过滤全量扫描复核")
         try:
-            full = _reconcile_tasks(tasks, fetch_json, created_after=created_after)
+            full = _reconcile_tasks(tasks, fetch_json, created_after=created_after,
+                                    consumed=consumed)
         except Exception as exc:
             _emit(callback, f"{label}全量复核失败：{exc}；为避免重复下单，后续不会自动提交")
             return None
@@ -2326,6 +2444,13 @@ def _run_reconciled_submission(
 
     ``pre_submit_settle_s`` / ``submit_attempts`` 原样透传给每轮提交（含重登后
     的补发轮与人工重试轮），语义见 :func:`_submit_tasks_concurrent`。
+
+    两条跨轮的硬约束（各有对应缺陷）：
+
+    * 一条站内记录只能充当一条任务的完成证据：已经用于确认的任务按指纹记进
+      「已消费」账目，后续轮次匹配时先扣除（D09）；
+    * 重登后的自动补发只收「确定没有建单」的任务：本轮已经发出、结果不可确认
+      的（``succeeded``/``uncertain``）绝不自动补发，只继续走只读对账（D10）。
     """
     batch_started_at = time.time()
     batch_window_start = batch_started_at - _BATCH_CLOCK_SKEW_S
@@ -2344,11 +2469,33 @@ def _run_reconciled_submission(
 
     all_errors: dict[str, str] = {}
     balance_error = ""
+    fingerprint_of = {task["identifier"]: _task_fingerprint(task) for task in tasks}
+    #: 已经由某轮对账确认过、占用了站内一条记录的任务标识（D09 的账目来源）。
+    confirmed_tasks: set[str] = set()
+
+    def consumed_evidence(round_tasks: list[dict[str, Any]]) -> Counter[OrderFingerprint]:
+        """本轮对账要扣除的「已消费站内记录」数（按指纹计）。
+
+        一条站内记录只能充当一条任务的完成证据：前几轮已经确认掉、且**不在本轮
+        名单里**的任务，各自占用了站内的一条记录，本轮必须先把它们扣掉，否则
+        同一张旧记录会被第二次当成新任务的证据（D09：只成功 0 单、站内仅 1 单，
+        却报两单全部完成）。
+
+        仍在本轮名单里的已确认任务不扣：同一批任务会被重复对账（收尾对账、
+        重试前/后对账扫的都是同一份名单），重复扫描必须幂等，否则第二次扫描
+        会把自己上一轮的确认结果翻成缺失。
+        """
+        round_identifiers = {task["identifier"] for task in round_tasks}
+        return Counter(fingerprint_of[identifier]
+                       for identifier in confirmed_tasks
+                       if identifier not in round_identifiers
+                       and identifier in fingerprint_of)
 
     def reconcile(round_tasks: list[dict[str, Any]], label: str, **options: Any
                   ) -> "_Reconciliation | None":
         """只读对账；"查不到"（missing）与"查失败"（返回 None）都如实返回。"""
-        return _safe_reconcile(round_tasks, fetch_json, callback, label, **options)
+        return _safe_reconcile(round_tasks, fetch_json, callback, label,
+                               consumed=consumed_evidence(round_tasks), **options)
 
     def submit_round(round_tasks: list[dict[str, Any]], workers: int) -> _SubmitResult:
         submit, close = submit_factory()
@@ -2362,6 +2509,7 @@ def _run_reconciled_submission(
             close()
 
     preconfirmed = set(initial.confirmed)
+    confirmed_tasks.update(initial.confirmed)
     current = list(initial.missing)
     first = submit_round(current, max_workers)
     all_errors.update(first.failures)
@@ -2373,7 +2521,7 @@ def _run_reconciled_submission(
         _emit(callback, f"余额不足，已停止后续下单：{first.balance_error}")
         stop_event.set()
 
-    # 401 只能统一重登一次；重登后先对账，再仅提交确认仍缺失的任务。
+    # 401 只能统一重登一次；重登后先对账，再仅提交确认仍缺失的**未发送**任务。
     if first.auth_error and not stop_event.is_set() and relogin is not None:
         _emit(callback, "登录态过期，正在重新登录并对账…")
         relogin()
@@ -2389,9 +2537,23 @@ def _run_reconciled_submission(
             return _merge_reconciliation(preconfirmed, after_login), True
         # 重登后对账确认的订单也要计入最终 confirmed，否则 created 数会少算。
         preconfirmed.update(after_login.confirmed)
+        confirmed_tasks.update(after_login.confirmed)
+        # 补发名单只收「确定没有建单」的任务：本轮已经发出、结果不可确认的
+        # （succeeded / uncertain）绝不能再自动补发 —— 对账天生滞后于建单，
+        # 「重登后仍然查不到」说明不了它没建单（D10：同一次运行里把已受理的
+        # 张三自动重发，站内变成 3 单）。它们留在 current 里继续走对账。
+        sent = set(first.succeeded) | {identifier for identifier, _ in first.uncertain}
+        withheld = [task for task in after_login.missing
+                    if task["identifier"] in sent]
+        resubmit = [task for task in after_login.missing
+                    if task["identifier"] not in sent]
         current = list(after_login.missing)
-        if current:
-            second = submit_round(current, max_workers)
+        if withheld:
+            _emit(callback,
+                  f"{len(withheld)} 单已发送但结果未知，重登后站内仍不可见，"
+                  "不会自动补发；如确未收到请人工处理")
+        if resubmit:
+            second = submit_round(resubmit, max_workers)
             all_errors.update(second.failures)
             all_errors.update(second.uncertain)
             balance_error = balance_error or second.balance_error
@@ -2400,8 +2562,10 @@ def _run_reconciled_submission(
                 stop_event.set()
             if second.auth_error:
                 _emit(callback, "重新登录后仍遇到 401，停止自动提交并以站内对账为准")
+                # 只给这一轮真的发过请求的任务挂上这条原因；被扣下的未知单保留
+                # 自己的「提交结果未知」明细，不能被串成「又遇到 401」。
                 all_errors.update({task["identifier"]: "重新登录后仍遇到 401"
-                                   for task in current})
+                                   for task in resubmit})
                 stop_event.set()
     elif first.auth_error and not stop_event.is_set():
         _emit(callback, "登录态过期但当前模式无法重登，停止自动提交并以站内对账为准")
@@ -2449,6 +2613,7 @@ def _run_reconciled_submission(
             return _merge_reconciliation(preconfirmed, before_retry), True
         if identifier not in {item["identifier"] for item in before_retry.missing}:
             _emit(callback, f"{identifier} 已在站内确认，跳过重试")
+            confirmed_tasks.update(before_retry.confirmed)
             final = _merge_reconciliation(preconfirmed, before_retry)
             continue
         _emit(callback, f"重试 {identifier}（已完成重试前对账）")
@@ -2471,6 +2636,7 @@ def _run_reconciled_submission(
             _emit(callback, "重试后发现站内重复，已停止且不会自动取消")
             stop_event.set()
             return _merge_reconciliation(preconfirmed, final_current), True
+        confirmed_tasks.update(final_current.confirmed)
         final = _merge_reconciliation(preconfirmed, final_current)
         if stop_event.is_set():
             break

@@ -248,6 +248,74 @@ def test_collect_day_orders_cloud_error_mentions_local_excel():
 
 
 # ----------------------------------------------------------------------
+# D08：读取预算截断 / 读不完整
+# ----------------------------------------------------------------------
+
+class LongSheetCli(FakeCli):
+    """used range 比单次读取预算（45,000 格）更长的云端表替身。
+
+    ``rowTo=300, colTo=199`` 时单次读取只覆盖第 1~225 行 —— 正是 D08 的触发条件。
+    """
+
+    def __init__(self, sheets, *, row_to=300, col_to=199, **kwargs):
+        super().__init__(sheets, **kwargs)
+        self.row_to = row_to
+        self.col_to = col_to
+
+    def sheets_info(self, file_id: str):
+        info = super().sheets_info(file_id)
+        if info:
+            info[0]["rowTo"] = self.row_to
+            info[0]["colTo"] = self.col_to
+        return info
+
+
+def long_sheet(*, marked_row: int, rows: int, name: str = "张三",
+               phone: str = "13800000001") -> dict[tuple[int, int], str]:
+    """``rows`` 行的宽表：只有第 ``marked_row`` 行（1-based）标着当天的 1。"""
+    data = [(f"客户{index + 1}", "b2", f"1380000{index:04d}", "")
+            for index in range(rows)]
+    data[marked_row - 3] = (name, "b2", phone, "1")
+    return build_sheet(data)
+
+
+def test_读取预算之外的客户仍然被分块补读出来():
+    """D08：第 230 行的客户在单次读取范围之外，必须分块补读，不能静默漏掉。"""
+    grid = long_sheet(marked_row=230, rows=231)
+    cli = LongSheetCli({LUNCH_FILE: grid})
+    meal = si.read_cloud_meal(cli, file_id=LUNCH_FILE, table="东湖中餐",
+                              meal="午餐", target=TARGET)
+    reads = [call for call in cli.calls if call.startswith("read_grid")]
+    assert len(reads) > 1, "宽表必须分块补读，不能只发一次截断的请求"
+    assert meal.marked_total == 1
+    assert [order["name"] for order in meal.orders] == ["张三"]
+    assert meal.orders[0]["row"] == 230
+
+
+def test_读取范围上限内的长表也完整读取():
+    """边界：used range 到第 400 行仍属"能读全"，第 400 行的客户不能漏。"""
+    grid = long_sheet(marked_row=400, rows=400)
+    cli = LongSheetCli({LUNCH_FILE: grid}, row_to=399)
+    meal = si.read_cloud_meal(cli, file_id=LUNCH_FILE, table="东湖中餐",
+                              meal="午餐", target=TARGET)
+    assert meal.marked_total == 1
+    assert meal.orders[0]["row"] == 400
+
+
+def test_表比可完整读取上限更长时拒绝下单():
+    """D08：读不完整时不给半份名单，按 ImportRefused 语义拒绝。"""
+    grid = long_sheet(marked_row=450, rows=451)
+    cli = LongSheetCli({LUNCH_FILE: grid}, row_to=500, col_to=50)
+    with pytest.raises(si.ImportRefused) as excinfo:
+        si.read_cloud_meal(cli, file_id=LUNCH_FILE, table="东湖中餐",
+                           meal="午餐", target=TARGET)
+    message = str(excinfo.value)
+    assert "东湖中餐" in message
+    assert "501" in message and "401" in message, "要说清实际行数与可完整读取的上限"
+    assert "本地 Excel" in message, "拒绝时要给出可用的退路"
+
+
+# ----------------------------------------------------------------------
 # 数据校验：只针对要下单的人
 # ----------------------------------------------------------------------
 

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import threading
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -1052,6 +1054,144 @@ def test_reconcile_normalizes_door_and_keeps_lunch_dinner_separate():
     assert result.duplicate_count == 0
 
 
+# ---------------------------------------------------------------------------
+# D06：地址门牌数字边界（B10 与 B1 不是同一处）
+# ---------------------------------------------------------------------------
+
+def test_地址兼容_b1_与_b10_门牌数字边界不得被吞并():
+    """包含匹配必须在门牌数字边界处停下，但纯格式差异仍要兼容（D06）。
+
+    ``…东湖校区b1`` 是 ``…东湖校区b10`` 的前缀，包含匹配若只看子串会判成
+    同一处，把 B10 的订单误当成 B1 任务的完成证据；缺省市区前缀、多「号」
+    尾缀这类纯格式差异则必须继续判为同址，否则会重复下单。
+    """
+    assert sss._addresses_compatible("浙江农林大学东湖校区b10",
+                                     "浙江农林大学东湖校区b1") is False
+    # 门牌数字的其它后缀扩张同样不再互认
+    assert sss._addresses_compatible("12", "1202") is False
+    assert sss._addresses_compatible("1", "11") is False
+    # 纯格式差异仍是同址
+    assert sss._addresses_compatible("东湖校区b1", "浙江农林大学东湖校区b1") is True
+    assert sss._addresses_compatible("东湖校区b1号", "东湖校区b1") is True
+
+
+def test_对账_站内_b10_记录不得确认_b1_任务():
+    """站内概要地址「…东湖校区B10」不能成为本次「…东湖校区B1」任务的完成证据。
+
+    姓名/电话/预约送达时间完全相同、只有门牌数字不同（B1 是 B10 的前缀）：
+    该记录必须按「他人订单」忽略，任务仍算缺失，而不是判成已在站内不下单。
+    """
+    payload = {
+        "receiveName": "张三",
+        "receivePhone": "13800000001",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "receiveAddress": {"addressDetail": "浙江农林大学东湖校区", "doorNum": "B1"},
+    }
+    task = {"identifier": "t1", "payload": payload,
+            "fingerprint": sss._payload_fingerprint(payload)}
+    record = {
+        "id": 9001,
+        "recipientName": "张三",
+        "recipientPhone": ["13800000001"],
+        "recipientAddress": "浙江农林大学东湖校区B10",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "status": 2,
+    }
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [record], "total": 1}}
+
+    result = sss._reconcile_tasks([task], fetch)
+    assert result.confirmed == set()
+    assert result.missing == [task]
+    assert result.matched_count == 0
+
+
+def _b10_only_station_fixture(tmp_path, *, reject=False):
+    """名单只送到 B1；站内只有同一客户的概要订单，地址是「…东湖校区B10」。
+
+    站内记录的姓名/电话/预约送达时间与任务完全相同，只有门牌数字不同
+    （B1 是 B10 的前缀）——这正是 D06 的触发条件。``reject=True`` 时下单
+    会被站内以业务理由明确拒绝（确定未建单）。
+    """
+    from openpyxl import Workbook
+
+    from tests.sss_test_support import _FakeClient, _config
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "午餐"
+    sheet.cell(2, 1, "姓名")
+    sheet.cell(3, 1, "张三")
+    sheet.cell(3, 2, "B1")
+    sheet.cell(3, 3, "13800000001")
+    excel_path = tmp_path / "闪时送.xlsx"
+    workbook.save(excel_path)
+    workbook.close()
+
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    orders = sss.load_sss_orders(excel_path)
+    sss._validate_sss_orders(orders)
+    tasks = sss._collect_tasks(orders, 7, sss._fixed_address_from_config(config),
+                               config.sss_product_name,
+                               account=config.sss_account, now=dt.datetime.now())
+    assert len(tasks) == 1, tasks
+    payload = tasks[0]["payload"]
+    address = payload.get("receiveAddress") or {}
+    assert address.get("doorNum") == "B1", address
+    station_record = {
+        "id": 9001,
+        "recipientName": payload["receiveName"],
+        "recipientPhone": [payload["receivePhone"]],
+        "recipientAddress": f"{address.get('addressDetail', '')}B10",
+        "expectedDeliveryTime": payload["expectedDeliveryTime"],
+        "status": 2,
+    }
+
+    class _B10OnlyClient(_FakeClient):
+        """站内预置 B10 订单：列表接口只读 ``list_records``。"""
+
+        def __init__(self):
+            super().__init__(order_fail=reject)
+            self.list_records = [dict(station_record)]
+
+    return config, _B10OnlyClient()
+
+
+def test_端到端_站内只有_b10_时_b1_仍会真实下单并确认(monkeypatch, tmp_path):
+    """端到端（D06）：站内 B10 不能顶替本次 B1 任务，必须真实提交一次并等到确认。"""
+    config, client = _b10_only_station_fixture(tmp_path)
+    monkeypatch.setattr(sss, "SssApiClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert len(client.posts) == 1, logs
+    assert (client.posts[0].get("receiveAddress") or {}).get("doorNum") == "B1"
+    assert result["created"] == 1, logs
+    assert result["reconciled"] is True, logs
+    assert result["partial"] is False, logs
+
+
+def test_端到端_站内明确拒绝_b1_时如实报部分完成(monkeypatch, tmp_path):
+    """端到端（D06）：B1 被真实提交后遭站内业务拒绝，如实报部分完成而非「已确认」。"""
+    config, client = _b10_only_station_fixture(tmp_path, reject=True)
+    monkeypatch.setattr(sss, "SssApiClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert len(client.posts) == 1, logs
+    assert (client.posts[0].get("receiveAddress") or {}).get("doorNum") == "B1"
+    assert result["created"] == 0, logs
+    assert result["partial"] is True, logs
+
+
 def test_list_pending_orders_paginates():
     task = _task()
     calls = []
@@ -1110,6 +1250,192 @@ def test_list_pending_orders_sends_prefilter_and_keeps_local_day_filter():
     records = sss._list_pending_orders(
         fetch, [task], prefilter=sss._build_list_prefilter([task]))
     assert [record["receiveName"] for record in records] == ["张三"]
+
+
+class _PageCappedClient:
+    """站内替身：遵守 ``pageNo``，但每页最多返回 ``page_cap`` 条（D11 触发条件）。
+
+    与 ``_FakeClient`` 的差别只在列表分页：这里响应带回服务端**自报**的
+    ``size``/``pages``/``current``（``pagination_metadata=False`` 时故意只回
+    ``records``），用于验证「按响应分页大小翻页」与「无法证明读完就 fail-closed」。
+    """
+
+    def __init__(self, records, *, page_cap=None, pagination_metadata=True):
+        self.site_records = [dict(record) for record in records]
+        self.page_cap = page_cap
+        self.pagination_metadata = pagination_metadata
+        self.posts: list[dict] = []
+        self.pages_requested: list[int] = []
+        self.requested_page_sizes: list[int] = []
+
+    def fetch_captcha(self):
+        return b"png"
+
+    def login(self, _code):
+        return {"success": True}
+
+    def fork(self):
+        return self
+
+    def close(self):
+        return None
+
+    def get_json(self, path):
+        if "list" in path:
+            return self._list(path)
+        if "store" in path:
+            return {"success": True, "result": [{"name": "一口轻食", "id": 7}]}
+        if "account" in path:
+            return {"success": True, "result": {"totalAmount": 1000.0}}
+        return {"success": True, "result": []}
+
+    def post_json(self, _path, payload):
+        """照常记录 POST 并建单：有没有重复下单，由测试断言兜住。"""
+        self.posts.append(payload)
+        address = payload.get("receiveAddress") or {}
+        self.site_records.append({
+            "recipientName": payload.get("receiveName", ""),
+            "recipientPhone": [payload.get("receivePhone", "")],
+            "recipientAddress": f"{address.get('addressDetail', '')}"
+                                f"{address.get('doorNum', '')}",
+            "expectedDeliveryTime": payload.get("expectedDeliveryTime", ""),
+            "status": 2,
+        })
+        return {"success": True}
+
+    def _list(self, path):
+        query = parse_qs(urlsplit(path).query)
+        page_no = int((query.get("pageNo") or ["1"])[0])
+        page_size = int((query.get("pageSize") or [str(sss._LIST_PAGE_SIZE)])[0])
+        self.pages_requested.append(page_no)
+        self.requested_page_sizes.append(page_size)
+        effective = min(page_size, self.page_cap) if self.page_cap else page_size
+        total = len(self.site_records)
+        start = (page_no - 1) * effective
+        page = self.site_records[start:start + effective]
+        result: dict = {"records": [dict(record) for record in page]}
+        if self.pagination_metadata:
+            result.update({
+                "total": total,
+                "size": effective,
+                "pages": max(1, math.ceil(total / effective)),
+                "current": page_no,
+            })
+        return {"success": True, "result": result}
+
+
+def _page_capped_fixture(tmp_path):
+    """站内 11 单：前 10 单是其他客户，第 11 单才是本次目标（正好落在第 2 页）。"""
+    from openpyxl import Workbook
+
+    from tests.sss_test_support import _config
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "午餐"
+    sheet.cell(2, 1, "姓名")
+    sheet.cell(3, 1, "张三")
+    sheet.cell(3, 2, "C3")
+    sheet.cell(3, 3, "13900000001")
+    excel_path = tmp_path / "闪时送.xlsx"
+    workbook.save(excel_path)
+    workbook.close()
+
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    orders = sss.load_sss_orders(excel_path)
+    sss._validate_sss_orders(orders)
+    tasks = sss._collect_tasks(orders, 7, sss._fixed_address_from_config(config),
+                               config.sss_product_name,
+                               account=config.sss_account, now=dt.datetime.now())
+    assert len(tasks) == 1
+    payload = tasks[0]["payload"]
+    address = payload.get("receiveAddress") or {}
+    target = {
+        "id": "OLD-ZS-001",
+        "recipientName": payload.get("receiveName", ""),
+        "recipientPhone": [payload.get("receivePhone", "")],
+        "recipientAddress": f"{address.get('addressDetail', '')}"
+                            f"{address.get('doorNum', '')}",
+        "expectedDeliveryTime": payload.get("expectedDeliveryTime", ""),
+        "status": 2,
+    }
+    others = [{
+        "id": f"OTHER-{index:03d}",
+        "recipientName": f"其他客户{index}",
+        "recipientPhone": [f"138000000{index:02d}"],
+        "recipientAddress": f"其他小区{index}号",
+        "expectedDeliveryTime": target["expectedDeliveryTime"],
+        "status": 2,
+    } for index in range(10)]
+    return config, tasks[0], [*others, target]
+
+
+def test_list_sweep_follows_server_pagination_metadata(monkeypatch, tmp_path):
+    """实际分页大小被限小时必须按响应翻页：第 2 页的已有订单不能漏读。
+
+    请求 pageSize=100、服务端每页只给 10 条（响应自报 size=10/pages=2/current）。
+    若结束判定仍用请求值，第 1 页 10 < 100 就被当成「读完了」，第 2 页的目标
+    订单永远看不到，进而被当成「站内不存在」重复下单。
+    """
+    config, task, site_records = _page_capped_fixture(tmp_path)
+    client = _PageCappedClient(site_records, page_cap=10)
+
+    swept = sss._list_pending_orders(client.get_json, [task])
+    assert [record["id"] for record in swept] == [
+        *(f"OTHER-{index:03d}" for index in range(10)), "OLD-ZS-001"]
+    assert client.pages_requested == [1, 2], client.pages_requested
+    assert client.requested_page_sizes[0] == sss._LIST_PAGE_SIZE
+
+    # 端到端：站内已有该订单 → 一次 POST 都不发，且如实报「1 单已确认」。
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert client.posts == [], [payload.get("receiveName") for payload in client.posts]
+    assert result["created"] == 1, logs
+    assert result["partial"] is False, logs
+    assert result["reconciled"] is True, logs
+
+
+def test_list_sweep_fails_closed_when_pagination_unprovable(monkeypatch, tmp_path):
+    """响应只有 records、没有 total/pages/size 且条数少于请求值：无法证明读完。
+
+    「读不到」不能被当成「站内没有」：必须抛错停止，绝不能据此继续下单。
+    """
+    config, task, site_records = _page_capped_fixture(tmp_path)
+    client = _PageCappedClient(site_records, page_cap=10, pagination_metadata=False)
+
+    with pytest.raises(LookupError, match="无法确认已读完"):
+        sss._list_pending_orders(client.get_json, [task])
+    assert client.pages_requested == [1], client.pages_requested
+
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert client.posts == []
+    assert result["created"] == 0, logs
+    assert result["reconciled"] is False, logs
+    assert result["uncertain"] is True, logs
+
+
+def test_list_sweep_fails_closed_when_server_ignores_page_no():
+    """服务端回显的页号与请求不一致（忽略了 pageNo）时必须停止，不能同页空转。"""
+    task = _task()
+    payload = {"success": True, "result": {
+        "records": [dict(_station_record(task)) for _ in range(10)],
+        "total": 11, "size": 10, "pages": 2, "current": 1}}
+
+    def fetch(_path):
+        return payload
+
+    with pytest.raises(LookupError, match="pageNo"):
+        sss._list_pending_orders(fetch, [task])
 
 
 def test_reconcile_tasks_forwards_prefilter():
@@ -1339,11 +1665,11 @@ def test_auth_expiry_relogs_once_then_only_submits_missing_task():
 # P0 订单幂等性：完整指纹、对账延迟、并发互斥
 # ---------------------------------------------------------------------------
 
-def _full_task(identifier="full", *, store_id=211053, goods_name="轻食",
+def _full_task(identifier="full", *, name="张三", store_id=211053, goods_name="轻食",
                address_detail="浙江农林大学东湖校区", door="A101",
                account="18758187837", created_at=None):
     payload = {
-        "receiveName": "张三",
+        "receiveName": name,
         "receivePhone": "13800000001",
         "expectedDeliveryTime": "2026-09-10 11:00:00",
         "orderType": 2,
@@ -1605,6 +1931,88 @@ def test_auth_expiry_preserves_successes_confirmed_after_relogin():
     assert final is not None and final.confirmed == {"first", "second"}
     assert len(submits) == 3
     assert relogins == [True]
+
+
+def _同名同址双任务():
+    """两条指纹完全相同、标识不同的任务（D09 的触发条件）。
+
+    同一餐里两行同名/同址/同电话/同送达时间：站内一条订单能同时「匹配」两条
+    任务，但一条站内记录只能充当一条任务的完成证据。
+    """
+    first = _full_task("第 3 行 张三")
+    second = _full_task("第 4 行 张三")
+    assert first["fingerprint"] == second["fingerprint"], "两条任务的指纹必须相同"
+    return first, second
+
+
+def _站内唯一匹配记录(task, *, order_id=None, created_ms=None):
+    """站内只有这一条匹配记录（概要结构；可选补订单号与创建时间）。"""
+    payload = task["payload"]
+    address = payload["receiveAddress"]
+    record = {
+        "recipientName": payload["receiveName"],
+        "recipientPhone": [payload["receivePhone"]],
+        "recipientAddress": f"{address['addressDetail']}{address['doorNum']}",
+        "expectedDeliveryTime": payload["expectedDeliveryTime"],
+        "status": 2,
+    }
+    if order_id is not None:
+        record["id"] = order_id
+    if created_ms is not None:
+        record["createTime"] = created_ms
+    return record
+
+
+@pytest.mark.parametrize("variant", ["缺创建时间", "带订单号且创建于本批窗口内"])
+def test_同一张站内记录只能确认一条任务(variant, monkeypatch):
+    """D09 回归：站内只有 1 条匹配记录时，它只能确认 1 条任务。
+
+    两条任务指纹相同，站内只有一条匹配记录；另一条被站内明确拒绝（「商品已
+    下架」，确定未建单）。旧代码：提交前拿这条记录确认「第 3 行 张三」，
+    收尾对账又拿同一张记录确认「第 4 行 张三」，两轮 confirmed 取并集后把
+    「只发出 1 次失败请求、站内仍只有 1 单」报成两单全部完成。
+
+    两个变体分别覆盖「记录缺订单号与创建时间」与「记录带订单号、创建于本批
+    时间窗口内」——证明并非只有列表缺字段时才会发生。
+    """
+    first, second = _同名同址双任务()
+    record = _站内唯一匹配记录(first)
+    if variant == "带订单号且创建于本批窗口内":
+        record["id"] = "OLD-001"
+        record["createTime"] = int((dt.datetime.now().timestamp() - 30) * 1000)
+    submits = []
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [dict(record)], "total": 1}}
+
+    def factory():
+        def submit(payload):
+            submits.append(payload)
+            return {"success": False, "message": "商品已下架"}
+
+        return submit, lambda: None
+
+    class Stop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            raise AssertionError("明确拒绝 + 未对账成功时不应停止")
+
+    monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+
+    final, reconciled = sss._run_reconciled_submission(
+        [first, second], factory, fetch, Stop(), None, None, max_workers=1)
+
+    assert reconciled is True
+    assert final is not None
+    assert len(final.confirmed) == 1, final
+    assert len(final.missing) == 1, final
+    assert (final.confirmed | {task["identifier"] for task in final.missing}) == {
+        "第 3 行 张三", "第 4 行 张三"}, final
+    assert final.duplicate_count == 0
+    assert len(submits) == 1, "只允许提交那条没有被旧记录确认的任务"
 
 
 def test_collect_tasks_reuses_stable_client_request_id_on_retry():
@@ -2663,3 +3071,400 @@ def test_serial_submission_failure_detail_is_emitted_immediately():
     sss._submit_tasks_concurrent(tasks, submit_uncertain, threading.Event(),
                                  logs.append, 1)
     assert any("提交结果未知：t0" in m and "弹窗没关上" in m for m in logs), logs
+
+
+# ---------------------------------------------------------------------------
+# D07：午餐 / 晚餐任务身份唯一（同行同名不得互相顶替）
+# ---------------------------------------------------------------------------
+
+def _双表同行同名工作簿(tmp_path):
+    """临时工作簿：午餐/晚餐第 3 行都是同一客户（同名、同门牌、同电话）。
+
+    这正是 D07 的触发条件——两表行号与姓名完全相同，但送达时间不同
+    （午餐 11:00、晚餐 17:00），是两个互不相同的任务。
+    """
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for sheet_name, delivery in (("午餐", "11:00"), ("晚餐", "17:00")):
+        sheet = workbook.create_sheet(sheet_name)
+        sheet.cell(1, 1, sheet_name)          # 第 1 行标题
+        sheet.cell(2, 1, "姓名")               # 第 2 行表头
+        sheet.cell(3, 1, "张三")               # 第 3 行：两表同名同门牌同电话
+        sheet.cell(3, 2, "B1")
+        sheet.cell(3, 3, "13800000001")
+        sheet.cell(3, 4, delivery)
+    path = tmp_path / "闪时送.xlsx"
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+def _assert_确认数与部分完成不矛盾(result, logs):
+    """D07 的对外症状：确认数少于处理数，却报成「不是部分完成」。
+
+    任务身份碰撞会让确认集合 ``set[str]`` 折叠掉一单，于是 ``created`` 少算
+    而 ``missing`` 仍为空，得到一个自相矛盾的结果。这条不变量必须先于任何
+    具体数值断言。
+    """
+    created, processed = result["created"], result["processed"]
+    assert not (created < processed and result["partial"] is False), (
+        f"确认 {created}/{processed} 却不是部分完成：任务身份被合并或状态口径矛盾；"
+        f"日志：{logs}")
+
+
+def test_任务标识_午餐晚餐同行同名也必须互不相同():
+    """同一行号同一姓名出现在两张表时，任务身份必须仍然唯一（D07）。
+
+    标识只有「第 N 行 姓名」时，午餐第 3 行的张三与晚餐第 3 行的张三是同一个
+    字符串：确认集合（``set[str]``）与错误归集字典（``dict[str, str]``）都会把
+    两个任务折叠成一个，created 少算且失败原因互相串台。
+    """
+    order = {"row": 3, "name": "张三", "door": "B1", "phone": "13800000001"}
+    address = {"lnt": 1.0, "lat": 2.0, "areaCode": "330110",
+               "addressDetail": "浙江农林大学东湖校区"}
+
+    tasks = sss._collect_tasks({"午餐": [dict(order)], "晚餐": [dict(order)]},
+                               7, address, "轻食", account="18758187837")
+
+    assert [task["sheet"] for task in tasks] == ["午餐", "晚餐"]
+    identifiers = [task["identifier"] for task in tasks]
+    assert identifiers == ["午餐 第 3 行 张三", "晚餐 第 3 行 张三"], identifiers
+    assert len(set(identifiers)) == 2, f"两个不同任务拿到了同一个标识：{identifiers}"
+
+
+def test_端到端_午餐晚餐同行同名时确认数必须等于处理数(monkeypatch, tmp_path):
+    """端到端（D07）：两表第 3 行同名同门牌，两次提交必须都算成一单。
+
+    使用接受下单的站内替身：POST 恰好 2 次、站内 2 条记录，结果必须是
+    processed=2 / created=2 / partial=False，收尾播报「确认 2/2」。
+    """
+    from tests.sss_test_support import _FakeClient, _config
+
+    _双表同行同名工作簿(tmp_path)
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    client = _FakeClient()
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert result["processed"] == 2, logs
+    assert len(client.posts) == 2, [payload.get("expectedDeliveryTime")
+                                    for payload in client.posts]
+    assert len(client.list_records) == 2, client.list_records
+    assert result["created"] == 2, logs
+    assert result["partial"] is False, logs
+    assert result["reconciled"] is True, logs
+    assert any("确认 2/2" in line for line in logs), logs
+    _assert_确认数与部分完成不矛盾(result, logs)
+
+
+def test_端到端_确实少一单时必须如实报部分完成(monkeypatch, tmp_path):
+    """反向锁（D07）：created < processed 只能是「真的少了一单」，且必须报 partial。
+
+    让晚餐那一单被站内业务拒绝（「商品已下架」＝确定未建单）：此时确认 1/2 是
+    真实缺失，partial 必须为 True。与上一条用例合起来锁住本缺陷的对外症状——
+    既不允许「少了却不承认」，也不允许把真实缺失吞成完成。
+    """
+    from tests.sss_test_support import _FakeClient, _config
+
+    class _晚餐被拒客户端(_FakeClient):
+        """接受午餐提交，明确拒绝晚餐（业务拒绝 → 确定未建单，不自动重试）。"""
+
+        def post_json(self, path, payload):
+            if str(payload.get("expectedDeliveryTime") or "").endswith("17:00:00"):
+                self.posts.append(payload)
+                return {"success": False, "message": "商品已下架"}
+            return super().post_json(path, payload)
+
+    _双表同行同名工作簿(tmp_path)
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    client = _晚餐被拒客户端()
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert len(client.posts) == 2, [payload.get("expectedDeliveryTime")
+                                    for payload in client.posts]
+    assert len(client.list_records) == 1, client.list_records
+    assert result["processed"] == 2, logs
+    assert result["created"] == 1, logs
+    assert result["partial"] is True, logs
+    _assert_确认数与部分完成不矛盾(result, logs)
+
+
+# ---------------------------------------------------------------------------
+# D09 / D10：跨轮对账的「已消费记录」账目与重登补发范围
+# ---------------------------------------------------------------------------
+
+def test_重登后不自动补发已发送但结果未知的任务(monkeypatch):
+    """D10 回归：重登后的补发名单必须扣掉「本轮已发出、结果不可确认」的任务。
+
+    张三的第一次 POST 已在站内建单，但客户端读响应超时（结果未知）；李四的
+    第一次 POST 因登录态失效被拒（服务端未建单）。重登后列表仍读不到张三的
+    订单（可见性延迟），旧代码据此把张三也当成「缺失」再补发一次——同一次
+    运行里重复下单。期望：张三只提交 1 次，李四走完恢复流程；站内合计 2 单、
+    没有重复；张三一直未被确认时必须如实留在 missing 里，不能假装完成。
+    """
+    from app.api_client import ApiError, SssTransportError
+
+    zhangsan = _full_task("午餐 第 3 行 张三", name="张三", door="A101")
+    lisi = _full_task("午餐 第 4 行 李四", name="李四", door="A202")
+
+    class _延迟可见客户端:
+        """站内替身：订单能建单，但李四补发成功之前列表一直读不到已建订单。
+
+        ``site_orders`` 是站内真实订单（最终计数用它），``readable`` 是列表接口
+        当前能读到的订单——「读不到」不等于「没建单」，这正是 D10 的判定条件。
+        """
+
+        def __init__(self):
+            self.site_orders: list[dict] = []
+            self.readable: list[dict] = []
+            self.posts: list[dict] = []
+
+        def _record(self, payload):
+            address = payload.get("receiveAddress") or {}
+            return {
+                "id": f"NEW-{len(self.site_orders) + 1:03d}",
+                "recipientName": payload.get("receiveName", ""),
+                "recipientPhone": [payload.get("receivePhone", "")],
+                "recipientAddress": (f"{address.get('addressDetail', '')}"
+                                     f"{address.get('doorNum', '')}"),
+                "expectedDeliveryTime": payload.get("expectedDeliveryTime", ""),
+                "status": 2,
+            }
+
+        # ---- SssApiClient 接口 ----
+        def fetch_captcha(self):
+            return b"png"
+
+        def login(self, _code):
+            return {"success": True}
+
+        def fork(self):
+            return self
+
+        def close(self):
+            pass
+
+        def get_json(self, path):
+            if "list" in path:
+                records = [dict(record) for record in self.readable]
+                return {"success": True,
+                        "result": {"records": records, "total": len(records)}}
+            if "store" in path:
+                return {"success": True, "result": [{"name": "一口轻食", "id": 7}]}
+            if "account" in path:
+                return {"success": True, "result": {"totalAmount": 1000.0}}
+            return {"success": True, "result": []}
+
+        def post_json(self, _path, payload):
+            self.posts.append(payload)
+            if len(self.posts) == 1:
+                # 张三：服务端已建单，但客户端读响应超时（结果未知）
+                self.site_orders.append(self._record(payload))
+                raise SssTransportError("读取超时")
+            if len(self.posts) == 2:
+                # 李四：与真机一致的登录失效（HTTP 200 + code=10000），未建单
+                raise ApiError("闪时送登录态已失效（code=10000，token失效，"
+                               "请重新登陆），请重新登录")
+            # 重登后的补发：这张订单列表读得到，张三那张仍然读不到
+            record = self._record(payload)
+            self.site_orders.append(record)
+            self.readable.append(record)
+            return {"success": True}
+
+    client = _延迟可见客户端()
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+
+    final, reconciled = sss._run_reconciled_submission(
+        [zhangsan, lisi],
+        lambda: sss._make_api_submitter(client),
+        client.get_json,
+        threading.Event(),
+        None,
+        None,
+        max_workers=1,
+        relogin=lambda: client.login("1234"))
+
+    assert reconciled is True
+    assert final is not None
+    assert [payload["receiveName"] for payload in client.posts] == ["张三", "李四", "李四"], (
+        "结果未知的张三不得在重登后被自动补发；李四（确定未建单）走恢复流程")
+    assert final.duplicate_count == 0, final
+    assert final.confirmed == {"午餐 第 4 行 李四"}, final
+    assert [task["identifier"] for task in final.missing] == ["午餐 第 3 行 张三"], (
+        "未被确认的未知单必须如实留在 missing 里")
+    assert sorted(record["recipientName"] for record in client.site_orders) == ["张三", "李四"], (
+        "站内合计 2 单：张三 1 单、李四 1 单，没有重复")
+
+
+def test_端到端_重登不会自动重发结果未知的已受理订单(monkeypatch, tmp_path):
+    """D10 端到端：站内列表看不见已受理订单时，重登补发不得再发一次。
+
+    与上一条同一替身，走完整 ``run_sss_job``：POST 序列必须是
+    张三 → 李四 → 李四，站内合计 2 单；张三一直没被确认，所以结果只能是
+    created=1 / partial=True（而不是被误报成全部完成）。
+    """
+    from tests.sss_test_support import _FakeClient, _config
+    from app.api_client import ApiError, SssTransportError
+
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "午餐"
+    sheet.cell(2, 1, "姓名")
+    sheet.cell(3, 1, "张三")
+    sheet.cell(3, 2, "A101")
+    sheet.cell(3, 3, "13800000001")
+    sheet.cell(4, 1, "李四")
+    sheet.cell(4, 2, "A202")
+    sheet.cell(4, 3, "13800000002")
+    excel_path = tmp_path / "闪时送.xlsx"
+    workbook.save(excel_path)
+    workbook.close()
+
+    class _可见性延迟客户端(_FakeClient):
+        """复用 _FakeClient 的登录/门店/余额，只替换列表与下单行为。"""
+
+        def __init__(self):
+            super().__init__()
+            self.site_orders = []
+            self.readable = []
+
+        def get_json(self, path):
+            if "list" not in path:
+                return super().get_json(path)
+            records = [dict(record) for record in self.readable]
+            return {"success": True, "result": {"records": records,
+                                               "total": len(records)}}
+
+        def post_json(self, _path, payload):
+            self.posts.append(payload)
+            address = payload.get("receiveAddress") or {}
+            record = {
+                "id": f"NEW-{len(self.site_orders) + 1:03d}",
+                "recipientName": payload.get("receiveName", ""),
+                "recipientPhone": [payload.get("receivePhone", "")],
+                "recipientAddress": (f"{address.get('addressDetail', '')}"
+                                     f"{address.get('doorNum', '')}"),
+                "expectedDeliveryTime": payload.get("expectedDeliveryTime", ""),
+                "status": 2,
+            }
+            if len(self.posts) == 1:
+                self.site_orders.append(record)          # 已建单，但读响应超时
+                raise SssTransportError("读取超时")
+            if len(self.posts) == 2:
+                raise ApiError("闪时送登录态已失效（code=10000，token失效，"
+                               "请重新登陆），请重新登录")
+            self.site_orders.append(record)
+            self.readable.append(record)
+            return {"success": True}
+
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    client = _可见性延迟客户端()
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert [payload["receiveName"] for payload in client.posts] == ["张三", "李四", "李四"], logs
+    assert sorted(record["recipientName"] for record in client.site_orders) == ["张三", "李四"], logs
+    assert result["processed"] == 2, logs
+    assert result["created"] == 1, logs
+    assert result["partial"] is True, logs
+    assert result["reconciled"] is True, logs
+    assert any("不会自动补发" in line for line in logs), logs
+    _assert_确认数与部分完成不矛盾(result, logs)
+
+
+def test_端到端_站内只有一条记录时只能确认一单并如实报部分完成(monkeypatch, tmp_path):
+    """D09 端到端：两条同名同址同电话的任务 + 站内 1 条旧记录 + 明确拒绝。
+
+    旧代码返回 processed=2 / created=2 / partial=False（把一张旧记录当成两条
+    任务的完成证据）；期望 created=1 且 partial=True，站内订单数仍为 1。
+    """
+    from openpyxl import Workbook
+
+    from tests.sss_test_support import _FakeClient, _config
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "午餐"
+    sheet.cell(2, 1, "姓名")
+    for row in (3, 4):                     # 同一客户两行：指纹相同、标识不同
+        sheet.cell(row, 1, "张三")
+        sheet.cell(row, 2, "B2")
+        sheet.cell(row, 3, "13900000001")
+    excel_path = tmp_path / "闪时送.xlsx"
+    workbook.save(excel_path)
+    workbook.close()
+
+    config = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                     sss_submit_min_interval_s=0.0)
+    orders = sss.load_sss_orders(excel_path)
+    sss._validate_sss_orders(orders)
+    tasks = sss._collect_tasks(orders, 7, sss._fixed_address_from_config(config),
+                               config.sss_product_name,
+                               account=config.sss_account, now=dt.datetime.now())
+    assert [task["identifier"] for task in tasks] == ["午餐 第 3 行 张三", "午餐 第 4 行 张三"]
+    payload = tasks[0]["payload"]
+    address = payload["receiveAddress"]
+    station_record = {
+        "recipientName": payload["receiveName"],
+        "recipientPhone": [payload["receivePhone"]],
+        "recipientAddress": f"{address['addressDetail']}{address['doorNum']}",
+        "expectedDeliveryTime": payload["expectedDeliveryTime"],
+        "status": 2,
+    }
+
+    class _站内仅一单客户端(_FakeClient):
+        """站内已有一条匹配旧记录；下单被明确拒绝（商品已下架，确定未建单）。"""
+
+        def __init__(self):
+            super().__init__(order_fail=True)
+            self.list_records = [dict(station_record)]
+
+        def get_json(self, path):
+            if "list" in path:
+                # 送达时间按查询时刻刷新：夹具在测试开头算过一遍，run_sss_job 内部
+                # 又算一遍，跨过 16:00/20:00 餐次边界时两边会得到不同的送达日。
+                for record in self.list_records:
+                    record["expectedDeliveryTime"] = sss.compute_delivery_time(
+                        False, dt.datetime.now())
+            return super().get_json(path)
+
+    client = _站内仅一单客户端()
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    monkeypatch.setattr(sss, "_RECONCILE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(sss, "_PREFILTER_ZERO_RETRY_DELAY_S", 0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert len(client.posts) == 1, logs
+    assert len(client.list_records) == 1, client.list_records
+    assert result["processed"] == 2, logs
+    assert result["created"] == 1, logs
+    assert result["partial"] is True, logs
+    _assert_确认数与部分完成不矛盾(result, logs)

@@ -325,6 +325,139 @@ def test_cloud_verified_merges_ledger_and_clears(env):
     assert ledger.synced_slots(TARGET.isoformat(), "F1", "张", "111") == [6]
 
 
+def _apply_with_ledger_disk_failure(cli, ledger, journal, plan, monkeypatch):
+    """执行一次上传，并让账本提交（``merge_entries``）写盘失败。
+
+    D05 的输入形态：云端已经按期望值写完，账本却没能落盘（``ledger_pending``），
+    恢复入口只能靠"只读核对 + 本次意图"来补记锚点。写盘失败只模拟这一次提交，
+    随后的账本重载/落盘走真实实现。
+    """
+
+    def _disk_failure(*_args, **_kwargs):
+        raise OSError("模拟账本写盘失败（D05）")
+
+    monkeypatch.setattr(SyncLedger, "merge_entries", _disk_failure)
+    try:
+        return cloud_apply_plan(cli, [plan], ledger=ledger, marker_enabled=False,
+                                journal=journal)
+    finally:
+        monkeypatch.undo()
+
+
+def test_云端已核对后补记本操作的合法槽位增量(env, monkeypatch):
+    """D05：账本 [6]、本地 7 已把云端总餐次写到 11，只有账本没落盘。
+
+    只读核对证明云端就是本操作的期望值后，恢复必须按本次意图把账本补成 [7] 并
+    结案（解除同日期同表的阻断），不能把"本次自己写出的增量"当成外部冲突。
+    （侦察规格用例名：test_cloud_verified_merges_legal_slot_increment。）
+    """
+    ledger, journal = env
+    cli = RecordingCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "10"}]))
+    ledger.record(TARGET.isoformat(), "F1",
+                  {"张\u0000111": {"slots": [6], "total": 6}})
+    ledger.save()
+    plan = _plan(cli, _orders(("张", "111", 7, 3)), ledger=ledger)
+
+    result = _apply_with_ledger_disk_failure(cli, ledger, journal, plan, monkeypatch)
+
+    op_id = result["operation_id"]
+    assert result["sheets"][0]["status"] == "ok"
+    assert result["sheets"][0]["ledger_error"], "账本写盘失败必须如实记进结果"
+    record = SyncJournal(journal_path_for(ledger.path)).get_operation(
+        op_id)["sheets"]["东湖中餐"]
+    assert record["status"] == "ledger_pending"
+    assert record["ledger_entries"]["张\u0000111"]["slots"] == [7]
+    assert SyncLedger(ledger.path).synced_slots(
+        TARGET.isoformat(), "F1", "张", "111") == [6]
+    assert str(cli.grid.get((2, 7), "")) == "11", "云端第 3 行总餐次应已被写到 11"
+    # 前提：只读核对确实证明云端 = 本操作期望值
+    assert rec.classify_journal_sheet(cli, record)["state"] == "verified"
+
+    resolved = rec.resolve_pending_operation(
+        op_id, "cloud_verified", confirm="cloud_verified",
+        note="已逐格核对云端，全部一致", ledger=SyncLedger(ledger.path),
+        journal=SyncJournal(journal_path_for(ledger.path)), cli=cli)
+
+    assert resolved["ok"] is True and resolved["status"] == "resolved", (
+        f"云端已证明成功，恢复不该拒绝补账：{resolved}")
+    assert resolved["cloud_write"] is False, "恢复入口永不写云端"
+    saved = SyncJournal(journal_path_for(ledger.path))
+    assert saved.get_operation(op_id)["sheets"]["东湖中餐"]["status"] == "verified"
+    assert SyncLedger(ledger.path).synced_slots(
+        TARGET.isoformat(), "F1", "张", "111") == [7]
+    assert saved.blocking_operations(TARGET.isoformat(), "F1") == {}, "补记成功后闸门解除"
+
+
+def test_云端已核对但锚点不是本操作写出的值仍判冲突(env, monkeypatch):
+    """失败关闭：日志里的槽位值改成 [8]（本次意图是 7）→ 仍判 ledger_slot_conflict。
+
+    只读核对证明的是"云端 = 期望值"，不是"账本可以随便改"。锚点值与本次意图对
+    不上时必须继续 blocking，绝不能自动放宽。
+    （侦察规格用例名：test_cloud_verified_keeps_conflict_when_slot_not_written_by_this_op。）
+    """
+    ledger, journal = env
+    cli = RecordingCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "10"}]))
+    ledger.record(TARGET.isoformat(), "F1",
+                  {"张\u0000111": {"slots": [6], "total": 6}})
+    ledger.save()
+    plan = _plan(cli, _orders(("张", "111", 7, 3)), ledger=ledger)
+
+    result = _apply_with_ledger_disk_failure(cli, ledger, journal, plan, monkeypatch)
+
+    op_id = result["operation_id"]
+    tampered = SyncJournal(journal_path_for(ledger.path))
+    tampered.get_operation(op_id)["sheets"]["东湖中餐"]["ledger_entries"][
+        "张\u0000111"]["slots"] = [8]
+    tampered.save()
+
+    resolved = rec.resolve_pending_operation(
+        op_id, "cloud_verified", confirm="cloud_verified",
+        note="已逐格核对云端，全部一致", ledger=SyncLedger(ledger.path),
+        journal=SyncJournal(journal_path_for(ledger.path)), cli=cli)
+
+    assert resolved["ok"] is False
+    assert resolved["operations"][0]["reason"] == "ledger_slot_conflict:张"
+    assert SyncLedger(ledger.path).synced_slots(
+        TARGET.isoformat(), "F1", "张", "111") == [6]
+    saved = SyncJournal(journal_path_for(ledger.path))
+    assert saved.get_operation(op_id)["sheets"]["东湖中餐"]["status"] == "ledger_pending"
+    assert op_id in saved.blocking_operations(TARGET.isoformat(), "F1"), "冲突不得解除阻断"
+
+
+def test_云端已核对后追加槽位仍按既有前缀语义补记(env, monkeypatch):
+    """旧语义回归：账本 [6] → 日志 [6, 2]（本地新增第 2 槽）仍按前缀分支补记。
+
+    这条守住"新 slots 以旧 slots 为前缀"的老分支，确保 D05 的放宽没有把它改坏。
+    """
+    ledger, journal = env
+    cli = RecordingCli(make_grid(BASE_HEADER, [{0: "张", 2: "111", 7: "6"},
+                                               {0: "张", 2: "111", 7: "0"}]))
+    ledger.record(TARGET.isoformat(), "F1",
+                  {"张\u0000111": {"slots": [6], "total": 6}})
+    ledger.save()
+    plan = _plan(cli, _orders(("张", "111", 6, 3), ("张", "111", 2, 4)), ledger=ledger)
+
+    result = _apply_with_ledger_disk_failure(cli, ledger, journal, plan, monkeypatch)
+
+    op_id = result["operation_id"]
+    record = SyncJournal(journal_path_for(ledger.path)).get_operation(
+        op_id)["sheets"]["东湖中餐"]
+    assert record["ledger_entries"]["张\u0000111"]["slots"] == [6, 2]
+    assert SyncLedger(ledger.path).synced_slots(
+        TARGET.isoformat(), "F1", "张", "111") == [6]
+
+    resolved = rec.resolve_pending_operation(
+        op_id, "cloud_verified", confirm="cloud_verified",
+        note="已逐格核对云端，全部一致", ledger=SyncLedger(ledger.path),
+        journal=SyncJournal(journal_path_for(ledger.path)), cli=cli)
+
+    assert resolved["ok"] is True and resolved["status"] == "resolved"
+    saved = SyncJournal(journal_path_for(ledger.path))
+    assert saved.get_operation(op_id)["sheets"]["东湖中餐"]["status"] == "verified"
+    assert SyncLedger(ledger.path).synced_slots(
+        TARGET.isoformat(), "F1", "张", "111") == [6, 2]
+
+
 def test_cloud_verified_refuses_when_cloud_does_not_match(env):
     """云端对不上（表头日期不符）时不能靠人工勾选放行。"""
     ledger, journal = env

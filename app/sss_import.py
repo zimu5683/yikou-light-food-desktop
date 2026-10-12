@@ -47,7 +47,8 @@ try:
         date_region,
         effective_tables,
         find_target_column,
-        scan_bounds,
+        read_grid_chunked,
+        scan_region,
     )
 except ImportError:  # pragma: no cover - allows ``python app/sss_import.py``
     from wps_cloud import (  # type: ignore[no-redef]
@@ -64,7 +65,8 @@ except ImportError:  # pragma: no cover - allows ``python app/sss_import.py``
         date_region,
         effective_tables,
         find_target_column,
-        scan_bounds,
+        read_grid_chunked,
+        scan_region,
     )
 
 # 闪时送工作表 -> 云端排单表（用户口径：闪时送的午餐/晚餐就是东湖的两顿）。
@@ -216,12 +218,15 @@ class MealImport:
 def read_cloud_meal(cli: Any, *, file_id: str, table: str, meal: str,
                     target: _dt.date,
                     log: Callable[[str], Any] | None = None) -> MealImport:
-    """读一张云端表的当天列，返回该餐要下单的人（只读，2 次接口调用）。
+    """读一张云端表的当天列，返回该餐要下单的人（只读；``sheets_info`` + 1~N 次
+    分块读 —— 宽表按单次格数上限分块，**保证读全**而不是只读前 225 行）。
 
     - 列位置全部按表头文字定位（协作者常插列，不能写死列号）；
     - 日期列只在「电话列右一列 ~ 第一个结构列左一列」之间找，备注右侧那句
       「9.16 周三」是协作者的标记，绝不当成日期列；
-    - 地址归一化后属于「大西/小」的行计入 ``skipped_address``，不进下单名单。
+    - 地址归一化后属于「大西/小」的行计入 ``skipped_address``，不进下单名单；
+    - 云端表长到读不全（used range 超过 ``MAX_SCAN_ROW``）时抛
+      :class:`ImportRefused` —— 名单不完整必须拒单，不能静默漏人（D08）。
     """
     result = MealImport(meal=meal, table=table, file_id=file_id, target=target)
     try:
@@ -234,9 +239,16 @@ def read_cloud_meal(cli: Any, *, file_id: str, table: str, meal: str,
             "已拒绝下单；可改用「本地 Excel」名单来源人工下单。")
     info = infos[0]
     worksheet_id = int(info.get("sheetId") or 1)
-    row_to, col_to = scan_bounds(info)
+    row_to, col_to, unreadable = scan_region(info)
+    if unreadable:
+        # D08：读不完整就不能拿这份快照判"今天没人要送"——名单会静默漏人。
+        raise ImportRefused(
+            f"云端表「{table}」{unreadable}已拒绝下单："
+            "请先在云端删除表格尾部多余的空行/格式后重试，"
+            "或改用「本地 Excel」名单来源人工下单。")
     try:
-        grid = cli.read_grid(file_id, worksheet_id, 0, row_to, 0, col_to)
+        # 单次请求有格数上限：宽表必须**分块补读**，否则第 230 行的人会被静默漏掉。
+        grid = read_grid_chunked(cli, file_id, worksheet_id, 0, row_to, 0, col_to)
     except WpsCloudError as exc:
         raise _cloud_error(table, exc) from exc
 

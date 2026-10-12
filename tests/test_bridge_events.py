@@ -300,3 +300,63 @@ def test_sss_config_defaults_to_wps_source_and_roundtrips(tmp_path):
     assert AppConfig.load(path).sss_order_source == "excel"
     # 非法值一律回落到云端模式
     assert AppConfig(sss_order_source="weird").sss_order_source == "wps"
+
+
+def test_wps_preview_blocks_a_sheet_that_cannot_be_read_in_full(tmp_path, monkeypatch):
+    """D08 端到端：云端表长到读不完整时，预览必须把该表标成阻断并给出原因。
+
+    走的是真实的 ``build_plan``（只把云端 CLI 换成替身）：used range 到第 501 行，
+    超过可完整读取的上限 —— 预览必须报"本次未写入这张表 + 原因"，且**一个内容
+    都不读**（探测到读不全就不该再去读半张表）。
+    """
+    from openpyxl import Workbook
+
+    from app import bridge as bridge_module
+
+    class _LongSheetCli:
+        """只为 ``build_plan`` 服务的最小替身：used range 到第 501 行。"""
+
+        path = "/fake/kdocs-cli"
+
+        def __init__(self) -> None:
+            self.content_reads: list[tuple] = []
+
+        def authenticated(self) -> bool:
+            return True
+
+        def sheets_info(self, file_id: str):
+            return [{"sheetId": 1, "sheetName": "东湖中餐",
+                     "rowTo": 500, "colTo": 50}]
+
+        def read_grid(self, file_id, worksheet_id, row_from, row_to,
+                      col_from, col_to, *, with_format: bool = False):
+            self.content_reads.append((row_from, row_to, col_from, col_to))
+            return {(1, 0): "姓名", (1, 1): "地址", (1, 2): "电话"}
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "东湖中餐"
+    sheet.append(["订单", "姓名", "地址", "电话"])
+    sheet.append([])
+    sheet.append(["W1", "张三", "b2", "13800000001"])
+    excel = tmp_path / "排单.xlsx"
+    workbook.save(excel)
+    workbook.close()
+
+    monkeypatch.setattr(bridge_module, "effective_tables",
+                        lambda _cfg: {"东湖中餐": {"file_id": "F1"}})
+    cli = _LongSheetCli()
+    bridge = Bridge(config_path=str(tmp_path / "config.json"))
+    bridge._config.wps_enabled = True
+    bridge._config.excel_path = str(excel)
+    monkeypatch.setattr(bridge, "_wps_cli", lambda: cli)
+
+    result = bridge.wps_preview()
+    assert result["ok"] is True and result["status"] == "preview_ready"
+    assert [item["sheet"] for item in result["blocked"]] == ["东湖中餐"]
+    reason = result["blocked"][0]["reason"]
+    assert "501" in reason and "401" in reason, "原因里要说清实际行数与上限"
+    assert "本次未写入这张表（一个格子都没动）" in result["text"]
+    assert "501" in result["text"]
+    assert result["summary"]["blocked"] == 1
+    assert cli.content_reads == [], "读不完整时不该再去读半张表"

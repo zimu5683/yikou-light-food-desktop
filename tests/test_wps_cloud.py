@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from app import wps_cloud as wc
+from app.wps_journal import SyncJournal, journal_path_for
 from app.wps_cloud import (
     Change, CloudOrder, LedgerCorruptError, SheetPlan, SyncLedger, WpsCloudError,
     apply_plan, build_plan, find_cli, format_plan, parse_date_header,
@@ -24,13 +25,18 @@ from app.wps_cloud import (
 
 
 def _ledger_with(directory, date_key: str, file_id: str, name: str, phone: str,
-                 slots: list[int]):
-    """造一个已记录 ``slots`` 的临时账本（模拟"本批已经同步过一次"）。"""
+                 slots: list[int], orders: list[str] | None = None):
+    """造一个已记录 ``slots`` 的临时账本（模拟"本批已经同步过一次"）。
+
+    ``orders`` 是同一批槽位对应的本地订单号（账本里的槽位身份）；不传就是
+    旧账本形态（没有身份信息，只能按行号位置配对）。
+    """
     path = Path(directory) / f"state-{uuid.uuid4().hex[:8]}.json"
     ledger = SyncLedger(path)
-    ledger.record(date_key, file_id,
-                  {f"{name}\u0000{phone}": {"slots": list(slots),
-                                            "total": sum(slots)}})
+    payload = {"slots": list(slots), "total": sum(slots)}
+    if orders is not None:
+        payload["orders"] = list(orders)
+    ledger.record(date_key, file_id, {f"{name}\u0000{phone}": payload})
     ledger.save()
     return ledger
 
@@ -523,6 +529,79 @@ def test_scan_bounds_respects_read_budget():
     assert wc.scan_bounds(None) == (0, 0)
 
 
+# ----------------------------------------------------------------------
+# D08：读取预算截断 / 读不完整
+# ----------------------------------------------------------------------
+
+class LongSheetCli(FakeCli):
+    """used range 比单次读取预算（45,000 格）更长的云端表替身。
+
+    ``rowTo=300, colTo=199`` 时单次读取只覆盖第 1~225 行 —— 正是 D08 的触发条件。
+    """
+
+    def __init__(self, grid, *, row_to=300, col_to=199, **kwargs):
+        super().__init__(grid, **kwargs)
+        self.row_to = row_to
+        self.col_to = col_to
+
+    def sheets_info(self, file_id: str):
+        info = super().sheets_info(file_id)
+        info[0]["rowTo"] = self.row_to
+        info[0]["colTo"] = self.col_to
+        return info
+
+
+def long_grid(*, person_row: int, rows: int, name: str = "张三",
+              phone: str = "13800000001") -> dict[tuple[int, int], str]:
+    """``rows`` 行的云端排单表；第 ``person_row`` 行（1-based）是已有客户。"""
+    people = [{0: f"客户{index + 1}", 2: f"1380000{index:04d}", 7: "1"}
+              for index in range(rows)]
+    people[person_row - 3] = {0: name, 1: "b2", 2: phone, 4: "1",
+                              5: "经济餐", 6: "中餐", 7: "10"}
+    return make_grid(BASE_HEADER, people)
+
+
+def test_读取预算截断时已有客户不被当成新客户():
+    """D08：第 230 行的老客户不能被漏读成"新客户"（否则会插重复行、餐次分开加）。"""
+    cli = LongSheetCli(long_grid(person_row=230, rows=231))
+    orders = [CloudOrder("东湖中餐", "张三", "b2", "13800000001", "中餐", "经济", 2)]
+    plans = _plan(cli, orders, sort=False)
+    change = plans[0].changes[0]
+    assert change.kind == "existing"
+    assert change.row == 230
+    assert (change.total_before, change.total_after) == (10, 12)
+
+
+def test_读取预算截断时老客户不被插成重复行():
+    """D08 的写侧后果：apply_plan 必须写回老客户那一行，而不是插一行新客户。"""
+    cli = LongSheetCli(long_grid(person_row=230, rows=231))
+    orders = [CloudOrder("东湖中餐", "张三", "b2", "13800000001", "中餐", "经济", 2)]
+    plans = _plan(cli, orders, sort=False)
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "ok"
+    assert cli.inserts == []
+    assert cli.grid[(229, 7)] == "12", "第 230 行（0-based 229）总餐次 10 → 12"
+
+
+def test_表比可完整读取上限更长时写侧阻断并明示():
+    """D08：读不完整（used range 超过 400 行）时整表拒绝写入，并说清原因。"""
+    cli = LongSheetCli(long_grid(person_row=450, rows=451), row_to=500, col_to=50)
+    orders = [CloudOrder("东湖中餐", "张三", "b2", "13800000001", "中餐", "经济", 2)]
+    plans = _plan(cli, orders, sort=False)
+    plan = plans[0]
+    assert plan.blocked_reason and plan.changes == []
+    assert "501" in plan.blocked_reason and "401" in plan.blocked_reason
+    assert "拒绝" in plan.blocked_reason
+    assert cli.reads == [("sheets_info", "F1")], "只允许探测 used range，不读内容"
+    assert summarize_plan(plans)["blocked"] == 1
+    assert "拒绝写入" in format_plan(plans)
+
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "blocked"
+    assert result["sheets"][0]["cloud_writes"] == 0
+    assert not cli.writes and not cli.inserts
+
+
 # 模板行的颜色分布（对齐 BASE_HEADER 与真实表）：名字~餐种白、总餐次/已出餐/剩余餐金黄、备注白
 TEMPLATE_COLORS = {c: "#FFFFFFFF" for c in range(1, 15)}
 for _c in (8, 9, 10):
@@ -882,7 +961,13 @@ def test_write_failure_after_sort_does_not_delete_rows():
 
 
 def test_actual_sort_result_wins_over_prediction():
-    """云端排序结果与本地预测不一致时，按**实际行号**写入并标记 sort_mismatch。"""
+    """云端排法与预测不一致时：按**地址定位到的实际行号**写入，并标记 sort_mismatch。
+
+    D01 之后这条的语义更精确了：``plan.final_rows`` 只是**预测/诊断**，写入位置由
+    「人 + 地址组 + 组内序号」定位决定（写入前还会逐行核对地址）。所以"实际行号
+    与预测不同"不再是风险 —— 只要定位到的还是变更原本那一行，就必须照写不误，
+    同时把差异留成 ``sort_mismatch`` 供人工排查。
+    """
     class ShuffleCli(FakeCli):
         """故意按降序排，模拟"云端排法与本地预测不一致"。"""
 
@@ -903,8 +988,12 @@ def test_actual_sort_result_wins_over_prediction():
     assert result["sheets"][0]["sort_mismatch"] is True
     for change in plan.changes:
         row = change.row
+        # 写入前按地址定位并核对：行号可以是实际的，行身份不能错
         assert cli.grid.get((row - 1, 0)) == change.name, \
             f"{change.name} 的写入行号与姓名不符（第 {row} 行）"
+        assert cli.grid.get((row - 1, 1)) == change.address, \
+            f"{change.name} 写到了地址不符的行（第 {row} 行：" \
+            f"{cli.grid.get((row - 1, 1))!r}）"
 
 
 def test_existing_customer_written_at_post_sort_row():
@@ -924,6 +1013,236 @@ def test_existing_customer_written_at_post_sort_row():
     # 李：云端 3 + 本批 6 = 9；张没有日期格，别写错行
     assert cli.grid[(2, 0)] == "李" and cli.grid[(2, 7)] == "9" and cli.grid[(2, 4)] == "1"
     assert cli.grid[(4, 0)] == "张" and (4, 4) not in cli.grid, "张没有日期格，别写错行"
+
+
+# ----------------------------------------------------------------------
+# 排序后的行定位：排序只按地址重排，变更的身份不能跟着漂（D01）
+# ----------------------------------------------------------------------
+
+def _person_rows(cli: FakeCli, name: str, phone: str) -> list[dict[str, str]]:
+    """按**内容**（不是行号）找出某人在表里的每一行 —— 断言不依赖绝对行号。
+
+    ``served`` 是这一行的「已出餐」格：老行的公式不会被改写、跟着行走，
+    因此可以用它把"原来哪一行"钉住（行号会变，公式里的行号不会）。
+    """
+    rows: list[dict[str, str]] = []
+    for (row, col), value in list(cli.grid.items()):
+        if col != 0 or str(value).strip() != name:
+            continue
+        if wc.normalize_phone(str(cli.grid.get((row, 2), "") or "")) != phone:
+            continue
+        rows.append({
+            "row": str(row + 1),
+            "address": str(cli.grid.get((row, 1), "") or "").strip(),
+            "mark": str(cli.grid.get((row, 4), "") or "").strip(),
+            "total": str(cli.grid.get((row, 7), "") or "").strip(),
+            "served": str(cli.grid.get((row, 8), "") or "").strip(),
+        })
+    return sorted(rows, key=lambda item: int(item["row"]))
+
+
+def _d01_cloud(*, first: int, second: int,
+               first_mark: str = "1", second_mark: str = "1") -> FakeCli:
+    """D01 场景的云端表：同一客户两条 B1 旧行 + 另一个人（证明不是"行数变了"）。"""
+    return FakeCli(make_grid(BASE_HEADER, [
+        {0: "张三", 1: "B1", 2: "111", 4: first_mark, 5: "中餐", 6: "经济",
+         7: str(first), 8: "=SUM(D3:E3)", 9: "=H3-I3"},
+        {0: "张三", 1: "B1", 2: "111", 4: second_mark, 5: "中餐", 6: "经济",
+         7: str(second), 8: "=SUM(D4:E4)", 9: "=H4-I4"},
+        {0: "李四", 1: "B1", 2: "222", 4: "1", 5: "中餐", 6: "经济",
+         7: "3", 8: "=SUM(D5:E5)", 9: "=H5-I5"},
+    ]))
+
+
+def _d01_orders(first: int, second: int, new: int = 2) -> list[CloudOrder]:
+    """张三本地三行：B1 两条旧单（槽位 1、2）+ 新下的 A1 单（槽位 3）。"""
+    return [
+        CloudOrder("东湖中餐", "张三", "B1", "111", "中餐", "经济", first,
+                   row=2, rows=(2,)),
+        CloudOrder("东湖中餐", "张三", "B1", "111", "中餐", "经济", second,
+                   row=3, rows=(3,)),
+        CloudOrder("东湖中餐", "张三", "A1", "111", "中餐", "经济", new,
+                   row=9, rows=(9,)),
+    ]
+
+
+def test_多行客户排序后槽位身份不错配():
+    """D01 场景 A（``test_multi_row_customer_slots_keep_identity_after_sort``）。
+
+    云端同一客户两条 B1 旧行（10 / 20，当天标记已经是 1）、账本本批已同步
+    [6, 1]，本地保留这两行并**新增**一条 A1 的 2 餐订单。开启地址排序后 A1
+    排到两条 B1 之前 —— 本地 A1 行与两条 B1 旧行之间没有出现任何数值差异，
+    所以定位错行时**只能**表现为：20 餐被新行的 2 覆盖、A1 行漏写，且仍报成功。
+
+    期望：旧行各自保留 10 / 20，A1 新行写入 2 餐与当天标记，合计 32。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张三", "111", [6, 1])
+    cli = _d01_cloud(first=10, second=20)
+    plan = _plan(cli, _d01_orders(6, 1), ledger=ledger,
+                 address_order={"东湖中餐": []})[0]
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+
+    zhang = _person_rows(cli, "张三", "111")
+    a1 = [item for item in zhang if item["address"] == "A1"]
+    b1 = [item for item in zhang if item["address"] == "B1"]
+    assert len(a1) == 1, f"A1 新行必须存在且只有一条：{zhang}"
+    assert a1[0]["total"] == "2" and a1[0]["mark"] == "1", \
+        f"A1 新行应写入 2 餐 + 当天标记，实际 {a1[0]}"
+    assert sorted(item["total"] for item in b1) == ["10", "20"], \
+        f"两条 B1 旧行的餐次必须原样保留，实际 {b1}"
+    # 身份而不是行号：老行「已出餐」公式留在自己那一行上，行号变了也不该互换
+    by_formula = {item["served"]: item["total"] for item in b1}
+    assert by_formula == {"=SUM(D3:E3)": "10", "=SUM(D4:E4)": "20"}, by_formula
+    assert sum(int(item["total"]) for item in zhang) == 32, zhang
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    assert result["sheets"][0]["sort_mismatch"] is False, result["sheets"]
+    assert result["failed"] == 0, result["sheets"]
+
+
+def test_多行客户排序后增量写回原行():
+    """D01 场景 B：两条旧行**还没写当天标记**、本地第 1 槽从 6 加到 8 餐。
+
+    这一批每个槽位都有真实写入，而且两条旧行的云端现值相同（10 / 10）：
+    按「第几个物理行」定位时，「+2 餐」会落到 A1 新行那一行上、新行的 2 餐
+    又会落到第二条旧行上 —— 合计凑巧还是 24 餐，回读校验也照样通过。
+
+    期望：+2 落在**原来那一行**（公式 =SUM(D3:E3) 的老行）上变成 12，
+    第二条旧行仍是 10，A1 新行 2 餐 + 当天标记。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张三", "111", [6, 1])
+    cli = _d01_cloud(first=10, second=10, first_mark="", second_mark="")
+    plan = _plan(cli, _d01_orders(8, 1), ledger=ledger,
+                 address_order={"东湖中餐": []})[0]
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+
+    zhang = _person_rows(cli, "张三", "111")
+    a1 = [item for item in zhang if item["address"] == "A1"]
+    b1 = [item for item in zhang if item["address"] == "B1"]
+    assert len(a1) == 1 and a1[0]["total"] == "2" and a1[0]["mark"] == "1", \
+        f"A1 新行应写入 2 餐 + 当天标记，实际 {a1}"
+    by_formula = {item["served"]: (item["total"], item["mark"]) for item in b1}
+    assert by_formula["=SUM(D3:E3)"] == ("12", "1"), \
+        f"第 1 槽的 +2 餐必须落在原来那一行上：{by_formula}"
+    assert by_formula["=SUM(D4:E4)"] == ("10", "1"), \
+        f"第 2 槽不应被加餐：{by_formula}"
+    assert sum(int(item["total"]) for item in zhang) == 24, zhang
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    assert result["sheets"][0]["sort_mismatch"] is False, result["sheets"]
+
+
+def test_排序后地址回读不符必须失败():
+    """D01：排序后定位不到变更原本那一行时，必须报失败 —— 不许猜行号继续写。
+
+    内存云表在排序之后把 A1 那行的地址列改掉（模拟地址列没被排序区带着走、
+    或表在排序后被协作者改过）：此时「A1 组里的第 1 行」证明不了是哪一行。
+    期望 fail-closed：一个餐次/标记格子都不写，且失败原因里说清是**地址**
+    对不上（旧实现会继续按错位行号写下去，只有数值凑巧对不上时才会被发现）。
+    """
+    class AddressMovedCli(FakeCli):
+        """排序完成后改掉 A1 行的地址列。"""
+
+        def sort_range(self, *args, **kwargs):
+            super().sort_range(*args, **kwargs)
+            for (row, col), value in list(self.grid.items()):
+                if col == 1 and str(value).strip() == "A1":
+                    self.grid[(row, col)] = "C9"
+
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张三", "111", [6, 1])
+    cli = AddressMovedCli(make_grid(BASE_HEADER, [
+        {0: "张三", 1: "B1", 2: "111", 4: "", 5: "中餐", 6: "经济",
+         7: "10", 8: "=SUM(D3:E3)", 9: "=H3-I3"},
+        {0: "张三", 1: "B1", 2: "111", 4: "", 5: "中餐", 6: "经济",
+         7: "10", 8: "=SUM(D4:E4)", 9: "=H4-I4"},
+    ]))
+    plan = _plan(cli, _d01_orders(8, 1), ledger=ledger,
+                 address_order={"东湖中餐": []})[0]
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+
+    sheet = result["sheets"][0]
+    assert sheet["status"] in {"failed", "verify_failed"}, sheet
+    assert sheet["uncertain"] is True, sheet
+    detail = " ".join([*(sheet.get("problems") or []), str(sheet.get("reason") or "")])
+    assert "地址" in detail, f"失败原因要带上地址口径：{sheet}"
+    # fail-closed：这个人的每一个格子都没动（+2 餐没写、新行没标当天 1）
+    zhang = _person_rows(cli, "张三", "111")
+    assert sorted(int(item["total"]) for item in zhang if item["total"]) == [10, 10], zhang
+    assert not [item for item in zhang if item["mark"]], zhang
+    assert result["failed"] == 1, result["sheets"]
+
+
+def test_同地址组内新增行排在既有行之后():
+    """D01 补充：同一客户在同一**地址组**里既有两行、本批又新增一行。
+
+    排序键是「地址名次 + 组内位置」（既有 0 < 新增 1），所以组内顺序是
+    「两条既有行（保持原顺序）+ 新行」。组内序号也按这个口径记，第 3 槽位就是
+    组内第 3 行 —— 用「已出餐」公式钉住身份，谁都不许挪位。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张三", "111",
+                          [6, 1, 0])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张三", 1: "B1", 2: "111", 4: "1", 5: "中餐", 6: "经济",
+         7: "10", 8: "=SUM(D3:E3)", 9: "=H3-I3"},
+        {0: "张三", 1: "B1", 2: "111", 4: "1", 5: "中餐", 6: "经济",
+         7: "20", 8: "=SUM(D4:E4)", 9: "=H4-I4"},
+        {0: "李四", 1: "A1", 2: "222", 4: "1", 5: "中餐", 6: "经济",
+         7: "3", 8: "=SUM(D5:E5)", 9: "=H5-I5"},
+    ]))
+    orders = [*_d01_orders(6, 1)[:2],
+              CloudOrder("东湖中餐", "张三", "B1", "111", "中餐", "经济", 4,
+                         row=9, rows=(9,))]
+    plan = _plan(cli, orders, ledger=ledger, address_order={"东湖中餐": []})[0]
+    assert [(c.address_in_sheet, c.group_index, c.group_total)
+            for c in plan.changes] == [("B1", 1, 3), ("B1", 2, 3), ("B1", 3, 3)]
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    zhang = _person_rows(cli, "张三", "111")
+    assert sorted(item["total"] for item in zhang) == ["10", "20", "4"], zhang
+    assert [item["served"] for item in zhang] == ["=SUM(D3:E3)", "=SUM(D4:E4)",
+                                                 "=SUM(D6:E6)"], zhang
+    assert [item["mark"] for item in zhang] == ["1", "1", "1"], zhang
+
+
+def test_回读地址与变更不符时校验失败():
+    """D01：写入后回读的地址列与变更不符 → ``verify_failed``，且不更新账本。
+
+    定位阶段读到的地址是对的，此后地址列被改（并发改动 / 写入没落到地址列）：
+    姓名与餐次都可能照样相符，**只有地址**是"这一行还是原来那一行"的凭据。
+    旧实现的回读校验不含地址列，这种错配会被判成成功。
+    """
+    class AddressClobberCli(FakeCli):
+        """排序之后的那一次写入（带总餐次的那批）顺手把地址列改掉。"""
+
+        def write_cells(self, file_id, worksheet_id, cells):
+            super().write_cells(file_id, worksheet_id, cells)
+            if 8 in {int(cell["col"]) for cell in cells}:     # 第 8 列 = 总餐次
+                for (row, col), value in list(self.grid.items()):
+                    if col == 1 and str(value).strip() == "A1":
+                        self.grid[(row, col)] = "C9"
+
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张三", "111", [6, 1])
+    cli = AddressClobberCli(make_grid(BASE_HEADER, [
+        {0: "张三", 1: "B1", 2: "111", 4: "", 5: "中餐", 6: "经济",
+         7: "10", 8: "=SUM(D3:E3)", 9: "=H3-I3"},
+        {0: "张三", 1: "B1", 2: "111", 4: "", 5: "中餐", 6: "经济",
+         7: "10", 8: "=SUM(D4:E4)", 9: "=H4-I4"},
+    ]))
+    plan = _plan(cli, _d01_orders(8, 1), ledger=ledger,
+                 address_order={"东湖中餐": []})[0]
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+
+    sheet = result["sheets"][0]
+    assert sheet["status"] in {"verify_failed", "failed"}, sheet
+    assert sheet["uncertain"] is True, sheet
+    problems = sheet.get("problems") or []
+    assert any("地址" in str(item) for item in problems), sheet
+    # 校验没过就不许记进账本（否则下次会把没写对的那批当成已同步）
+    assert SyncLedger(ledger.path).synced_slots("2026-09-11", "F1", "张三", "111") == [6, 1]
 
 
 def test_missing_meal_columns_are_completed():
@@ -1595,3 +1914,866 @@ def test_sync_is_idempotent_for_text_phone_values():
     assert result["failed"] == 0
     assert not cli.inserts, "不得插行"
     assert cli.grid[(2, 7)] == "4", "总餐次不能被重复累加"
+
+
+# ----------------------------------------------------------------------
+# 槽位身份与同步基准：补单重跑 / 临时缺行 / 先减后恢复
+# （缺陷排查记录 D02 / D03 / D04 的回归锁）
+# ----------------------------------------------------------------------
+
+def _w_order(meals: int, *, order_no: str, row: int) -> CloudOrder:
+    """本地排单表里「张」的一行（``order_no`` = 本地「订单」列的 W 编号）。
+
+    订单处理按 W 编号从大到小写行（``app/automation.py``），所以补单会让新单
+    排在旧单前面 —— 槽位配对必须靠订单身份，不能靠行号。
+    """
+    return CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", meals,
+                      row=row, order_no=order_no, rows=(row,),
+                      weekday_marks=("周五",))
+
+
+def _cli_with_unrelated() -> FakeCli:
+    """云端只有一行无关的人：被观测的人从「新建行」开始。"""
+    return FakeCli(make_grid(BASE_HEADER, [
+        {0: "李四", 1: "小", 2: "222", 4: "1", 5: "中餐", 6: "经济", 7: "1",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+
+
+def _cloud_rows(cli: FakeCli, name: str = "张") -> list[tuple[int, int, str]]:
+    """内存云表里某人的每一行：(1-based 行号, 总餐次, 当天标记)。"""
+    rows = []
+    for (row, col), value in list(cli.grid.items()):
+        if col == 0 and str(value).strip() == name:
+            rows.append((row + 1,
+                         int(str(cli.grid.get((row, 7), "") or "") or 0),
+                         str(cli.grid.get((row, 4), "") or "").strip()))
+    return sorted(rows)
+
+
+def _cloud_total(cli: FakeCli, name: str = "张") -> int:
+    return sum(total for _row, total, _mark in _cloud_rows(cli, name))
+
+
+def _disk_slots(path, name: str = "张", phone: str = "111"):
+    return SyncLedger(path).synced_slots("2026-09-11", "F1", name, phone)
+
+
+def _disk_orders(path, name: str = "张", phone: str = "111"):
+    return SyncLedger(path).synced_orders("2026-09-11", "F1", name, phone)
+
+
+def _disk_positions(path, name: str = "张", phone: str = "111"):
+    return SyncLedger(path).synced_positions("2026-09-11", "F1", name, phone)
+
+
+def test_补单重跑按订单身份配对槽位():
+    """D02：补单后本地行序变成 [W11, W5]，旧订单 W5 不能当成新槽位再加 6 餐。
+
+    第 1 次只有 W5=6（云端 6、账本 [6]）；第 2 次补 W11=1 只应再加 1 餐
+    （合计 7，不是 12）；第 3 次同输入应当无事可做（noop、一个格子都不写）。
+    """
+    ledger_path = tmp_path_dir() / "d02-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    first = _plan(cli, [_w_order(6, order_no="W5", row=3)],
+                  ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 6, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6]
+    assert _disk_orders(ledger_path) == ["W5"], "账本要记下槽位的订单身份"
+
+    ledger = SyncLedger(ledger_path)
+    second = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                         _w_order(6, order_no="W5", row=4)],
+                   ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, second, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 7, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 1], _disk_slots(ledger_path)
+    assert _disk_orders(ledger_path) == ["W5", "W11"]
+
+    ledger = SyncLedger(ledger_path)
+    third = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                        _w_order(6, order_no="W5", row=4)],
+                  ledger=ledger, marker=False, sort=False)
+    writes_before = len(cli.writes)
+    result = apply_plan(cli, third, ledger=ledger, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "noop", result["sheets"]
+    assert len(cli.writes) == writes_before, "重跑不应再写任何格子"
+    assert _cloud_total(cli) == 7, _cloud_rows(cli)
+
+
+def test_补单后槽位身份对齐():
+    """D02 计划层：账本 orders=[W5] + 本地 [W11, W5] → 第 1 槽还是 W5。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111",
+                          [6], orders=["W5"])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                       _w_order(6, order_no="W5", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    by_slot = {change.slot: change for change in plan.changes}
+    assert sorted(by_slot) == [1, 2], plan.changes
+    first, second = by_slot[1], by_slot[2]
+    assert (first.order_no, first.ledger_prev, first.total_after,
+            first.delta) == ("W5", 6, 6, 0)
+    assert (second.order_no, second.ledger_prev,
+            second.delta) == ("W11", None, 1)
+
+
+def test_旧账本无orders时退回位置配对():
+    """D02 兼容：账本没有订单号（升级后第一批）→ 行数对得上时按位置配对并补记 orders。
+
+    行数与旧槽位数一致时位置配对是**唯一**的配对方式（没有挑行号的余地），
+    这时沿用位置配对，但要把身份补进账本供下一批核对。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(8, order_no="W5", row=3)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert any("无法按订单身份核对" in warn for warn in plan.warnings), plan.warnings
+
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    slots = _disk_slots(ledger.path)
+    orders = _disk_orders(ledger.path)
+    assert orders is not None, "本批必须把订单号记进账本，供下一批核对"
+    assert len(orders) == len(slots) == 1, (orders, slots)
+    assert orders == ["W5"], orders
+
+
+def test_旧账本noop批次也补记订单身份():
+    """D02 升级窗口：账本没有 orders 时，没有变更的那一批也要补记身份。
+
+    账本没记订单号（旧版本写的）时槽位只能按行号配对；如果只有"真的写了云端"
+    的批次才记账本，那些没有变更的批次就永远补不上身份 —— 升级窗口会一直开着：
+    升级后先跑一次 noop、再补单重排，旧订单仍会被当成新槽位再加一遍（云端 12 餐）。
+    """
+    ledger_path = tmp_path_dir() / "upgrade-state.json"
+    ledger = SyncLedger(ledger_path)
+    ledger.record("2026-09-11", "F1", {"张\u0000111": {"slots": [6], "total": 6}})
+    ledger.save()
+    assert _disk_orders(ledger_path) is None, "前置：旧账本形态没有订单号"
+
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    # 升级后第一批：本地与云端一致，本来是个 noop
+    ledger = SyncLedger(ledger_path)
+    first = _plan(cli, [_w_order(6, order_no="W5", row=3)],
+                  ledger=ledger, marker=False, sort=False)
+    writes = len(cli.writes)
+    result = apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "noop", result["sheets"]
+    assert len(cli.writes) == writes, "没有变更就不该写云端"
+    assert _disk_orders(ledger_path) == ["W5"], "noop 批次也要把订单身份补进账本"
+    assert _disk_slots(ledger_path) == [6]
+
+    # 补单后本地变成 [W11=1, W5=6]：现在必须能按身份配上，只加新付的 1 餐
+    ledger = SyncLedger(ledger_path)
+    second = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                         _w_order(6, order_no="W5", row=4)],
+                   ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, second, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 7, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 1]
+    assert _disk_orders(ledger_path) == ["W5", "W11"]
+
+
+def test_账本订单号全空时不再静默退回位置配对():
+    """账本 orders 全是空串（当时本地「订单」列是空的）＝ 没有身份，必须提示。
+
+    只判断"有没有 orders 这个字段"会把 ``['']`` 当成"有订单号"而一声不吭地
+    退回按行号配对（复核反例 2）：行数一致时要提示并补记身份，行数变了要不猜。
+    """
+    # (a) 行数与旧槽位数一致：位置配对是唯一配对方式 → 提示 + 把身份补进账本
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6],
+                          orders=[""])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(8, order_no="W5", row=3)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert any("无法按订单身份核对" in warn for warn in plan.warnings), plan.warnings
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 8, _cloud_rows(cli)
+    assert _disk_orders(ledger.path) == ["W5"], "本批要把身份补进账本"
+
+    # (b) 本地行数比旧槽位多：位置配对是在猜 → 失败关闭，云端保持 6 餐
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6],
+                          orders=[""])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                       _w_order(6, order_no="W5", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+    assert plan.changes == [], plan.changes
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 6, _cloud_rows(cli)
+    assert _disk_slots(ledger.path) == [6]
+
+
+def test_旧账本行数变多但旧行对得上时照常写入():
+    """失败关闭只针对"旧行被顶掉"：新行排在末尾、旧行逐一对得上时必须照常写入。
+
+    行数变多本身是正常补单（D01 的用例就是这种）—— 一刀切拦掉会让新订单永远
+    同步不出去，所以拦的判据是"负增量被丢掉 + 末尾多一整行"这个组合。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(6, order_no="W5", row=3),
+                       _w_order(2, order_no="W11", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert not any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 8, _cloud_rows(cli)
+    assert _disk_slots(ledger.path) == [6, 2]
+    assert _disk_orders(ledger.path) == ["W5", "W11"]
+
+
+def test_旧账本行数变多又没有订单身份时不写云端():
+    """D02 升级窗口 + 直接补单：配对不成立时失败关闭。
+
+    账本只有 1 个已同步槽位、又没有订单号，本地却有 2 行 —— 按行号硬套会让
+    新单占住旧槽位、旧订单落到"没有锚点"的位置被全额再加一遍（复核反例 1：
+    云端 12 餐、报告成功）。这里宁可一个格子都不写：不猜，也不重复入账。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                       _w_order(6, order_no="W5", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert plan.changes == [], plan.changes
+    assert any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+
+    writes = len(cli.writes)
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 6, _cloud_rows(cli)
+    assert len(cli.writes) == writes, "失败关闭：一个格子都不写"
+    assert _disk_slots(ledger.path) == [6], "账本锚点不动"
+    assert _disk_orders(ledger.path) is None
+
+
+def test_账本有身份但本地订单列为空且行数变多时不写云端():
+    """D02（复核反例 H7）：账本记着身份，本地「订单」列却空着 + 行数变多。
+
+    第 1 批 [W5=6] → 云端 6 餐、账本 [6]/['W5']；第 2 批本地 [''=1, ''=6]
+    （订单列空、行序变化）。没有订单号的行没有身份可核对，按行号硬套就会把
+    旧订单 W5 当成新槽位再全额加 6 餐（实测云端 12 餐、状态 ok）。与旧账本
+    情形一样失败关闭：不写云端、不动账本锚点，亮警告请用户补齐订单号。
+    """
+    ledger_path = tmp_path_dir() / "d02-anon-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+    first = _plan(cli, [_w_order(6, order_no="W5", row=3)],
+                  ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 6, _cloud_rows(cli)
+    assert _disk_orders(ledger_path) == ["W5"]
+
+    ledger = SyncLedger(ledger_path)
+    plan = _plan(cli, [_w_order(1, order_no="", row=3),
+                       _w_order(6, order_no="", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert plan.changes == [], plan.changes
+    assert any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+
+    writes = len(cli.writes)
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 6, "失败关闭：不许把旧订单 W5 再全额加一遍"
+    assert len(cli.writes) == writes, "失败关闭：一个格子都不写"
+    assert _disk_slots(ledger_path) == [6], "账本锚点不动"
+    assert _disk_orders(ledger_path) == ["W5"], "已知身份不许被空串覆写"
+
+
+def test_账本有身份但匿名行落在有身份槽位加餐时不写云端():
+    """D02 同形的另一种排法：没有订单号的行被套进**账本记着身份**的槽位。
+
+    账本 slots=[6, 1]/orders=['W5', 'W11']，本地两行订单列全空、餐次对调
+    [''=1, ''=6]：按行号套 → 第 2 槽从锚点 1 加 5 餐（云端 12 餐）。
+    这一行完全可能是另一笔订单，不核对就加餐就是重复入账 → 失败关闭。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111",
+                          [6, 1], orders=["W5", "W11"])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "1",
+         8: "=SUM(D4)", 9: "=H4-I4"},
+    ]))
+    plan = _plan(cli, [_w_order(1, order_no="", row=3),
+                       _w_order(6, order_no="", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert plan.changes == [], plan.changes
+    assert any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+
+    writes = len(cli.writes)
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 7, _cloud_rows(cli)
+    assert len(cli.writes) == writes, "失败关闭：一个格子都不写"
+
+
+def test_账本有身份且旧行对得上时末尾匿名新行照常写入():
+    """失败关闭只针对"配对不成立"：身份对得上的旧行 + 末尾一行没有订单号的新行。
+
+    账本 slots=[6]/orders=['W5']，本地 [W5=6, ''=2]：W5 按身份对上（锚点 6，
+    无增量），多出来的 2 餐行落在账本之外的末尾槽位（没有旧锚点可顶掉）——
+    这是正常补单，必须照常写入，不能一刀切拦掉。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111",
+                          [6], orders=["W5"])
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(6, order_no="W5", row=3),
+                       _w_order(2, order_no="", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert not any("不写这个人的云端行" in warn for warn in plan.warnings), plan.warnings
+
+    apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 8, _cloud_rows(cli)
+
+
+def test_账本orders长度非法时失败关闭():
+    """orders 必须是与 slots 等长的字符串列表；不合法就拒绝读取（不能当空账本）。"""
+    path = tmp_path_dir() / "broken-orders.json"
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"slots": [6, 6], "orders": ["W1"], '
+        '"local": 12, "at": "x"}}}}}}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"slots": [6], "orders": [1], '
+        '"local": 6, "at": "x"}}}}}}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+
+def test_账本本地行数减少时保留末尾旧槽位():
+    """D03 单测：本次只有第 1 槽有变更时，第 2 槽的旧锚点不能被截掉。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6, 6])
+    change = Change("existing", "张", "111", 4, 1, 5, 6, 7, True,
+                    local_meals=7, ledger_prev=6, slot=1)
+    entries = wc._ledger_entries([change], only_keys={"张\u0000111"},
+                                 ledger=ledger, date_key="2026-09-11", file_id="F1")
+    assert entries["张\u0000111"]["slots"] == [7, 6], entries
+
+
+def test_本地行数减少再恢复不重复加餐():
+    """D03 端到端：已同步 [6, 6] → 暂时只剩 [W1=7] → 恢复 [W1=7, W2=6]，仍是 13 餐。"""
+    ledger_path = tmp_path_dir() / "d03-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    zero = _plan(cli, [_w_order(6, order_no="W1", row=3),
+                       _w_order(6, order_no="W2", row=4)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 12, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 6]
+
+    ledger = SyncLedger(ledger_path)
+    only_first = _plan(cli, [_w_order(7, order_no="W1", row=3)],
+                       ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, only_first, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 13, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [7, 6], "末尾旧槽位不能被截掉"
+
+    ledger = SyncLedger(ledger_path)
+    restored = _plan(cli, [_w_order(7, order_no="W1", row=3),
+                           _w_order(6, order_no="W2", row=4)],
+                     ledger=ledger, marker=False, sort=False)
+    writes_before = len(cli.writes)
+    result = apply_plan(cli, restored, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 13, _cloud_rows(cli)
+    assert result["sheets"][0]["status"] == "noop", result["sheets"]
+    assert len(cli.writes) == writes_before, "恢复已入账的行不应再写云端"
+    assert _disk_slots(ledger_path) == [7, 6]
+
+
+def test_本地行数减少时journal意图与磁盘账本一致():
+    """D03 顺带：journal 记的 ledger_entries 与磁盘账本逐槽位相等。"""
+    ledger_path = tmp_path_dir() / "d03-journal-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+    journal = SyncJournal(journal_path_for(ledger.path))
+
+    zero = _plan(cli, [_w_order(6, order_no="W1", row=3),
+                       _w_order(6, order_no="W2", row=4)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False, journal=journal)
+
+    ledger = SyncLedger(ledger_path)
+    only_first = _plan(cli, [_w_order(7, order_no="W1", row=3)],
+                       ledger=ledger, marker=False, sort=False)
+    result = apply_plan(cli, only_first, ledger=ledger, marker_enabled=False,
+                        journal=journal)
+
+    saved = SyncJournal(journal_path_for(ledger.path))
+    record = saved.get_operation(result["operation_id"])["sheets"]["东湖中餐"]
+    assert record["ledger_entries"]["张\u0000111"]["slots"] == [7, 6]
+    assert record["ledger_entries"]["张\u0000111"]["slots"] == _disk_slots(ledger.path)
+
+
+def test_按槽位身份对齐缺行的槽位留空不压缩():
+    """D03 单测：账本第 2 槽有身份、本地没有这一行 → 返回里第 2 槽是 ``None``。
+
+    旧实现把后面的行整体前移补空位：第 2 槽拿到第 3 槽的订单，却用第 2 槽的
+    锚点做减法 —— 云端永久多入账（复核场景 I）。``None`` 是"本地暂时没有这一
+    行"，调用方跳过它；不是"这个槽位可以给别人用"。
+    """
+    group = [_w_order(2, order_no="W1", row=3), _w_order(6, order_no="W3", row=5)]
+    slots = wc._slots_by_identity(group, ["W1", "W2", "W3"])
+    assert [item.order_no if item else None for item in slots] == ["W1", None, "W3"], slots
+
+    # 账本没有身份（旧账本 / 订单列全空）时原样返回：没有洞，调用方沿用位置配对
+    assert wc._slots_by_identity(group, None) == group
+    assert wc._slots_by_identity(group, ["", ""]) == group
+
+    # 带身份但账本里没有的 = 本批新单：放到账本之外的末尾槽位，不许占别人的槽
+    appended = wc._slots_by_identity(
+        [_w_order(2, order_no="W1", row=3), _w_order(1, order_no="W9", row=4)],
+        ["W1", "W2"])
+    assert [item.order_no if item else None for item in appended] == ["W1", None, "W9"], appended
+
+
+def test_本地行数减少丢中间行时按槽位下标对齐():
+    """D03 端到端（复核场景 I）：[1,1,6] → 本地暂时 [W1=2, W3=6] → 云端只 +1。
+
+    丢的是中间一行时，保留的后一行必须留在自己的槽位上：不能前移去顶空位、
+    拿别人的锚点做减法（旧行为：云端 8 → 14 餐，W2 的行被写进 W3 的 6 餐）。
+    """
+    ledger_path = tmp_path_dir() / "d03-middle-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    zero = _plan(cli, [_w_order(1, order_no="W1", row=3),
+                       _w_order(1, order_no="W2", row=4),
+                       _w_order(6, order_no="W3", row=5)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 1, "1"), (5, 1, "1"), (6, 6, "1")], _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [1, 1, 6]
+    assert _disk_orders(ledger_path) == ["W1", "W2", "W3"]
+
+    ledger = SyncLedger(ledger_path)
+    missing_middle = _plan(cli, [_w_order(2, order_no="W1", row=3),
+                                 _w_order(6, order_no="W3", row=5)],
+                           ledger=ledger, marker=False, sort=False)
+    assert any("本地暂时没有订单「W2」" in warn
+               for warn in missing_middle[0].warnings), missing_middle[0].warnings
+    apply_plan(cli, missing_middle, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 2, "1"), (5, 1, "1"), (6, 6, "1")], _cloud_rows(cli)
+    assert _cloud_total(cli) == 9, "只该加第一行真涨的 1 餐"
+    assert _disk_slots(ledger_path) == [2, 1, 6], "缺行槽位的锚点原样保留"
+    assert _disk_orders(ledger_path) == ["W1", "W2", "W3"], "槽位身份不许被顶掉"
+
+    ledger = SyncLedger(ledger_path)
+    restored = _plan(cli, [_w_order(2, order_no="W1", row=3),
+                           _w_order(1, order_no="W2", row=4),
+                           _w_order(6, order_no="W3", row=5)],
+                     ledger=ledger, marker=False, sort=False)
+    writes_before = len(cli.writes)
+    result = apply_plan(cli, restored, ledger=ledger, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "noop", result["sheets"]
+    assert len(cli.writes) == writes_before, "恢复已入账的行不应再写云端"
+    assert _cloud_total(cli) == 9, _cloud_rows(cli)
+
+
+def test_本地行数减少丢第一行时不动云端那一行():
+    """D03（复核场景 B2）：已同步 [W1=1, W2=6]，本地暂时只剩 [W2=6] → 仍是 7 餐。
+
+    旧行为把 W2=6 套到第 1 槽（锚点 1）上：云端 7 → 12 餐，还写错物理行。
+    """
+    ledger_path = tmp_path_dir() / "d03-first-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+    zero = _plan(cli, [_w_order(1, order_no="W1", row=3),
+                       _w_order(6, order_no="W2", row=4)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 1, "1"), (5, 6, "1")], _cloud_rows(cli)
+
+    ledger = SyncLedger(ledger_path)
+    only_second = _plan(cli, [_w_order(6, order_no="W2", row=4)],
+                        ledger=ledger, marker=False, sort=False)
+    writes = len(cli.writes)
+    result = apply_plan(cli, only_second, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 1, "1"), (5, 6, "1")], _cloud_rows(cli)
+    assert _cloud_total(cli) == 7, "保留的行要留在自己的槽位上（不能降级成第 1 槽）"
+    assert _disk_slots(ledger_path) == [1, 6], "缺的第一槽锚点原样保留"
+    assert _disk_orders(ledger_path) == ["W1", "W2"]
+    assert len(cli.writes) == writes, "没有增量就不该写云端"
+    assert result["failed"] == 0
+
+
+def test_本地行数减少丢中间行时更新写在正确的物理行上():
+    """D03（复核场景 C2）：[6,6,6] → 本地只剩中间 [W2=7] → 第 2 物理行 6→7。
+
+    旧行为把 7 写进第 1 行（W1 的行、值 6），W3 的行被前移顶位：云端行上的值
+    与订单对不上（复核："写错物理行"）。
+    """
+    ledger_path = tmp_path_dir() / "d03-row-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+    zero = _plan(cli, [_w_order(6, order_no="W1", row=3),
+                       _w_order(6, order_no="W2", row=4),
+                       _w_order(6, order_no="W3", row=5)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False)
+    assert _cloud_total(cli) == 18, _cloud_rows(cli)
+
+    ledger = SyncLedger(ledger_path)
+    middle = _plan(cli, [_w_order(7, order_no="W2", row=4)],
+                   ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, middle, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 6, "1"), (5, 7, "1"), (6, 6, "1")], _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 7, 6]
+    assert _disk_orders(ledger_path) == ["W1", "W2", "W3"]
+
+
+def test_本地订单列为空的行仍按剩下的空位配对():
+    """本地「订单」列是空的行没有身份可核对：沿用按行号填空位的旧行为，不许丢。
+
+    账本第 2 槽的身份是 W2，本地第 2 行没有订单号：这一行仍排在剩下的第 2 槽
+    （锚点 1）上 —— 不因为"身份对不上"就把它当新单再全额加一遍。
+    """
+    ledger_path = tmp_path_dir() / "d03-anon-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+    zero = _plan(cli, [_w_order(6, order_no="W1", row=3),
+                       _w_order(1, order_no="W2", row=4)],
+                 ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, zero, ledger=ledger, marker_enabled=False)
+    assert _disk_slots(ledger_path) == [6, 1]
+
+    ledger = SyncLedger(ledger_path)
+    anonymous = wc.CloudOrder("东湖中餐", "张", "小", "111", "中餐", "经济", 1,
+                              row=4, order_no="", rows=(4,), weekday_marks=("周五",))
+    plan = _plan(cli, [_w_order(6, order_no="W1", row=3), anonymous],
+                 ledger=ledger, marker=False, sort=False)
+    assert any("无法按订单身份核对" in warn for warn in plan[0].warnings), plan[0].warnings
+    writes = len(cli.writes)
+    result = apply_plan(cli, plan, ledger=ledger, marker_enabled=False)
+    assert result["failed"] == 0
+    assert _cloud_total(cli) == 7, _cloud_rows(cli)
+    assert len(cli.writes) == writes, "第 2 行锚点 1 = 本地 1 餐，不该再有增量"
+
+
+def test_负增量被截时账本基准不倒退():
+    """D04 单测：云端不扣减时，账本锚点 = 已同步量（6），不是本地现值（4）。"""
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6])
+    truncated = Change("existing", "张", "111", 4, 0, 5, 6, 6, True,
+                       local_meals=4, ledger_prev=6, slot=1)
+    entries = wc._ledger_entries([truncated], only_keys={"张\u0000111"},
+                                 ledger=ledger, date_key="2026-09-11", file_id="F1")
+    assert entries["张\u0000111"]["slots"] == [6], entries
+    assert entries["张\u0000111"]["local"] == 6
+
+    # 增量没被截时锚点 = 本地现值（8）：口径仍与「本批已同步量」一致
+    grown = Change("existing", "张", "111", 4, 2, 5, 6, 8, True,
+                   local_meals=8, ledger_prev=6, slot=1)
+    entries = wc._ledger_entries([grown], only_keys={"张\u0000111"},
+                                 ledger=ledger, date_key="2026-09-11", file_id="F1")
+    assert entries["张\u0000111"]["slots"] == [8], entries
+
+
+def test_本地先减后恢复不重复加餐():
+    """D04 端到端：[6, 1] → [4, 2] → [6, 2]，合计仍是 8 餐（不是 10 餐）。"""
+    ledger_path = tmp_path_dir() / "d04-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    def run(meals_first: int, meals_second: int):
+        nonlocal ledger
+        plan = _plan(cli, [_w_order(meals_first, order_no="W1", row=3),
+                           _w_order(meals_second, order_no="W2", row=4)],
+                     ledger=ledger, marker=False, sort=False)
+        result = apply_plan(cli, plan, ledger=ledger, marker_enabled=False)
+        ledger = SyncLedger(ledger_path)
+        return result
+
+    run(6, 1)
+    assert _cloud_rows(cli) == [(4, 6, "1"), (5, 1, "1")], _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 1]
+
+    first = run(4, 2)
+    assert _cloud_rows(cli) == [(4, 6, "1"), (5, 2, "1")], _cloud_rows(cli)
+    assert _cloud_total(cli) == 8, "云端不扣减：第一槽位仍是 6 餐"
+    assert _disk_slots(ledger_path) == [6, 2], "账本锚点不能随本地减少而倒退"
+
+    writes_before = len(cli.writes)
+    second = run(6, 2)
+    assert _cloud_total(cli) == 8, _cloud_rows(cli)
+    assert second["sheets"][0]["status"] == "noop", second["sheets"]
+    assert len(cli.writes) == writes_before, "恢复本地原值不应再写云端"
+
+    third = run(6, 2)
+    assert _cloud_total(cli) == 8, _cloud_rows(cli)
+    assert third["failed"] == 0 and first["failed"] == 0
+
+
+# ----------------------------------------------------------------------
+# 整体评审：槽位→云端行不能按位置配对（账本槽位序 ≠ 物理行序）
+# ----------------------------------------------------------------------
+
+def test_补单新行插到既有行上方后增量写回自己的行():
+    """整体评审：补单新行插到既有行上方后，槽位序与物理行序脱钩。
+
+    第 1 批只有 W5=6（云端 1 行）；第 2 批补 W11=1 —— 新行插到既有行上方，
+    物理行序变成 [W11, W5]，而账本槽位序仍是 [W5, W11]（身份序）；第 3 批
+    本地把 W11 由 1 加到 3。
+
+    只按位置 ``cloud_rows[slot-1]`` 配对时，第 2 槽会套到 W5 的物理行上：
+    W5 的行被写成 8、W11 的行仍是 1 —— 人级合计还是 9、执行照样报 ok，
+    但两个物理行上的值与订单对不上（账本 orders 与行内容不符）。
+    期望：+2 落在 W11 自己的那一行上（1→3），W5 的行保持 6。
+    """
+    ledger_path = tmp_path_dir() / "review-slot-order-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    first = _plan(cli, [_w_order(6, order_no="W5", row=3)],
+                  ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 6, "1")], _cloud_rows(cli)
+
+    ledger = SyncLedger(ledger_path)
+    second = _plan(cli, [_w_order(1, order_no="W11", row=3),
+                         _w_order(6, order_no="W5", row=4)],
+                   ledger=ledger, marker=False, sort=False)
+    apply_plan(cli, second, ledger=ledger, marker_enabled=False)
+    assert _cloud_rows(cli) == [(4, 1, "1"), (5, 6, "1")], _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 1]
+    assert _disk_orders(ledger_path) == ["W5", "W11"], "账本槽位身份顺序不变"
+
+    ledger = SyncLedger(ledger_path)
+    third = _plan(cli, [_w_order(3, order_no="W11", row=3),
+                        _w_order(6, order_no="W5", row=4)],
+                  ledger=ledger, marker=False, sort=False)
+    result = apply_plan(cli, third, ledger=ledger, marker_enabled=False)
+
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    assert _cloud_rows(cli) == [(4, 3, "1"), (5, 6, "1")], (
+        "第 2 槽的 +2 必须落在 W11 自己的那一行（第 4 行）上，"
+        f"不能写进 W5 的行：{_cloud_rows(cli)}")
+    assert _cloud_total(cli) == 9, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 3]
+    assert _disk_orders(ledger_path) == ["W5", "W11"]
+
+
+def test_跨地址组重排后增量写回自己的行():
+    """整体评审：D01 地址排序把同一人跨地址组重排后，槽位序也会与物理行序脱钩。
+
+    第 1 批在 B1 建了 W2=6；第 2 批补 A1 的 W7=2 —— 排序后 A1 排到 B1 之前
+    （物理行序 [A1=W7, B1=W2]，账本槽位序仍是历史序 [W2, W7]）；第 3 批本地
+    把 B1 那一单由 6 加到 8。
+
+    只按位置配对时 +2 会加到 A1 的 2 餐行上（变成 4），B1 的行仍是 6。
+    期望：+2 落在 B1 自己的行上，A1 的 2 餐不动。
+    """
+    ledger_path = tmp_path_dir() / "review-cross-address-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    def order(meals: int, order_no: str, address: str, row: int) -> CloudOrder:
+        return CloudOrder("东湖中餐", "张", address, "111", "中餐", "经济", meals,
+                          row=row, order_no=order_no, rows=(row,),
+                          weekday_marks=("周五",))
+
+    first = _plan(cli, [order(6, "W2", "B1", 3)], ledger=ledger, marker=False)
+    apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+
+    ledger = SyncLedger(ledger_path)
+    second = _plan(cli, [order(2, "W7", "A1", 3), order(6, "W2", "B1", 4)],
+                   ledger=ledger, marker=False)
+    apply_plan(cli, second, ledger=ledger, marker_enabled=False)
+    # 排序后 A1 排在 B1 之前：物理行序与账本槽位序（历史序）相反
+    placed = {item["address"]: item["total"] for item in _person_rows(cli, "张", "111")}
+    assert placed == {"A1": "2", "B1": "6"}, placed
+    assert _disk_slots(ledger_path) == [6, 2]
+    assert _disk_orders(ledger_path) == ["W2", "W7"]
+
+    ledger = SyncLedger(ledger_path)
+    third = _plan(cli, [order(2, "W7", "A1", 3), order(8, "W2", "B1", 4)],
+                  ledger=ledger, marker=False)
+    result = apply_plan(cli, third, ledger=ledger, marker_enabled=False)
+
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    rows = {item["address"]: item for item in _person_rows(cli, "张", "111")}
+    assert rows["B1"]["total"] == "8", \
+        f"B1 那一单的 +2 必须落在 B1 自己的行上：{rows}"
+    assert rows["A1"]["total"] == "2", f"A1 那一单不许被加餐：{rows}"
+    assert _cloud_total(cli) == 10, _cloud_rows(cli)
+
+
+def test_槽位物理位置按行号记账本():
+    """整体评审单测：账本 positions = 本批结束后每个槽位在云端排第几行。
+
+    槽位序是身份序（历史写入序），物理行序会被插入与排序改掉；账本按物理位置
+    记，下一批才能把槽位配到**自己那一行**上（不是数组位置）。
+    """
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1", "张", "111", [6, 1],
+                          orders=["W5", "W11"])
+    # 第 1 槽（W5）本批落在第 5 行、第 2 槽（W11）落在第 4 行（补单新行在上）
+    first = Change("existing", "张", "111", 5, 0, 5, 6, 6, True,
+                   local_meals=6, ledger_prev=6, slot=1, order_no="W5")
+    second = Change("existing", "张", "111", 4, 2, 5, 1, 3, True,
+                    local_meals=3, ledger_prev=1, slot=2, order_no="W11")
+    entries = wc._ledger_entries([first, second], only_keys={"张\u0000111"},
+                                 ledger=ledger, date_key="2026-09-11", file_id="F1")
+    assert entries["张\u0000111"]["positions"] == [2, 1], entries
+    assert entries["张\u0000111"]["slots"] == [6, 3], entries
+
+    # 没有变更的槽位（本地暂时缺行）用计划预测的行号：位置照样记全
+    entries = wc._ledger_entries([first], only_keys={"张\u0000111"}, ledger=ledger,
+                                 date_key="2026-09-11", file_id="F1",
+                                 slot_rows={("张", "111"): {1: 5, 2: 4}})
+    assert entries["张\u0000111"]["positions"] == [2, 1], entries
+
+
+def test_账本positions长度非法时失败关闭():
+    """positions 必须与 slots 等长；不合法就拒绝读取（不能当没有位置的账本用）。"""
+    path = tmp_path_dir() / "broken-positions.json"
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"slots": [6, 6], "positions": [1], '
+        '"local": 12, "at": "x"}}}}}}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"slots": [6], "positions": ["x"], '
+        '"local": 6, "at": "x"}}}}}}', encoding="utf-8")
+    with pytest.raises(LedgerCorruptError):
+        SyncLedger(path)
+
+    # 旧账本没有 positions：正常读，synced_positions 返回 None（回退按位置配对）
+    path.write_text(
+        '{"version": 1, "batches": {"2026-09-11": {"F1": {"synced_at": "x", '
+        '"people": {"张\\u0000111": {"slots": [6], "orders": ["W5"], '
+        '"local": 6, "at": "x"}}}}}}', encoding="utf-8")
+    ledger = SyncLedger(path)
+    assert ledger.synced_positions("2026-09-11", "F1", "张", "111") is None
+
+
+def test_旧账本noop批次补记槽位物理位置():
+    """升级窗口：账本没有 positions 时，没有变更的那一批也要把位置补进账本。
+
+    否则升级后先跑一次 noop、再补单，补单那一批仍要按数组位置配对 —— 本批
+    配对结果虽然写对了，但"下一批按位置配对"的窗口一直开在错误状态里。
+    """
+    ledger_path = tmp_path_dir() / "positions-upgrade-state.json"
+    ledger = SyncLedger(ledger_path)
+    ledger.record("2026-09-11", "F1",
+                  {"张\u0000111": {"slots": [6], "orders": ["W5"], "total": 6}})
+    ledger.save()
+    assert _disk_positions(ledger_path) is None, "前置：旧账本形态没有 positions"
+
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    ledger = SyncLedger(ledger_path)
+    plan = _plan(cli, [_w_order(6, order_no="W5", row=3)],
+                 ledger=ledger, marker=False, sort=False)
+    writes = len(cli.writes)
+    result = apply_plan(cli, plan, ledger=ledger, marker_enabled=False)
+    assert result["sheets"][0]["status"] == "noop", result["sheets"]
+    assert len(cli.writes) == writes, "没有变更就不该写云端"
+    assert _disk_positions(ledger_path) == [1], "noop 批次也要把物理位置补进账本"
+    assert _disk_slots(ledger_path) == [6]
+    assert _disk_orders(ledger_path) == ["W5"]
+
+
+def test_位置指向的行被删后按本地餐次重建而不是改写别人的行():
+    """槽位位置指向的云端行不存在了（被协作者删了）：重建那一行，不改别的行。
+
+    位置记的是"这个槽位在云端这个人的第几行"，行数变少时第 2 槽的位置就取不到。
+    这时宁可重建一行（并按本地餐次补账），也不能拿第 1 槽的行顶上 —— 那会把
+    W5 的那一行写成别人的餐次。
+    """
+    ledger_path = tmp_path_dir() / "positions-missing-row-state.json"
+    ledger = SyncLedger(ledger_path)
+    ledger.record("2026-09-11", "F1", {"张\u0000111": {
+        "slots": [6, 1], "orders": ["W5", "W11"], "positions": [1, 2], "total": 7}})
+    ledger.save()
+    cli = FakeCli(make_grid(BASE_HEADER, [
+        {0: "张", 1: "小", 2: "111", 4: "1", 5: "中餐", 6: "经济", 7: "6",
+         8: "=SUM(D3)", 9: "=H3-I3"},
+    ]))
+    plan = _plan(cli, [_w_order(6, order_no="W5", row=3),
+                       _w_order(1, order_no="W11", row=4)],
+                 ledger=ledger, marker=False, sort=False)[0]
+    assert any("云端没有这一行" in warn for warn in plan.warnings), plan.warnings
+
+    result = apply_plan(cli, [plan], ledger=ledger, marker_enabled=False)
+    assert result["failed"] == 0, result["sheets"]
+    assert _cloud_rows(cli) == [(3, 6, "1"), (4, 1, "1")], _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 1]
+    assert _disk_orders(ledger_path) == ["W5", "W11"]
+    # 新行插在第 4 行、张自己的旧行仍在第 3 行：W5 仍是他的第 1 行
+    assert _disk_positions(ledger_path) == [1, 2]
+
+
+def test_排序批次里新增行与错位旧槽位同时写入():
+    """整体评审：一批里既有新行、又要在"物理行序≠槽位序"的旧槽位上写增量。
+
+    第 1 批在 B1 建 W2=6；第 2 批补 A1 的 W7=2（排序后 A1 在前：物理行序
+    [W7, W2]，槽位序仍是 [W2, W7]）；第 3 批同时做两件事：A1 那单 2→4 餐、
+    再补一张 A0 的 W9=2 餐（排序后又插到最前）。
+
+    只按位置配对 + 排序后按地址组定位时，+2 会落到 B1 那一行（6→8），
+    A1 那一行仍是 2。期望：A1 自己 2→4、B1 仍是 6、A0 新行 2 餐。
+    """
+    ledger_path = tmp_path_dir() / "review-sorted-combo-state.json"
+    cli = _cli_with_unrelated()
+    ledger = SyncLedger(ledger_path)
+
+    def order(meals: int, order_no: str, address: str, row: int) -> CloudOrder:
+        return CloudOrder("东湖中餐", "张", address, "111", "中餐", "经济", meals,
+                          row=row, order_no=order_no, rows=(row,),
+                          weekday_marks=("周五",))
+
+    apply_plan(cli, _plan(cli, [order(6, "W2", "B1", 3)], ledger=ledger,
+                          marker=False), ledger=ledger, marker_enabled=False)
+    ledger = SyncLedger(ledger_path)
+    apply_plan(cli, _plan(cli, [order(2, "W7", "A1", 3), order(6, "W2", "B1", 4)],
+                          ledger=ledger, marker=False),
+               ledger=ledger, marker_enabled=False)
+    assert _disk_positions(ledger_path) == [2, 1], "槽位序 [W2, W7] vs 物理行序 [W7, W2]"
+
+    ledger = SyncLedger(ledger_path)
+    third = _plan(cli, [order(2, "W9", "A0", 3), order(4, "W7", "A1", 4),
+                        order(6, "W2", "B1", 5)],
+                  ledger=ledger, marker=False)
+    result = apply_plan(cli, third, ledger=ledger, marker_enabled=False)
+
+    assert result["sheets"][0]["status"] == "ok", result["sheets"]
+    rows = {item["address"]: item["total"] for item in _person_rows(cli, "张", "111")}
+    assert rows == {"A0": "2", "A1": "4", "B1": "6"}, rows
+    assert _cloud_total(cli) == 12, _cloud_rows(cli)
+    assert _disk_slots(ledger_path) == [6, 4, 2]
+    assert _disk_orders(ledger_path) == ["W2", "W7", "W9"]
