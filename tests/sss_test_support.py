@@ -8,15 +8,23 @@ from __future__ import annotations
 
 
 class _FakeClient:
-    """SssApiClient 替身：登录、门店/地址、余额、列表、下单。"""
+    """SssApiClient 替身：登录、门店/地址、余额、列表、下单。
+
+    ``order_reject_times`` > 0 时，接下来这么多次下单 POST 会返回平台内部错误
+    （``success=false`` + ``IndexOutOfBoundsException``，**不建单**）——用于验证
+    "平台驳回自动重试"（v3.6.7）。成功受理的订单会出现在列表里，供站内对账确认。
+    """
 
     def __init__(self, *, order_fail: bool = False, order_timeout: bool = False,
+                 order_reject_times: int = 0,
                  list_payload=None, login_payload=None):
         self.order_fail = order_fail
         self.order_timeout = order_timeout
+        self.order_reject_times = max(0, int(order_reject_times))
+        self.rejects = 0
         self.posts: list[dict] = []
-        self._list_payload = list_payload or {"success": True, "result": {
-            "records": [], "total": 0}}
+        self.list_records: list[dict] = []
+        self._list_payload = list_payload
         self._login_payload = login_payload or {"success": True}
 
     def fetch_captcha(self) -> bytes:
@@ -27,9 +35,12 @@ class _FakeClient:
 
     def get_json(self, path: str) -> dict:
         if "list" in path:
-            payload = self._list_payload
-            self._list_payload = {"success": True, "result": {"records": [], "total": 0}}
-            return payload
+            if self._list_payload is not None:
+                payload = self._list_payload
+                self._list_payload = None
+                return payload
+            return {"success": True, "result": {
+                "records": list(self.list_records), "total": len(self.list_records)}}
         if "store" in path:
             return {"success": True, "result": [{"name": "一口轻食", "id": 7}]}
         if "account" in path:
@@ -43,6 +54,20 @@ class _FakeClient:
             raise SssTransportError("读取超时")
         if self.order_fail:
             return {"success": False, "message": "商品已下架"}
+        if self.rejects < self.order_reject_times:
+            self.rejects += 1
+            return {"success": False,
+                    "message": "操作失败，java.lang.IndexOutOfBoundsException: "
+                               "Index: 0, Size: 0"}
+        address = payload.get("receiveAddress") or {}
+        self.list_records.append({
+            "recipientName": payload.get("receiveName", ""),
+            "recipientPhone": [payload.get("receivePhone", "")],
+            "recipientAddress": f"{address.get('addressDetail', '')}"
+                                f"{address.get('doorNum', '')}",
+            "expectedDeliveryTime": payload.get("expectedDeliveryTime", ""),
+            "status": 2,
+        })
         return {"success": True}
 
     def fork(self):

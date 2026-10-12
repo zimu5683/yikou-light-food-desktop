@@ -469,6 +469,236 @@ def test_rate_reject_signature_only_matches_the_over_rate_error():
     assert sss._is_rate_reject_response(None) is False
 
 
+# ----------------------------------------------------------------------
+# 接口模式：提交前静默 + 平台驳回自动重试（v3.6.7，与浏览器模式对齐）
+# ----------------------------------------------------------------------
+
+BUSINESS_REJECT = {"success": False, "message": "商品已下架"}
+
+
+def _only_task():
+    return [{"identifier": "t0", "payload": {"i": 0}}]
+
+
+def test_retryable_reject_only_matches_platform_internal_errors():
+    """只有"明确拒绝且属平台内部错误"才可重试；业务驳回/未知响应都不行。"""
+    assert sss._is_retryable_reject(
+        {"success": False, "message": INTERNAL_ERROR}) is True
+    assert sss._is_retryable_reject(
+        {"success": False,
+         "message": "java.lang.RuntimeException: 系统异常"}) is True
+    assert sss._is_retryable_reject(BUSINESS_REJECT) is False
+    assert sss._is_retryable_reject({"success": False, "message": "地址无效"}) is False
+    assert sss._is_retryable_reject(None) is False
+
+
+def test_api_submit_retries_after_platform_rejection():
+    """平台内部错误驳回 → 自动重试同一单；第 3 次尝试成功。"""
+    responses = [
+        {"success": False, "message": INTERNAL_ERROR},
+        {"success": False, "message": INTERNAL_ERROR},
+        {"success": True},
+    ]
+    posts = []
+    logs = []
+
+    def submit(payload):
+        posts.append(payload)
+        return responses[len(posts) - 1]
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), logs.append, max_workers=1,
+        submit_attempts=3)
+    assert result.succeeded == {"t0"}
+    assert len(posts) == 3
+    assert result.failures == [] and result.uncertain == []
+    assert any("平台驳回（第 1/3 次）" in message for message in logs)
+    assert any("平台驳回（第 2/3 次）" in message for message in logs)
+    assert any("第 3 次提交后成功（平台驳回重试生效）" in message for message in logs)
+
+
+def test_api_submit_retry_exhausted_is_a_failure():
+    """连续驳回直到用尽尝试次数 → 仍按显式失败记录，失败明细只打印一次。"""
+    posts = []
+    logs = []
+
+    def submit(payload):
+        posts.append(payload)
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), logs.append, max_workers=1,
+        submit_attempts=3)
+    assert len(posts) == 3
+    assert [identifier for identifier, _detail in result.failures] == ["t0"]
+    assert sum(1 for message in logs if message.startswith("提交失败：")) == 1
+
+
+def test_api_submit_does_not_retry_business_rejections():
+    """业务类驳回是确定性的：不重试，直接按失败交给人工。"""
+    posts = []
+    logs = []
+
+    def submit(payload):
+        posts.append(payload)
+        return BUSINESS_REJECT
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), logs.append, max_workers=1,
+        submit_attempts=3)
+    assert len(posts) == 1, "业务驳回不该重试（白打请求还多消耗平台序号）"
+    assert [identifier for identifier, _detail in result.failures] == ["t0"]
+
+
+def test_api_submit_never_retries_an_uncertain_post():
+    """回归锁：超时/无 success 字段 = 结果未知，**绝不重发**（重复下单红线）。"""
+    for uncertain_response in (None, {"code": 0, "msg": "ok"}):
+        posts = []
+
+        def submit(payload, _response=uncertain_response):
+            posts.append(payload)
+            if _response is None:
+                raise sss._SubmissionUncertain("读取超时")
+            return _response
+
+        result = sss._submit_tasks_concurrent(
+            _only_task(), submit, _NeverStopped(), None, max_workers=1,
+            submit_attempts=3)
+        assert len(posts) == 1, "结果未知的 POST 一次都不能重发"
+        assert [identifier for identifier, _detail in result.uncertain] == ["t0"]
+        assert result.succeeded == set()
+
+
+def test_api_submit_never_retries_balance_depletion():
+    """余额不足是 LookupError 家族：不能被"明确拒绝 → 重试"分支吃掉。"""
+    posts = []
+
+    def submit(payload):
+        posts.append(payload)
+        return {"success": False, "message": "余额不足，请充值"}
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), None, max_workers=1,
+        submit_attempts=3)
+    assert len(posts) == 1
+    assert "余额不足" in result.balance_error
+    assert result.succeeded == set()
+
+
+def test_api_retries_obey_the_submit_interval():
+    """重试同样吃提交节流：相邻 POST 起点（含重试）至少间隔最小间隔。"""
+    import time
+
+    starts = []
+
+    def submit(payload):
+        starts.append(time.perf_counter())
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), None, max_workers=1,
+        min_interval_s=0.15, submit_attempts=3)
+    assert len(starts) == 3
+    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
+    assert all(gap >= 0.12 for gap in gaps), gaps
+    assert [identifier for identifier, _detail in result.failures] == ["t0"]
+
+
+def test_api_retry_stops_when_halted_before_the_retry():
+    """轮到重试时已被停止/中止 → 不再派发，且该单仍记 failure（它确实发出过）。"""
+    from threading import Event
+
+    stop = Event()
+    posts = []
+
+    def submit(payload):
+        posts.append(payload)
+        stop.set()  # 首次被驳回的同一刻用户点了停止
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, stop, None, max_workers=1,
+        min_interval_s=0.05, submit_attempts=3)
+    assert len(posts) == 1, "停止后不能再发第二次"
+    assert [identifier for identifier, _detail in result.failures] == ["t0"], (
+        "已经发出过请求的单绝不能被记成「未发送」")
+
+
+def test_api_retry_wait_aborts_on_stop_without_sending_again():
+    """重试的节流等待期间被停止 → 放弃重试，但结论仍是 failure（不是未发送）。"""
+    import threading as _threading
+
+    stop = _threading.Event()
+    posts = []
+
+    def submit(payload):
+        posts.append(payload)
+        if len(posts) == 1:
+            _threading.Timer(0.05, stop.set).start()
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    result = sss._submit_tasks_concurrent(
+        _only_task(), submit, stop, None, max_workers=1,
+        min_interval_s=0.4, submit_attempts=3)
+    assert len(posts) == 1, "等待期间收到停止，绝不能补发"
+    assert [identifier for identifier, _detail in result.failures] == ["t0"]
+
+
+def test_api_settle_delays_each_post_attempt():
+    """每次 POST（含重试）之前都先静默。"""
+    import time
+
+    starts = []
+
+    def submit(payload):
+        starts.append(time.perf_counter())
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), None, max_workers=1,
+        pre_submit_settle_s=0.15, submit_attempts=2)
+    assert len(starts) == 2
+    assert starts[1] - starts[0] >= 0.15, starts
+
+
+def test_api_settle_is_excluded_from_the_http_latency_window():
+    """静默不计入 HTTP 耗时：否则会顶破快速驳回判定、让自动放宽节流失效。"""
+    logs = []
+
+    def submit(payload):
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    sss._submit_tasks_concurrent(
+        _only_task(), submit, _NeverStopped(), logs.append, max_workers=1,
+        min_interval_s=0.05, pre_submit_settle_s=1.6, submit_attempts=1)
+    assert any("自动放宽" in message for message in logs), (
+        "静默 1.6s 若被算进 HTTP 耗时，快速驳回（≤1.5s）判定就不会触发")
+
+
+def test_run_sss_job_api_mode_recovers_from_platform_rejections(
+        monkeypatch, tmp_path):
+    """端到端（接口模式）：平台驳回被自动重试救回，最终由站内对账确认。"""
+    from tests.sss_test_support import _FakeClient, _config, _write_sss_excel
+
+    _write_sss_excel(tmp_path)
+    cfg = _config(tmp_path, sss_order_source="excel", sss_max_workers=1,
+                  sss_submit_min_interval_s=0.0)
+    client = _FakeClient(order_reject_times=1)
+    monkeypatch.setattr(sss, "SssApiClient", lambda *a, **k: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+    logs: list[str] = []
+
+    result = sss.run_sss_job(cfg, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert result["created"] == 2, logs
+    assert result["uncertain"] is False
+    assert client.rejects == 1
+    # 被驳回的那一单多打了一次 POST：1 驳回 + 1 重试 + 1 正常 = 3 次
+    assert len(client.posts) == 3, client.posts
+    assert any("平台驳回重试生效" in message for message in logs), logs
+
+
 def test_submission_trace_records_the_active_interval(monkeypatch):
     """埋点带上请求发出时生效的提交最小间隔，供后续取证对照。
 

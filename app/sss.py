@@ -112,12 +112,24 @@ _UI_FINAL_CONFIRM_ATTEMPTS = 3          # 驳回后最多点击轮数（实测�
 _UI_REJECT_SETTLE_WINDOW_S = 5.0        # 单轮点击后等收场的观察窗（实测值）
 _UI_REJECT_RETRY_PAUSE_MS = 600         # 驳回后到下一轮点击的间隔（实测值）
 _UI_MASK_POLL_S = 0.3                   # 遮罩可见性轮询间隔（实测值）
+# 接口模式（api_mode=True）的提交节奏，与浏览器模式对齐：
+#  * 每次 POST 之前先静默，位置等价于浏览器模式"填完等 0.5s 再点确定"（都在
+#    "确定"动作之前）；两者用同一个 0.5s；
+#  * 服务端**明确拒绝**（success=false 且平台内部错误，确定未建单）时自动重试，
+#    单笔最多尝试 _API_SUBMIT_ATTEMPTS 次（与浏览器模式"共点 3 次"对齐）。
+#  * 重试**必须吃提交节流**（见 _SubmitPacer）：接口模式的驳回归因是"建单受理
+#    节奏"（2026-10-09 排查记录），所以不能像浏览器模式那样 600ms 快重试；
+#    "结果未知"（超时/断连/缺 success 字段）一律不重试（见 _post_one）。
+_API_SUBMIT_SETTLE_S = 0.5
+_API_SUBMIT_ATTEMPTS = 3
 # 创建订单接口是非幂等 POST，且平台在并发请求下曾间歇性返回
 # ``IndexOutOfBoundsException: Index: 0, Size: 0``（2026-09 实测，未定根因）。
 # 当时为此把提交固定成 1 路串行排查；2026-10-08 恢复为配置值（默认 4 路），
 # 依赖的是"至少一次提交 + 站内对账确认"这条既有兜底：并发只影响并发度，
-# 不改变"POST 不自动重发、以对账结果为准"的语义。平台若再次出现与并发相关的
-# 间歇错误，把 ``sss_max_workers`` 配回 1 即可回到串行，不需要改代码。
+# 不改变"**结果未知**的 POST 不自动重发、以对账结果为准"的语义（2026-10-12
+# 起另有例外：服务端明确拒绝且属平台内部错误时按节流自动重试，见 _API_SUBMIT_*）。
+# 平台若再次出现与并发相关的间歇错误，把 ``sss_max_workers`` 配回 1 即可回到串行，
+# 不需要改代码。
 _SSS_CREATE_MAX_WORKERS_CEILING = 20  # 与 config._SSS_MAX_WORKERS_CEILING 保持一致
 # 配置对象缺 ``sss_max_workers`` 字段（或取值无法解析）时的保守回退：串行。
 # 正常路径上 ``AppConfig`` 始终带该字段（默认 4 路），因此这条只保护
@@ -490,7 +502,7 @@ def _minimize_window(browser: Any, callback: Callable[[str], Any] | None) -> Non
 #
 # 结果分类必须遵守与接口分支相同的契约（见 run_sss_job 中 submit_browser 注释）：
 #   * 最终确定点击**之前**的任何失败 —— 普通异常（这一单确定没有创建，
-#     未决日志按“未落单”关闭，允许人工重试）；
+#     按失败记录，允许人工重试）；
 #   * 最终确定点击后无法确认弹窗收场 —— ``_SubmissionUncertain``（结果未知，
 #     由站内只读对账定论，绝不自动重发）；
 #   * 「创建订单」按钮消失 —— ``_AuthExpired``（登录态丢失，触发统一重登）；
@@ -1798,6 +1810,20 @@ def _is_rate_reject_response(response: Any) -> bool:
     return "IndexOutOfBounds" in message
 
 
+def _is_retryable_reject(response: Any) -> bool:
+    """明确拒绝（``success=false``）里，只有**平台内部错误**可以安全重试。
+
+    调用前提：``_check_success`` 已确证这是明确拒绝 —— 服务端不会创建订单，
+    因此重发同一单不会造成重复下单（2026-10-09 实测：平台对建单节奏的快速驳回
+    也不建单，只消耗一个平台序号）。
+
+    业务类拒绝（"商品已下架"、"地址无效"）是确定性的，重试只会白打请求并多消耗
+    平台序号，因此**不重试**；"结果未知"（超时/断连/响应缺 ``success`` 字段）
+    根本走不到这里 —— 那类一律不重发（见 ``_post_one`` 与 ``_SubmissionUncertain``）。
+    """
+    return isinstance(response, dict) and is_internal_error_payload(response)
+
+
 class _SubmitPacer:
     """提交节流：令相邻两次 POST 的起点至少间隔 ``interval`` 秒。
 
@@ -1862,10 +1888,13 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                              callback: Callable[[str], Any] | None,
                              max_workers: int = 4,
                              on_stop: Callable[[], None] | None = None,
-                             min_interval_s: float = 0.0) -> _SubmitResult:
+                             min_interval_s: float = 0.0,
+                             *, pre_submit_settle_s: float = 0.0,
+                             submit_attempts: int = 1) -> _SubmitResult:
     """有界并发提交，停止、401、余额不足后不再派发新任务。同一轮最多保留
     ``max_workers`` 个在途 POST。请求超时或断链只记录为 ``uncertain``，由调用方
-    查询订单列表确认，绝不在此处自动重发。
+    查询订单列表确认，**绝不在此处自动重发**；服务端明确拒绝（``success=false``，
+    确定未建单）在 ``submit_attempts`` > 1 时按提交节流自动重试同一单。
 
     ``max_workers == 1`` 时**在本函数的调用线程内串行执行**，不经过执行器线程：
     Playwright 同步 API 把 greenlet 绑定在创建它的线程上，浏览器表单分支的
@@ -1878,13 +1907,27 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     POST 的**起点**至少间隔该值，贴近平台对同一账号的建单受理节奏；出现平台
     快速驳回特征时自动放宽间隔。0 = 关闭节流（行为与引入节流前完全一致）。
     结束后输出一行本轮汇总（见 `_emit_round_summary`）。
+
+    ``pre_submit_settle_s`` > 0 时在**每次 POST 之前**静默该秒数（位置等价于
+    浏览器模式"填完等 0.5s 再点确定"）；静默**不计入 HTTP 耗时**，否则会顶破
+    ``_SUBMIT_FAST_REJECT_MAX_S`` 的快速驳回判定、让自动放宽节流失效。
+
+    ``submit_attempts`` > 1 时，**仅当**服务端明确拒绝且属于平台内部错误
+    （``_is_retryable_reject``）才重试；重试同样先过 ``pacer.wait``（吃全局节流
+    与自动放宽），被停止/401/余额拦下时保留本次失败结论（该单确实发出过请求，
+    绝不记成"未发送"）。默认 1 = 与引入重试前完全一致。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
+    attempts = max(1, int(submit_attempts or 1))
     try:
         pacing = max(0.0, float(min_interval_s or 0.0))
     except (TypeError, ValueError):
         pacing = 0.0
+    try:
+        settle_s = max(0.0, float(pre_submit_settle_s or 0.0))
+    except (TypeError, ValueError):
+        settle_s = 0.0
     pacer = _SubmitPacer(pacing)
     latencies: list[float] = []
     round_started = time.perf_counter()
@@ -1899,39 +1942,71 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
             # 节流等待期间收到停止/中止：请求确实没有发出，按「未发送」处理
             # （与在派发前被停止拦下同义，不引入任何新的重发行为）。
             return task["identifier"], "stopped", ""
+        identifier = task["identifier"]
         interval_at_send = pacer.interval
-        started = time.perf_counter()  # 计时只量 HTTP 本身，不含节流等待
-        response: Any = None
-        try:
-            response = submit(task["payload"])
-            _check_success(response)
-        except _AuthExpired as exc:
-            state, detail = "auth", str(exc)
-        except _BalanceDepleted as exc:
-            state, detail = "balance", str(exc)
-        except (_SubmissionUncertain, SssTransportError) as exc:
-            state, detail = "uncertain", str(exc)
-        except Exception as exc:
-            state, detail = "failure", str(exc)
-        else:
-            state, detail = "success", ""
-        elapsed = time.perf_counter() - started
-        # 平台「受理超速」的快速驳回：自动放宽提交节奏（自保）。桌面版把
-        # ``success=false`` 的平台拒绝归类为显式失败（可人工重试），与把平台内部
-        # 异常归为 uncertain 的服务端不同；因此这里按「响应特征 + 快速返回」判定，
-        # 两种分类都接受，只放宽节奏，不改变分类与重发语义。
-        if (state in ("uncertain", "failure")
-                and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
-                and _is_rate_reject_response(response)):
-            widened = pacer.penalize()
-            if widened is not None:
-                _emit(callback, "平台快速驳回（疑似建单受理超速）；"
-                                f"提交最小间隔自动放宽到 {widened:g} 秒"
-                                "（结果分类与重发语义不变）")
-        latencies.append(elapsed)
-        _trace(f"POST {task['identifier']}: {elapsed:.2f}s -> {state}"
-               f"；min_interval_s={interval_at_send:.3f}")
-        return task["identifier"], state, detail
+        spent = 0.0        # 本单累计 HTTP 时长（重试也计入，汇总口径仍是"每单"）
+        attempts_done = 0
+        while True:
+            attempts_done += 1
+            if settle_s:
+                # 提交前静默：与浏览器模式"填完等 0.5s 再点确定"同一个位置语义
+                # （都在"确定"动作之前），且刻意不计入下面的 HTTP 计时。
+                time.sleep(settle_s)
+            started = time.perf_counter()  # 计时只量 HTTP，不含静默与节流等待
+            response: Any = None
+            rejected = False
+            try:
+                response = submit(task["payload"])
+                _check_success(response)
+            except _AuthExpired as exc:
+                state, detail = "auth", str(exc)
+            except _BalanceDepleted as exc:
+                state, detail = "balance", str(exc)
+            except (_SubmissionUncertain, SssTransportError) as exc:
+                state, detail = "uncertain", str(exc)
+            except LookupError as exc:
+                # 服务端明确拒绝（``success=false``；``_BalanceDepleted`` 已在上方
+                # 拦下）：这一单确定没有创建 —— 只有这一类才允许自动重试。
+                state, detail = "failure", str(exc)
+                rejected = True
+            except Exception as exc:  # noqa: BLE001 - 其它异常同样无法确认结果
+                state, detail = "failure", str(exc)
+            else:
+                state, detail = "success", ""
+            elapsed = time.perf_counter() - started
+            spent += elapsed
+            # 平台「受理超速」的快速驳回：自动放宽提交节奏（自保）。桌面版把
+            # ``success=false`` 的平台拒绝归类为显式失败，与把平台内部异常归为
+            # uncertain 的服务端不同；因此这里按「响应特征 + 快速返回」判定，
+            # 两种分类都接受，只放宽节奏，不改变分类与重发语义。
+            if (state in ("uncertain", "failure")
+                    and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
+                    and _is_rate_reject_response(response)):
+                widened = pacer.penalize()
+                if widened is not None:
+                    _emit(callback, "平台快速驳回（疑似建单受理超速）；"
+                                    f"提交最小间隔自动放宽到 {widened:g} 秒"
+                                    "（结果分类与重发语义不变）")
+            _trace(f"POST {identifier}"
+                   + (f"（第 {attempts_done}/{attempts} 次尝试）" if attempts > 1 else "")
+                   + f": {elapsed:.2f}s -> {state}；min_interval_s={interval_at_send:.3f}")
+            if state == "success":
+                if attempts_done > 1:
+                    _emit(callback, f"{identifier} 第 {attempts_done} 次提交后成功"
+                                    "（平台驳回重试生效）")
+                break
+            if not (rejected and attempts_done < attempts
+                    and _is_retryable_reject(response) and not halted()):
+                break
+            _emit(callback,
+                  f"平台驳回（第 {attempts_done}/{attempts} 次）：{identifier}："
+                  f"{detail[:120]}；按提交节流等待后自动重试该单…")
+            if not pacer.wait(stop_event, halted):
+                # 重试等待期间收到停止/中止：本单**已经发出过请求**，绝不能记成
+                # 「未发送」（那会让上层以为它没落单）；保留本次 failure 结论。
+                break
+        latencies.append(spent)
+        return identifier, state, detail
 
     def classify(identifier: str, state: str, detail: str) -> None:
         if state == "success":
@@ -2273,16 +2348,23 @@ def _run_reconciled_submission(
         max_workers: int,
         relogin: Callable[[], None] | None = None,
         submit_min_interval_s: float = 0.0,
+        pre_submit_settle_s: float = 0.0,
+        submit_attempts: int = 1,
         ) -> tuple[_Reconciliation | None, bool]:
     """执行"先对账、提交、再对账"的至少一次语义。
 
     返回 ``(最终对账结果, 是否完成了最终对账)``。平台接口没有客户端幂等
-    键，因此这里不承诺 exactly-once：只保证非幂等 POST 不自动重试，提交后
-    通过列表对账确认；对账延迟时只读轮询，绝不立即重复 POST。
+    键，因此这里不承诺 exactly-once：**结果未知**的非幂等 POST 绝不自动重试，
+    提交后通过列表对账确认（对账延迟时只读轮询，绝不立即重复 POST）；只有
+    服务端明确拒绝（``success=false``，确定未建单）才在 ``submit_attempts`` > 1
+    时按提交节流自动重试同一单。
 
     ``submit_min_interval_s`` > 0 时，每轮提交的相邻 POST 起点至少间隔该值
     （见 `_SubmitPacer`；每轮新建一个节流器，0 = 关闭）。节流只影响发送节奏，
     不改变分类、记录与重发语义。
+
+    ``pre_submit_settle_s`` / ``submit_attempts`` 原样透传给每轮提交（含重登后
+    的补发轮与人工重试轮），语义见 :func:`_submit_tasks_concurrent`。
     """
     batch_started_at = time.time()
     batch_window_start = batch_started_at - _BATCH_CLOCK_SKEW_S
@@ -2312,7 +2394,9 @@ def _run_reconciled_submission(
         try:
             return _submit_tasks_concurrent(round_tasks, submit, stop_event,
                                             callback, workers, on_stop=close,
-                                            min_interval_s=submit_min_interval_s)
+                                            min_interval_s=submit_min_interval_s,
+                                            pre_submit_settle_s=pre_submit_settle_s,
+                                            submit_attempts=submit_attempts)
         finally:
             close()
 
@@ -2718,6 +2802,9 @@ def run_sss_job(config: Any, stop_event: Any,
                 max_workers,
                 relogin=relogin,
                 submit_min_interval_s=submit_min_interval_s,
+                # 接口模式：每次 POST 前静默 0.5s、明确拒绝后按节流重试（见常量注释）
+                pre_submit_settle_s=_API_SUBMIT_SETTLE_S,
+                submit_attempts=_API_SUBMIT_ATTEMPTS,
             )
             created = len(final.confirmed) if final is not None else 0
             processed = len(tasks)
@@ -2896,6 +2983,8 @@ def run_sss_job(config: Any, stop_event: Any,
                 max_workers=1,
                 relogin=relogin_browser,
                 submit_min_interval_s=submit_min_interval_s,
+                # 浏览器分支的 0.5s 填报静默与 3 轮点击重试在 _ui_create_order
+                # 内部完成，这里不能叠加第二层（否则双重静默/重复点击）。
             )
             created = len(final.confirmed) if final is not None else 0
             processed = len(tasks)
