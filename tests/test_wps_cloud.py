@@ -18,7 +18,8 @@ from app import wps_cloud as wc
 from app.wps_cloud import (
     Change, CloudOrder, LedgerCorruptError, SheetPlan, SyncLedger, WpsCloudError,
     apply_plan, build_plan, find_cli, format_plan, parse_date_header,
-    person_key, summarize_plan, target_date_for, weekday_number,
+    normalize_phone, person_key, summarize_plan, target_date_for,
+    text_cell_formula, weekday_number,
 )
 
 
@@ -72,8 +73,8 @@ class FakeCli:
                 if row_from <= k[0] <= row_to and col_from <= k[1] <= col_to}
         if with_format:
             # 与真实接口一致：只返回非空格；fill 模拟为空（模板测试里由 TemplateCli 覆盖）
-            return {k: {"text": str(v), "fill": ""} for k, v in hits.items()}
-        return hits
+            return {k: {"text": _grid_text(v), "fill": ""} for k, v in hits.items()}
+        return {k: _grid_text(v) for k, v in hits.items()}
 
     def write_cells(self, file_id, worksheet_id, cells):
         if self.fail_write:
@@ -174,6 +175,13 @@ class FakeCli:
     # ---- 格式接口（默认：读不到参考格式，于是跳过格式设置）----
     def read_cell_format(self, file_id, worksheet_id, row, col):
         return None
+
+
+def _grid_text(value):
+    """把格子载荷转成文本：允许用例传 ``{"text": ...}`` 模拟带格式读取。"""
+    if isinstance(value, dict):
+        return str(value.get("text", ""))
+    return str(value)
 
 
 def make_grid(header: dict[int, str], rows: list[dict[int, str]]) -> dict[tuple[int, int], str]:
@@ -1374,6 +1382,27 @@ def test_read_grid_with_format_accepts_real_background_field():
         (2, 10): {"text": "6", "fill": "#FFFFC000"}}
 
 
+def test_read_grid_prefers_the_original_value_over_display_text():
+    """回读优先取**原值**：12 位电话显示成科学计数时也不能变形。
+
+    2026-10-12 医学院中餐事故的根因就是这个：写进去 `159678999961`，平台把它
+    存成数字、`cellText` 显示成 `1.59679E+11`，按显示值算人键就找不到人。
+    """
+    cli = wc.KdocsCli.__new__(wc.KdocsCli)
+    cli._run = lambda *args, **kwargs: {"detail": {"rangeData": [
+        {"originRow": 2, "originCol": 2,
+         "originalCellValue": "159678999961", "cellText": "1.59679E+11"},
+        {"originRow": 3, "originCol": 2,
+         "originalCellValue": 159678999961.0, "cellText": "1.59679E+11"},
+        # 老响应没有原值字段：退回显示文本，行为与改动前一致
+        {"originRow": 4, "originCol": 0, "cellText": "张"},
+        # 空格子不返回
+        {"originRow": 5, "originCol": 2, "originalCellValue": "", "cellText": ""},
+    ]}}
+    grid = cli.read_grid("F1", 1, 0, 5, 0, 12)
+    assert grid == {(2, 2): "159678999961", (3, 2): "159678999961", (4, 0): "张"}
+
+
 def test_formula_cells_for_new_rows_use_dynamic_date_columns():
     plan = SheetPlan(sheet="东湖中餐", file_id="F1", target_col=8,
                      columns={"total": 12, "served": 13, "left": 14},
@@ -1464,3 +1493,105 @@ def test_effective_tables_test_mode_uses_copies_and_rejects_production():
     config.wps_test_tables = {"东湖中餐": "H8vzKoTJVrMP7mA9QG591xqS9W8Bg57iG"}
     with pytest.raises(WpsCloudError, match="已过期试验田"):
         wc.effective_tables(config)
+
+
+# ----------------------------------------------------------------------
+# 值原样上传（2026-10-12 需求，对应医学院中餐事故）
+#
+# 事故链：本地电话 `159678999961`（12 位）→ 平台按数字存 → 显示 `1.59679E+11`
+# → 回读只取显示值 → 人键 `('mer','15967911')` 与本地对不上 → 「排序后定位不到」。
+# 本组用例把"写进去 / 读回来 / 显示出来"三处的口径钉死。
+# ----------------------------------------------------------------------
+
+def test_person_key_normalizes_numeric_phones():
+    """人键按**值**算：数值型、`.0` 尾巴都还原成同一串数字。
+
+    注意口径的边界：`1.59679E+11` 这种**已经丢精度的显示文本**永远救不回来
+    （它只剩 6 位有效数字）——本项目的做法是不让它出现：写入按文本（前置单引号）、
+    回读优先取原值。已损坏的线上格子属于遗留数据，要人工改回文本。
+    """
+    expected = "159678999961"
+    for raw in ("159678999961", "159678999961.0", 159678999961):
+        assert person_key("mer", raw)[1] == expected, raw
+    # 客户怎么填就怎么留：空格/连字符/+86/前导 0 只丢符号、不做位数校验
+    assert normalize_phone("159 6789 9961") == "15967899961"
+    assert normalize_phone("+86 159-6789-9961") == "8615967899961"
+    assert normalize_phone("015967899961") == "015967899961"
+
+
+def test_cell_value_text_keeps_numeric_strings_intact():
+    assert wc.cell_value_text("159678999961") == "159678999961"
+    assert wc.cell_value_text(159678999961.0) == "159678999961"
+    assert wc.cell_value_text(159678999961) == "159678999961"
+    assert wc.cell_value_text(None) == ""
+    assert wc.cell_value_text(" 张 ") == "张"
+
+
+def test_text_cell_formula_quotes_digit_strings_only():
+    """纯数字按文本写（前置单引号），其余值原样写、不改写。"""
+    assert text_cell_formula("159678999961") == "'159678999961"
+    assert text_cell_formula("015967899961") == "'015967899961"
+    assert text_cell_formula("张") == "张"
+    assert text_cell_formula("159 6789 9961") == "159 6789 9961"
+    assert text_cell_formula("+86 159-6789-9961") == "+86 159-6789-9961"
+
+
+def test_phone_updates_are_located_by_value_not_display_text():
+    """整表重排后按值重新定位：12 位电话的人必须还能被找到。
+
+    走的是事故同款路径：表里有 `mer/159678999961`，本地再给他加 3 餐，
+    必须定位到他、把总餐次从 4 累加到 7（而不是报「排序后定位不到」）。
+    """
+    grid = make_grid(BASE_HEADER, [{0: "mer", 1: "小", 2: "159678999961", 7: "4"}])
+    cli = FakeCli(grid)
+    plans = _plan(cli, [CloudOrder("东湖中餐", "mer", "小", "159678999961",
+                                   "中餐", "经济", 3)],
+                  address_order={"东湖中餐": ["小"]})
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["failed"] == 0, result["sheets"]
+
+    totals = [op for op in cli.writes if any(c["col"] == 8 for c in op["cells"])]
+    assert totals, cli.writes
+    total_cells = [c for op in totals for c in op["cells"] if c["col"] == 8]
+    assert [c["value"] for c in total_cells] == [7]
+
+
+def test_new_customer_phone_is_written_as_text_so_it_displays_as_filled():
+    """写新客户：电话列按文本写（平台才不会把它存成数字、显示成科学计数）。
+
+    姓名/地址等非数字值原样写；餐种等业务值也不带引号。
+    """
+    cli = FakeCli(make_grid(BASE_HEADER, [{0: "老客户", 1: "小", 2: "111", 7: "3"}]))
+    plans = _plan(cli, [CloudOrder("东湖中餐", "新人", "小", "159678999961",
+                                   "中餐", "经济", 6)])
+    # 关排序：直接看"写新行"这一批格子，不被排序/重定位的中间态干扰
+    plans[0].sort_enabled = False
+    result = apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert result["failed"] == 0, result["sheets"]
+
+    phone_col = plans[0].columns["phone"]
+    name_col = plans[0].columns["name"]
+    written = {c["col"]: c["value"] for op in cli.writes for c in op["cells"]}
+    assert written[phone_col] == "'159678999961", written
+    assert written[name_col] == "新人", "非数字值不得被改写"
+    # 回读校验用同一个值拿到的文本，与本地一致
+    assert cli.grid[(plans[0].changes[0].row - 1, phone_col - 1)] == "'159678999961"
+
+
+def test_sync_is_idempotent_for_text_phone_values():
+    """同一批数据第二次同步 = no-op（值一致，不重复加餐、不插行）。"""
+    grid = make_grid(BASE_HEADER, [{0: "mer", 1: "小", 2: "'159678999961", 7: "4"}])
+    cli = FakeCli(grid)
+    orders = [CloudOrder("东湖中餐", "mer", "小", "159678999961", "中餐", "经济", 4)]
+    ledger = _ledger_with(tmpdir := tmp_path_dir(), "2026-09-11", "F1",
+                          "mer", "159678999961", [4])
+
+    first = _plan(cli, orders, ledger=ledger, sort=False)
+    apply_plan(cli, first, ledger=ledger, marker_enabled=False)
+
+    second = _plan(cli, orders, ledger=ledger, sort=False)
+    assert second[0].changes[0].needs_write is False, "第二次不应再写任何格子"
+    result = apply_plan(cli, second, ledger=ledger, marker_enabled=False)
+    assert result["failed"] == 0
+    assert not cli.inserts, "不得插行"
+    assert cli.grid[(2, 7)] == "4", "总餐次不能被重复累加"

@@ -360,8 +360,67 @@ def person_key(name: Any, phone: Any) -> tuple[str, str]:
 
 
 def normalize_phone(value: Any) -> str:
-    """把手机号规范化成「11 位 ASCII 数字」形式（与 :func:`person_key` 口径一致）。"""
+    """把手机号规范化成纯数字形式（与 :func:`person_key` 口径一致）。
+
+    只做"抹掉显示形态、留下值本身"这一步：`159678999961.0`（数值型原值）、
+    `1.59679E+11`（科学计数显示）都能还原成 `159678999961`；括号、连字符、
+    `+86`、前导 0 等**客户怎么填就怎么留**，不做位数校验、不截断、不改写
+    （需求见 ``docs``：值原样上传）。
+    """
     return person_key("", value)[1]
+
+
+def cell_value_text(value: Any) -> str:
+    """把云端单元格的**原值**转成最贴近本地写法的文本。
+
+    * 数字字符串原样保留（`"159678999961"`）；
+    * 浮点整数值去掉多余的 ``.0``（`159678999961.0`` → ``"159678999961"``）；
+    * ``None`` → 空串。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, float):
+        if value.is_integer():
+            return str(int(value))
+        return format(value, ".15g")
+    if isinstance(value, int):
+        return str(value)
+    return str(value).strip()
+
+
+def _looks_like_number(text: str) -> bool:
+    """纯数字文本（去掉两侧空白后全为 0-9，且至少一位）。"""
+    return bool(text) and text.isdigit()
+
+
+def _read_cell_text(cell: Mapping[str, Any]) -> str:
+    """从接口的单格数据里取出**值文本**（优先原值，显示文本兜底）。
+
+    老接口/空响应里可能没有 ``originalCellValue``，此时退回 ``cellText``，
+    行为与引入原值读取之前一致。
+    """
+    original = cell.get("originalCellValue")
+    if original not in (None, ""):
+        return cell_value_text(original)
+    return cell_value_text(cell.get("cellText"))
+
+
+def text_cell_formula(text: str) -> str:
+    """写单元格用的"强制文本"公式：数字一律带前置单引号。
+
+    平台的写值操作只有 ``opType=formula`` 一种。直接把纯数字字符串交给它当公式
+    写，12 位号码会被当成数字存起来：回读的原值仍在，但**显示**成科学计数
+    `1.59679E+11`，协作者看到的就不是客户填的号码（2026-10-12 医学院中餐事故）。
+    前置单引号是电子表格的"按文本存"约定：显示与回读都保持原样，值不变形。
+
+    非数字文本（姓名/地址/餐种，以及带空格/连字符/+86 的电话）原样写，不改写。
+    """
+    raw = "" if text is None else str(text)
+    if _looks_like_number(raw.strip()):
+        return "'" + raw
+    return raw
 
 
 def _address_key(text: Any) -> str:
@@ -1152,7 +1211,11 @@ class KdocsCli:
                   row_from: int, row_to: int,
                   col_from: int, col_to: int,
                   *, with_format: bool = False) -> dict[tuple[int, int], str]:
-        """读取矩形区域，返回 {(0-based 行, 0-based 列): cellText}。
+        """读取矩形区域，返回 {(0-based 行, 0-based 列): 值文本}。
+
+        **优先取原值** ``originalCellValue``（客户怎么填就怎么读），``cellText``
+        只是显示形态、会在数字很长时变成科学计数（`1.59679E+11`，2026-10-12
+        医学院中餐事故）。名称沿用 ``cellText`` 的年代，但语义是"值"。
 
         接口返回里没有 ``detail`` 说明这张表读不了（例如是二进制 xlsx 而非在线
         表格），此时抛错而不是返回空结果 —— 否则调用方会把"读不了"误判成"表是空的"。
@@ -1169,16 +1232,16 @@ class KdocsCli:
         for cell in cells:
             if not isinstance(cell, dict):
                 continue
-            text = cell.get("cellText")
-            if text in (None, ""):
+            text = _read_cell_text(cell)
+            if text == "":
                 continue
             if with_format:
                 key = (int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))
-                grid[key] = {"text": str(text),
+                grid[key] = {"text": text,
                              "fill": (cell.get("cell_background_color")
                                       or cell.get("fill") or "")}
                 continue
-            grid[(int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))] = str(text)
+            grid[(int(cell.get("originRow", 0)), int(cell.get("originCol", 0)))] = text
         return grid
 
     def read_row(self, file_id: str, worksheet_id: int, row: int,
@@ -1297,8 +1360,12 @@ class KdocsCli:
         detail = data.get("detail") if isinstance(data, dict) else None
         cells = (detail or {}).get("rangeData") or []
         for cell in cells:
-            if isinstance(cell, dict) and cell.get("cellText") not in (None, ""):
-                return cell
+            if isinstance(cell, dict) and _read_cell_text(cell) != "":
+                # 返回原格数据，但把 ``text`` 统一成"值文本"（优先原值）——
+                # 调用方（学格式）只看 fill，``text`` 保持可用的核对口径。
+                payload = dict(cell)
+                payload["text"] = _read_cell_text(cell)
+                return payload
         return None
 
     def sort_range(self, file_id: str, worksheet_id: int, *, range_ref: str,
@@ -2421,6 +2488,11 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
     ``failed_no_write`` / ``uncertain``，使崩溃或部分失败后能只读对账并人工处置。
     同时：同日期 + 同云表若还有未解除的防重复闸门（``retire_guarded``），
     本表直接拒绝写入；计划构建时所用的账本快照若已变化，同样拒绝写入。
+
+    表间独立：某张表失败/结果未知**只影响它自己**（闸门按"同日期 + 同表"设限），
+    后续表照常执行；连未预期的编程/数据异常也只把该表记成结果未知（见
+    ``_abort_sheet``），不再中断整批。汇总逐表给出状态，整批结论由
+    ``_finalize_apply_result`` 按逐表状态判定。
     """
     emit = log or (lambda _msg, _level="INFO": None)
     plan_list = list(plans)
@@ -2428,6 +2500,32 @@ def apply_plan(cli: KdocsCli, plans: Iterable[SheetPlan], *,
         return _apply_plan_locked(cli, plan_list, ledger=ledger,
                                   marker_enabled=marker_enabled, emit=emit,
                                   journal=journal, operation_id=operation_id)
+
+
+def _abort_sheet(plan: SheetPlan, exc: BaseException,
+                 emit: Callable[..., Any], mark: Callable[..., Any],
+                 result: dict[str, Any]) -> None:
+    """某张表抛了未预期异常：只把这张表记成「结果未知」，整批继续。
+
+    为什么按 ``uncertain`` 而不是 ``failed``：异常可能发生在任何一个云端请求
+    之后，本地无法证明"一个格子都没写"；记错方向的代价不对称 —— 记 uncertain
+    最多多一次人工核对，记 failed 却可能让下一次上传把同一批餐重复累加。
+    因此这里**不回滚也不猜**，交给「云同步恢复」只读核对后处置。
+
+    为什么要有这层兜底：``apply_plan`` 原先只吞 ``WpsCloudError``，其它异常会
+    跳出逐表循环 —— 一张表（例如它的布局触发了代码里的 KeyError）出意外，
+    排在它后面的表一张都不会写（2026-10-12 需求：表间独立上传）。
+    """
+    detail = f"{type(exc).__name__}: {exc}"
+    emit(f"[云同步] {plan.sheet} 执行中发生未预期错误，本表记为结果未知；"
+         f"其余表继续（请到「云同步恢复」只读核对本表）：{detail}", "ERROR")
+    try:
+        mark("uncertain", reason=f"未预期错误：{detail}")
+    except Exception:  # noqa: BLE001 - 日志写不进去也不能改变云端结论
+        pass
+    result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                             "reason": f"未预期错误：{detail}", "uncertain": True})
+    result["failed"] += 1
 
 
 def _guard_block_reason(plan: SheetPlan, journal: Any,
@@ -2522,471 +2620,479 @@ def _apply_plan_locked(cli: KdocsCli, plans: Sequence[SheetPlan], *,
             return _finalize_apply_result(result)
 
     for plan in plans:
-
-        def mark(status: str, **fields: Any) -> None:
-            """把某张表的状态写进意图日志；日志不可写只告警，不改变云端结论。"""
-            if journal is None:
-                return
-            try:
-                journal.set_sheet_status(operation_id, plan.sheet, status, **fields)
-                journal.save()
-            except Exception as exc:  # noqa: BLE001
-                emit(f"[云同步] {plan.sheet}：意图日志更新失败（{exc}）", "WARN")
-
-        if plan.blocked_reason:
-            # 批次日期闸门：**一个云端请求都不发**（连 sheets_info 都不调用），
-            # 写请求 = 0、账本更新 = 0、新行插入 = 0。
-            emit(f"[云同步] {plan.sheet}：整表拒绝写入 —— {plan.blocked_reason}", "ERROR")
-            mark("not_started", reason=plan.blocked_reason)
-            result["sheets"].append({"sheet": plan.sheet, "status": "blocked",
-                                     "reason": plan.blocked_reason,
-                                     "cloud_writes": 0, "ledger_updates": 0})
-            result["blocked"] = int(result.get("blocked", 0)) + 1
-            continue
-        guard_reason = _guard_block_reason(plan, journal, ledger,
-                                           operation_id=operation_id,
-                                           expected_digest=batch_digest)
-        if guard_reason:
-            emit(f"[云同步] {plan.sheet}：拒绝写入 —— {guard_reason}", "ERROR")
-            mark("not_started", reason=guard_reason)
-            result["sheets"].append({"sheet": plan.sheet, "status": "stale_batch",
-                                     "reason": guard_reason,
-                                     "cloud_writes": 0, "ledger_updates": 0})
-            result["failed"] += 1
-            continue
-        if not plan.target_col:
-            mark("not_started", reason="未找到目标日期列")
-            result["sheets"].append({"sheet": plan.sheet, "status": "skipped",
-                                     "reason": "未找到目标日期列",
-                                     "cloud_writes": 0, "ledger_updates": 0})
-            continue
-        infos = cli.sheets_info(plan.file_id)
-        if not infos:
-            mark("failed_no_write", reason="云端文件不可读")
-            result["sheets"].append({"sheet": plan.sheet, "status": "failed",
-                                     "reason": "云端文件不可读", "cloud_writes": 0,
-                                     "ledger_updates": 0})
-            result["failed"] += 1
-            continue
-        worksheet_id = int(infos[0].get("sheetId") or 1)
-        if any(change.needs_write for change in plan.changes):
-            # 第一次真正写入之前先把状态推进到 writing：崩溃后能看出"这张表动过"。
-            # worksheet_id 也必须记住：恢复时的只读核对要靠它定位子表。
-            mark("writing", worksheet_id=worksheet_id)
-
-        # 1) 插入新客户行：统一一块，插到第 3 行与第 4 行之间。
-        #    表里本来没有数据行时不插（写单元格会自动把表扩出来）。
-        inserted: list[tuple[int, int]] = []          # (first_row, count)，回滚用
-        new_changes = [c for c in plan.changes if c.kind == "new"]
-        block = plan.insert_blocks[0] if plan.insert_blocks else None
-        if block and not block.append_only:
-            try:
-                cli.insert_rows(plan.file_id, worksheet_id,
-                                row=block.first_row, count=block.count)
-                inserted.append((block.first_row, block.count))
-                emit(f"[云同步] {plan.sheet}：已在第 {block.first_row} 行前插入 "
-                     f"{block.count} 行（新客户）")
-            except WpsCloudError as exc:
-                # 服务端可能**已经插入成功**而客户端只拿到了超时/断连。直接报
-                # "未写入"会在下一次上传时重复插行，所以这里一定先只读核对：
-                # 只有证明云端仍与写前基线一致，才允许说失败且零写入。
-                emit(f"[云同步] {plan.sheet} 插入新行失败：{exc}；正在只读核对云端")
-                status, fields = _classify_after_failure(
-                    cli, journal, operation_id, plan, rollback_ok=True)
-                if status == "failed_no_write" and _looks_like_transport_error(exc):
-                    # 超时/断连/网关错误：服务端**可能已经插过行**（例如插入了空行），
-                    # 本地读回也看不见这种痕迹 —— 不能声明"未写入"。
-                    status = "uncertain"
-                    fields["manual_required"] = "insert_may_have_landed"
-                    fields["problems"] = list(fields.get("problems") or []) + [
-                        "插入请求报错发生在传输层：服务端可能已经插入过空行，"
-                        "本地读回无法证明；请人工核对表结构后再决定是否重传"]
-                if status == "verified":
-                    mark("verified", reason=f"插入回报异常但云端期望值已完整：{exc}",
-                         **fields)
-                    result["sheets"].append({"sheet": plan.sheet, "status": "ok",
-                                             "people": 0, "warning": "插入异常但云端已完整",
-                                             "ledger_updates": 0})
-                    result["written"] += 1
-                    continue
-                mark(status, reason=f"插入新行失败：{exc}", **fields)
-                result["sheets"].append({
-                    "sheet": plan.sheet, "status": "failed",
-                    "reason": f"插入新行失败：{exc}",
-                    "uncertain": status != "failed_no_write",
-                    "cloud_writes": (0 if status == "failed_no_write" else None),
-                    "ledger_updates": 0})
-                result["failed"] += 1
-                continue
-
-        # 2) 排序前先写"与行号无关"的整行信息：排序后这些值会跟着行走。
-        #    必须写在 insert_row（排序前的物理行），不能写 change.row（那是排序后
-        #    的目标行号，此刻还属于别人）。
-        base_cells: list[dict[str, Any]] = []
-        for change in new_changes:
-            at = change.insert_row or change.row
-            base_cells.append({"row": at, "col": plan.columns["name"],
-                               "value": change.name})
-            if plan.columns.get("address"):
-                base_cells.append({"row": at, "col": plan.columns["address"],
-                                   "value": change.address})
-            base_cells.append({"row": at, "col": plan.columns["phone"],
-                               "value": change.phone})
-            if plan.columns.get("type") and change.meal_type:
-                base_cells.append({"row": at, "col": plan.columns["type"],
-                                   "value": change.meal_type})
-            if plan.columns.get("kind") and change.meal_kind:
-                base_cells.append({"row": at, "col": plan.columns["kind"],
-                                   "value": change.meal_kind})
-        if base_cells:
-            try:
-                cli.write_cells(plan.file_id, worksheet_id, base_cells)
-            except WpsCloudError as exc:
-                rolled_back, deleted = _rollback_inserts(
-                    cli, plan, worksheet_id, inserted, emit,
-                    new_names={c.name for c in new_changes})
-                emit(f"[云同步] {plan.sheet} 新客户行写入失败：{exc}")
-                status, fields = _classify_after_failure(
-                    cli, journal, operation_id, plan, rollback_ok=rolled_back,
-                    rolled_back_rows=deleted)
-                if status == "verified":
-                    mark("verified", reason=str(exc), **fields)
-                    result["sheets"].append({"sheet": plan.sheet, "status": "ok",
-                                             "people": 0, "cloud_writes": None,
-                                             "warning": "写入异常但云端期望值已完整"})
-                    result["written"] += 1
-                    continue
-                mark(status, reason=str(exc), rollback_ok=rolled_back,
-                     **fields)
-                result["sheets"].append({
-                    "sheet": plan.sheet, "status": "failed", "reason": str(exc),
-                    "uncertain": status != "failed_no_write",
-                    # 写过后完整回滚 ≠ 从未写入：不能声明零写入（§R10）。
-                    "rolled_back": deleted > 0,
-                    "cloud_writes": (0 if (status == "failed_no_write" and not deleted)
-                                     else None),
-                    "ledger_updates": 0})
-                result["failed"] += 1
-                continue
-
-        # 3) 上底色：新客户行跟着原数据行的字体/对齐；经济餐照抄模板底色（黄带位置
-        #    与老行一致）；**豪华餐整行金黄**。所有操作合并后分批，25 个新行只花
-        #    1~2 次调用。格式失败不影响数据写入结论。
-        if new_changes:
-            col_lo = plan.columns.get("name") or 1
-            col_hi = plan.columns.get("remark") or (col_lo + 12)
-            try:
-                spec = learn_row_format(cli, plan.file_id, worksheet_id,
-                                        col_from=col_lo, col_to=col_hi,
-                                        rows=[r for r in plan.format_rows if r],
-                                        cached_fills=plan.format_fills)
-                if spec:
-                    econ = [c.insert_row or c.row for c in new_changes
-                            if str(c.meal_kind).strip() != "豪华"]
-                    lux = [c.insert_row or c.row for c in new_changes
-                           if str(c.meal_kind).strip() == "豪华"]
-                    ops = build_format_ops(
-                        spec, econ_rows=econ, lux_rows=lux,
-                        col_from=col_lo, col_to=col_hi,
-                        # A~「餐种」整段刷底色（含日期与类型之间可能夹着的空列）
-                        plain_to=(plan.columns.get("kind")
-                                  or plan.columns.get("type") or 0),
-                        # 金黄带按列身份固定：总餐次 / 已出餐 / 剩余餐
-                        band_cols=tuple(c for c in (plan.columns.get("total"),
-                                                    plan.columns.get("served"),
-                                                    plan.columns.get("left")) if c))
-                    cli.write_format_ops(plan.file_id, worksheet_id, ops)
-                    emit(f"[云同步] {plan.sheet}：{len(new_changes)} 个新客户已套用"
-                         f"表格原有格式（字体/对齐、经济餐照抄模板底色"
-                         + ("、豪华餐整行金黄" if lux else "") + "）")
-                else:
-                    emit(f"[云同步] {plan.sheet}：读不到参考行格式，跳过格式设置")
-            except WpsCloudError as exc:
-                emit(f"[云同步] {plan.sheet}：格式设置失败（数据已写入）：{exc}")
-
-        # 4) 排序：写排序键（辅助列，在该表所有内容列右侧）→ 云端原地排序 → 删辅助列。
-        if plan.sort_key_col and plan.row_keys:
-            # 4a) 排序区必须覆盖表里**所有**内容列：辅助列右边若还有内容，说明它在
-            #     读取范围（MAX_SCAN_COL）之外，排序会让行与那些列错位。此时拒绝排序并
-            #     回滚插入 —— 宁可不排序，也不能把表排坏。
-            safe, found_at = probe_sort_area(
-                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
-                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
-            if not safe:
-                rolled_back, deleted = _rollback_inserts(
-                    cli, plan, worksheet_id, inserted, emit,
-                    new_names={c.name for c in new_changes})
-                reason = (f"第 {plan.sort_key_col} 列右侧（{found_at}）还有内容，"
-                          "排序区覆盖不到它，已放弃排序以免行与列错位")
-                emit(f"[云同步] {plan.sheet}：{reason}；新客户行已回滚，"
-                     "请先清理该列内容后重新上传", "ERROR")
-                status, fields = _classify_after_failure(
-                    cli, journal, operation_id, plan, rollback_ok=rolled_back,
-                    rolled_back_rows=deleted)
-                mark("uncertain" if status == "verified" else status,
-                     reason=reason, rollback_ok=rolled_back,
-                     **fields)
-                result["sheets"].append({
-                    "sheet": plan.sheet, "status": "failed", "reason": reason,
-                    "uncertain": status != "failed_no_write",
-                    "rolled_back": deleted > 0})
-                result["failed"] += 1
-                continue
-            key_cells = [{"row": row, "col": plan.sort_key_col,
-                          "value": format_sort_key(key)}
-                         for row, key in sorted(plan.row_keys.items())]
-            try:
-                cli.write_cells(plan.file_id, worksheet_id, key_cells)
-                cli.sort_range(plan.file_id, worksheet_id, range_ref=plan.sort_range,
-                               key=column_name(plan.sort_key_col), order="asc",
-                               header=False)
-            except WpsCloudError as exc:
-                # 排序还没生效（行还在原位）→ 插进去的新行可以整块删掉
-                rolled_back, deleted = _rollback_inserts(
-                    cli, plan, worksheet_id, inserted, emit,
-                    new_names={c.name for c in new_changes})
-                emit(f"[云同步] {plan.sheet} 按地址排序失败：{exc}")
-                status, fields = _classify_after_failure(
-                    cli, journal, operation_id, plan, rollback_ok=rolled_back,
-                    rolled_back_rows=deleted)
-                reason = f"按地址排序失败：{exc}"
-                mark("uncertain" if status == "verified" else status,
-                     reason=reason, rollback_ok=rolled_back,
-                     **fields)
-                result["sheets"].append({
-                    "sheet": plan.sheet, "status": "failed", "reason": reason,
-                    "uncertain": status != "failed_no_write",
-                    "rolled_back": deleted > 0})
-                result["failed"] += 1
-                continue
-            emit(f"[云同步] {plan.sheet}：已按地址顺序重排第 {FIRST_DATA_ROW}~"
-                 f"{plan.last_data_row} 行")
-            # 4b) 排序后复查一次：确实错位了就不要继续往这些行写数据。
-            safe, found_at = probe_sort_area(
-                cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
-                row_to=max(plan.last_data_row, FIRST_DATA_ROW))
-            if not safe:
-                emit(f"[云同步] {plan.sheet}：排序后第 {plan.sort_key_col} 列右侧出现内容"
-                     f"（{found_at}），说明排序区未覆盖全部列，已停止写入后续数据。"
-                     "表已重排，请重新上传（重复执行安全）", "ERROR")
-                reason = f"排序区未覆盖全部列（右侧有内容：{found_at}）"
-                mark("uncertain", reason=reason)
-                result["sheets"].append({
-                    "sheet": plan.sheet, "status": "failed",
-                    "reason": reason, "uncertain": True})
-                result["failed"] += 1
-                continue
-            try:
-                cli.delete_columns(plan.file_id, worksheet_id,
-                                   column=plan.sort_key_col, rows=plan.last_data_row)
-            except WpsCloudError as exc:
-                emit(f"[云同步] {plan.sheet}：排序辅助列（第 {plan.sort_key_col} 列）"
-                     f"删除失败，表右侧可能残留一排排序键：{exc}", "WARN")
-                try:
-                    cli.write_cells(plan.file_id, worksheet_id, [
-                        {"row": row, "col": plan.sort_key_col, "value": ""}
-                        for row in sorted(plan.row_keys)])
-                except WpsCloudError:
-                    pass
-
-        # 5) 重定位：整表重排后人行号全变了，必须回读（姓名,电话）重新定位。
-        #    定位失败就停手（不猜行号），此时只写了新行信息与底色，重传一次即可。
-        if plan.sort_enabled:
-            try:
-                actual_rows = read_person_rows(cli, plan, worksheet_id,
-                                               last_row=plan.last_data_row)
-            except WpsCloudError as exc:
-                emit(f"[云同步] {plan.sheet} 排序后无法重新定位人员行号，已停止写入"
-                     f"（请重新上传，重复执行安全）：{exc}", "ERROR")
-                mark("uncertain", reason=f"排序后回读失败：{exc}")
-                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
-                                         "reason": f"排序后回读失败：{exc}",
-                                         "uncertain": True})
-                result["failed"] += 1
-                continue
-            missing = [c for c in plan.changes
-                       if person_key(c.name, c.phone) not in actual_rows]
-            if missing:
-                names = "、".join(c.name for c in missing[:5])
-                emit(f"[云同步] {plan.sheet} 排序后定位不到这些人：{names}，已停止写入",
-                     "ERROR")
-                mark("uncertain", reason=f"排序后定位不到：{names}")
-                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
-                                         "reason": f"排序后定位不到：{names}"})
-                result["failed"] += 1
-                continue
-            drift = 0
-            for change in plan.changes:
-                key = person_key(change.name, change.phone)
-                rows = actual_rows[key]
-                # 一个人多行（多槽位）：第 i 个槽位对应他第 i 行，不能取同一个行号。
-                position = max(1, int(change.slot or 1)) - 1
-                row = rows[position] if position < len(rows) else rows[-1]
-                predicted = plan.final_rows.get(key)
-                if predicted and position < len(predicted) and predicted[position] != row:
-                    drift += 1
-                    if drift <= 3:
-                        emit(f"[云同步] {plan.sheet}：{change.name} 第 {change.slot} 行"
-                             f"实际排在第 {row} 行，与预测不符（按实际行号写入）", "WARN")
-                change.row = row
-            if drift:
-                plan.sort_mismatch = True
-                emit(f"[云同步] {plan.sheet}：{drift} 行的实际行号与预测不同"
-                     f"（已按实际行号写入，不影响数据正确性）", "WARN")
-
-        # 6) 其余写入：日期格 / 总餐次 / 公式 / 通讯记号
-        cells: list[dict[str, Any]] = []
-        pending: list[Change] = []
-        for change in plan.changes:
-            if not change.needs_write:
-                continue          # 已经一致：一个字都不写
-            pending.append(change)
-            if change.total_after != change.total_before and plan.columns.get("total"):
-                cells.append({"row": change.row, "col": plan.columns["total"],
-                              "value": change.total_after})
-            if change.kind == "existing":
-                if change.fill_type and plan.columns.get("type"):
-                    cells.append({"row": change.row, "col": plan.columns["type"],
-                                  "value": change.meal_type})
-                if change.fill_kind and plan.columns.get("kind"):
-                    cells.append({"row": change.row, "col": plan.columns["kind"],
-                                  "value": change.meal_kind})
-            if not change.target_ok and not change.target_blocked:
-                cells.append({"row": change.row, "col": change.target_col, "value": CELL_MARK})
-        formula_cells = formula_cells_for_new_rows(
-            plan, [c.row for c in pending if c.kind == "new"])
-        # 半成品行自愈：老客户缺公式的也补上（同一套公式）
-        formula_cells.extend(formula_cells_for_new_rows(
-            plan, [c.row for c in pending if c.kind == "existing" and c.fill_formula]))
-        cells.extend(formula_cells)
-        if marker_enabled and plan.marker_col:
-            cells.append({"row": HEADER_ROW, "col": plan.marker_col,
-                          "value": str(plan.weekday_number)})
-        if not cells:
-            # 没有任何待写内容（本次也没新客户，否则一定有格子要写）
-            mark("verified", reason="noop")
-            result["sheets"].append({"sheet": plan.sheet, "status": "noop",
-                                     "people": 0, "cloud_writes": 0,
-                                     "ledger_updates": 0})
-            continue
         try:
-            cli.write_cells(plan.file_id, worksheet_id, cells)
-        except WpsCloudError as exc:
-            note = "（表已按地址重排，请重新上传；重复执行是安全的）" if plan.sort_enabled else ""
-            emit(f"[云同步] {plan.sheet} 写入失败：{exc}{note}", "ERROR")
-            mark("uncertain", reason=str(exc))
-            result["sheets"].append({"sheet": plan.sheet, "status": "failed",
-                                     "reason": str(exc), "uncertain": True})
-            result["failed"] += 1
-            continue
 
-        # 回读校验：逐格核对，而不是只抽查首尾行。
-        # （曾出现过"只抽查末尾行、恰好该行原本就是 1"导致的假阳性。）
-        rows_written = sorted({int(c["row"]) for c in cells if int(c["row"]) >= FIRST_DATA_ROW})
-        if rows_written:
-            lo, hi = rows_written[0] - 1, rows_written[-1] - 1
-            verify_cols = {plan.target_col}
-            if plan.columns.get("total"):
-                verify_cols.add(plan.columns["total"])
-            if plan.columns.get("name"):
-                verify_cols.add(plan.columns["name"])
-            if formula_cells:
-                for formula_col in (plan.columns.get("served"), plan.columns.get("left")):
-                    if formula_col:
-                        verify_cols.add(formula_col)
-            c_lo, c_hi = min(verify_cols) - 1, max(verify_cols) - 1
-            try:
-                back = cli.read_grid(plan.file_id, worksheet_id, lo, hi, c_lo, c_hi)
-            except WpsCloudError as exc:
-                emit(f"[云同步] {plan.sheet} 写入已完成，但回读校验失败（网络/接口问题）：{exc}",
-                     "WARN")
-                mark("uncertain", reason=f"写入完成但回读失败：{exc}")
-                result["sheets"].append({"sheet": plan.sheet, "status": "verify_unreadable",
-                                         "reason": f"写入完成但回读失败：{exc}",
-                                         "uncertain": True})
-                if ledger is not None and pending:
-                    # 数据已写入，账本仍要记，避免下次重复写入
-                    ok, detail = _commit_ledger(
-                        ledger, plan, _ledger_entries(
-                            plan.changes, only_keys={_change_key(c) for c in pending},
-                            ledger=ledger, date_key=plan.target_date.isoformat(),
-                            file_id=plan.file_id))
-                    if not ok:
-                        mark("ledger_pending", reason=detail)
-                    batch_digest = _advance_batch_digest(ledger, batch_digest)
-                result["written"] += 1
+            def mark(status: str, **fields: Any) -> None:
+                """把某张表的状态写进意图日志；日志不可写只告警，不改变云端结论。"""
+                if journal is None:
+                    return
+                try:
+                    journal.set_sheet_status(operation_id, plan.sheet, status, **fields)
+                    journal.save()
+                except Exception as exc:  # noqa: BLE001
+                    emit(f"[云同步] {plan.sheet}：意图日志更新失败（{exc}）", "WARN")
+
+            if plan.blocked_reason:
+                # 批次日期闸门：**一个云端请求都不发**（连 sheets_info 都不调用），
+                # 写请求 = 0、账本更新 = 0、新行插入 = 0。
+                emit(f"[云同步] {plan.sheet}：整表拒绝写入 —— {plan.blocked_reason}", "ERROR")
+                mark("not_started", reason=plan.blocked_reason)
+                result["sheets"].append({"sheet": plan.sheet, "status": "blocked",
+                                         "reason": plan.blocked_reason,
+                                         "cloud_writes": 0, "ledger_updates": 0})
+                result["blocked"] = int(result.get("blocked", 0)) + 1
                 continue
-            problems: list[str] = []
-            formula_back = {}
-            if formula_cells:
-                formula_back = cli.read_formulas(
-                    plan.file_id, worksheet_id, lo, hi, c_lo, c_hi)
-            name_col = plan.columns.get("name") or 0
-            for change in pending:
-                if name_col:
-                    got_name = str(back.get((change.row - 1, name_col - 1), "")).strip()
-                    if got_name != str(change.name).strip():
-                        problems.append(f"第 {change.row} 行应为「{change.name}」，"
-                                        f"实际「{got_name}」")
-                got_mark = str(back.get((change.row - 1, plan.target_col - 1), "")).strip()
-                expected_mark = (change.target_occupied if change.target_blocked
-                                 else CELL_MARK)
-                if got_mark != expected_mark:
-                    problems.append(f"{change.name}: 目标列应为 {expected_mark!r}，"
-                                    f"实际 {got_mark!r}")
-                if plan.columns.get("total"):
-                    got_total = _as_int(back.get((change.row - 1, plan.columns["total"] - 1)))
-                    if got_total != change.total_after:
-                        problems.append(
-                            f"{change.name}: 总餐次应为 {change.total_after}，实际 {got_total}")
-                if change.kind == "new" and plan.columns.get("served") and plan.columns.get("left"):
-                    expected_served = f"=SUM({column_name(min(plan.date_cols))}{change.row}:{column_name(max(plan.date_cols))}{change.row})"
-                    expected_left = f"={column_name(plan.columns['total'])}{change.row}-{column_name(plan.columns['served'])}{change.row}"
-                    if formula_back.get((change.row - 1, plan.columns["served"] - 1)) != expected_served:
-                        problems.append(f"{change.name}: 已出餐公式未写入或不正确")
-                    if formula_back.get((change.row - 1, plan.columns["left"] - 1)) != expected_left:
-                        problems.append(f"{change.name}: 剩余餐公式未写入或不正确")
-            if problems:
-                for item in problems[:10]:
-                    emit(f"[云同步] {plan.sheet} 校验不一致：{item}")
-                mark("uncertain", reason="写入后回读校验未通过", problems=problems[:20])
-                result["sheets"].append({"sheet": plan.sheet, "status": "verify_failed",
-                                         "problems": problems[:20], "uncertain": True})
+            guard_reason = _guard_block_reason(plan, journal, ledger,
+                                               operation_id=operation_id,
+                                               expected_digest=batch_digest)
+            if guard_reason:
+                emit(f"[云同步] {plan.sheet}：拒绝写入 —— {guard_reason}", "ERROR")
+                mark("not_started", reason=guard_reason)
+                result["sheets"].append({"sheet": plan.sheet, "status": "stale_batch",
+                                         "reason": guard_reason,
+                                         "cloud_writes": 0, "ledger_updates": 0})
                 result["failed"] += 1
                 continue
-        ledger_error = ""
-        if ledger is not None and pending:
-            # 账本记录本次写入后每个人的**每槽位本地餐次**（幂等锚点）与总餐次。
-            ok, detail = _commit_ledger(
-                ledger, plan, _ledger_entries(
-                    plan.changes, only_keys={_change_key(c) for c in pending},
-                    ledger=ledger, date_key=plan.target_date.isoformat(),
-                    file_id=plan.file_id))
-            if not ok:
-                ledger_error = detail
-                emit(f"[云同步] {plan.sheet}：数据已写入但账本没记上（{detail}），"
-                     f"下一次上传可能重复加餐，请不要直接重传", "ERROR")
-            batch_digest = _advance_batch_digest(ledger, batch_digest)
-        sort_skipped = ""
-        if new_changes and not plan.sort_enabled:
-            # 具体原因（设置里关了排序 / 表格结构检查没过）由 plan.warnings 给出，
-            # 这里只保证"确实没排序"这件事在日志里有一句醒目的话。
-            sort_skipped = "本次未按地址重排整表：新客户留在表格最上面，原因见上方警告"
-        mark("ledger_pending" if ledger_error else "verified",
-             reason=ledger_error, cloud_checked=True,
-             evidence="executor_cloud_readback")
-        result["sheets"].append({"sheet": plan.sheet, "status": "ok",
-                                 "cells": len(cells), "people": len(pending),
-                                 "sorted": bool(plan.sort_enabled),
-                                 "sort_skipped": sort_skipped,
-                                 "sort_mismatch": bool(plan.sort_mismatch),
-                                 "ledger_error": ledger_error,
-                                 "ledger_updates": len(pending)})
-        if ledger_error:
-            result["failed"] += 1
-            result.setdefault("ledger_errors", []).append(
-                {"sheet": plan.sheet, "reason": ledger_error})
-        result["written"] += 1
+            if not plan.target_col:
+                mark("not_started", reason="未找到目标日期列")
+                result["sheets"].append({"sheet": plan.sheet, "status": "skipped",
+                                         "reason": "未找到目标日期列",
+                                         "cloud_writes": 0, "ledger_updates": 0})
+                continue
+            infos = cli.sheets_info(plan.file_id)
+            if not infos:
+                mark("failed_no_write", reason="云端文件不可读")
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": "云端文件不可读", "cloud_writes": 0,
+                                         "ledger_updates": 0})
+                result["failed"] += 1
+                continue
+            worksheet_id = int(infos[0].get("sheetId") or 1)
+            if any(change.needs_write for change in plan.changes):
+                # 第一次真正写入之前先把状态推进到 writing：崩溃后能看出"这张表动过"。
+                # worksheet_id 也必须记住：恢复时的只读核对要靠它定位子表。
+                mark("writing", worksheet_id=worksheet_id)
+
+            # 1) 插入新客户行：统一一块，插到第 3 行与第 4 行之间。
+            #    表里本来没有数据行时不插（写单元格会自动把表扩出来）。
+            inserted: list[tuple[int, int]] = []          # (first_row, count)，回滚用
+            new_changes = [c for c in plan.changes if c.kind == "new"]
+            block = plan.insert_blocks[0] if plan.insert_blocks else None
+            if block and not block.append_only:
+                try:
+                    cli.insert_rows(plan.file_id, worksheet_id,
+                                    row=block.first_row, count=block.count)
+                    inserted.append((block.first_row, block.count))
+                    emit(f"[云同步] {plan.sheet}：已在第 {block.first_row} 行前插入 "
+                         f"{block.count} 行（新客户）")
+                except WpsCloudError as exc:
+                    # 服务端可能**已经插入成功**而客户端只拿到了超时/断连。直接报
+                    # "未写入"会在下一次上传时重复插行，所以这里一定先只读核对：
+                    # 只有证明云端仍与写前基线一致，才允许说失败且零写入。
+                    emit(f"[云同步] {plan.sheet} 插入新行失败：{exc}；正在只读核对云端")
+                    status, fields = _classify_after_failure(
+                        cli, journal, operation_id, plan, rollback_ok=True)
+                    if status == "failed_no_write" and _looks_like_transport_error(exc):
+                        # 超时/断连/网关错误：服务端**可能已经插过行**（例如插入了空行），
+                        # 本地读回也看不见这种痕迹 —— 不能声明"未写入"。
+                        status = "uncertain"
+                        fields["manual_required"] = "insert_may_have_landed"
+                        fields["problems"] = list(fields.get("problems") or []) + [
+                            "插入请求报错发生在传输层：服务端可能已经插入过空行，"
+                            "本地读回无法证明；请人工核对表结构后再决定是否重传"]
+                    if status == "verified":
+                        mark("verified", reason=f"插入回报异常但云端期望值已完整：{exc}",
+                             **fields)
+                        result["sheets"].append({"sheet": plan.sheet, "status": "ok",
+                                                 "people": 0, "warning": "插入异常但云端已完整",
+                                                 "ledger_updates": 0})
+                        result["written"] += 1
+                        continue
+                    mark(status, reason=f"插入新行失败：{exc}", **fields)
+                    result["sheets"].append({
+                        "sheet": plan.sheet, "status": "failed",
+                        "reason": f"插入新行失败：{exc}",
+                        "uncertain": status != "failed_no_write",
+                        "cloud_writes": (0 if status == "failed_no_write" else None),
+                        "ledger_updates": 0})
+                    result["failed"] += 1
+                    continue
+
+            # 2) 排序前先写"与行号无关"的整行信息：排序后这些值会跟着行走。
+            #    必须写在 insert_row（排序前的物理行），不能写 change.row（那是排序后
+            #    的目标行号，此刻还属于别人）。
+            base_cells: list[dict[str, Any]] = []
+            for change in new_changes:
+                at = change.insert_row or change.row
+                base_cells.append({"row": at, "col": plan.columns["name"],
+                                   "value": change.name})
+                if plan.columns.get("address"):
+                    base_cells.append({"row": at, "col": plan.columns["address"],
+                                       "value": change.address})
+                base_cells.append({"row": at, "col": plan.columns["phone"],
+                                   # 电话是"值"，不是数字：纯数字电话按文本写，
+                                   # 否则 12 位号码会被平台存成数字、显示成科学计数
+                                   # （2026-10-12 医学院中餐事故）。带空格/连字符/
+                                   # +86 等形态原样写，不做任何清洗。
+                                   "value": text_cell_formula(change.phone)})
+                if plan.columns.get("type") and change.meal_type:
+                    base_cells.append({"row": at, "col": plan.columns["type"],
+                                       "value": change.meal_type})
+                if plan.columns.get("kind") and change.meal_kind:
+                    base_cells.append({"row": at, "col": plan.columns["kind"],
+                                       "value": change.meal_kind})
+            if base_cells:
+                try:
+                    cli.write_cells(plan.file_id, worksheet_id, base_cells)
+                except WpsCloudError as exc:
+                    rolled_back, deleted = _rollback_inserts(
+                        cli, plan, worksheet_id, inserted, emit,
+                        new_names={c.name for c in new_changes})
+                    emit(f"[云同步] {plan.sheet} 新客户行写入失败：{exc}")
+                    status, fields = _classify_after_failure(
+                        cli, journal, operation_id, plan, rollback_ok=rolled_back,
+                        rolled_back_rows=deleted)
+                    if status == "verified":
+                        mark("verified", reason=str(exc), **fields)
+                        result["sheets"].append({"sheet": plan.sheet, "status": "ok",
+                                                 "people": 0, "cloud_writes": None,
+                                                 "warning": "写入异常但云端期望值已完整"})
+                        result["written"] += 1
+                        continue
+                    mark(status, reason=str(exc), rollback_ok=rolled_back,
+                         **fields)
+                    result["sheets"].append({
+                        "sheet": plan.sheet, "status": "failed", "reason": str(exc),
+                        "uncertain": status != "failed_no_write",
+                        # 写过后完整回滚 ≠ 从未写入：不能声明零写入（§R10）。
+                        "rolled_back": deleted > 0,
+                        "cloud_writes": (0 if (status == "failed_no_write" and not deleted)
+                                         else None),
+                        "ledger_updates": 0})
+                    result["failed"] += 1
+                    continue
+
+            # 3) 上底色：新客户行跟着原数据行的字体/对齐；经济餐照抄模板底色（黄带位置
+            #    与老行一致）；**豪华餐整行金黄**。所有操作合并后分批，25 个新行只花
+            #    1~2 次调用。格式失败不影响数据写入结论。
+            if new_changes:
+                col_lo = plan.columns.get("name") or 1
+                col_hi = plan.columns.get("remark") or (col_lo + 12)
+                try:
+                    spec = learn_row_format(cli, plan.file_id, worksheet_id,
+                                            col_from=col_lo, col_to=col_hi,
+                                            rows=[r for r in plan.format_rows if r],
+                                            cached_fills=plan.format_fills)
+                    if spec:
+                        econ = [c.insert_row or c.row for c in new_changes
+                                if str(c.meal_kind).strip() != "豪华"]
+                        lux = [c.insert_row or c.row for c in new_changes
+                               if str(c.meal_kind).strip() == "豪华"]
+                        ops = build_format_ops(
+                            spec, econ_rows=econ, lux_rows=lux,
+                            col_from=col_lo, col_to=col_hi,
+                            # A~「餐种」整段刷底色（含日期与类型之间可能夹着的空列）
+                            plain_to=(plan.columns.get("kind")
+                                      or plan.columns.get("type") or 0),
+                            # 金黄带按列身份固定：总餐次 / 已出餐 / 剩余餐
+                            band_cols=tuple(c for c in (plan.columns.get("total"),
+                                                        plan.columns.get("served"),
+                                                        plan.columns.get("left")) if c))
+                        cli.write_format_ops(plan.file_id, worksheet_id, ops)
+                        emit(f"[云同步] {plan.sheet}：{len(new_changes)} 个新客户已套用"
+                             f"表格原有格式（字体/对齐、经济餐照抄模板底色"
+                             + ("、豪华餐整行金黄" if lux else "") + "）")
+                    else:
+                        emit(f"[云同步] {plan.sheet}：读不到参考行格式，跳过格式设置")
+                except WpsCloudError as exc:
+                    emit(f"[云同步] {plan.sheet}：格式设置失败（数据已写入）：{exc}")
+
+            # 4) 排序：写排序键（辅助列，在该表所有内容列右侧）→ 云端原地排序 → 删辅助列。
+            if plan.sort_key_col and plan.row_keys:
+                # 4a) 排序区必须覆盖表里**所有**内容列：辅助列右边若还有内容，说明它在
+                #     读取范围（MAX_SCAN_COL）之外，排序会让行与那些列错位。此时拒绝排序并
+                #     回滚插入 —— 宁可不排序，也不能把表排坏。
+                safe, found_at = probe_sort_area(
+                    cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                    row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+                if not safe:
+                    rolled_back, deleted = _rollback_inserts(
+                        cli, plan, worksheet_id, inserted, emit,
+                        new_names={c.name for c in new_changes})
+                    reason = (f"第 {plan.sort_key_col} 列右侧（{found_at}）还有内容，"
+                              "排序区覆盖不到它，已放弃排序以免行与列错位")
+                    emit(f"[云同步] {plan.sheet}：{reason}；新客户行已回滚，"
+                         "请先清理该列内容后重新上传", "ERROR")
+                    status, fields = _classify_after_failure(
+                        cli, journal, operation_id, plan, rollback_ok=rolled_back,
+                        rolled_back_rows=deleted)
+                    mark("uncertain" if status == "verified" else status,
+                         reason=reason, rollback_ok=rolled_back,
+                         **fields)
+                    result["sheets"].append({
+                        "sheet": plan.sheet, "status": "failed", "reason": reason,
+                        "uncertain": status != "failed_no_write",
+                        "rolled_back": deleted > 0})
+                    result["failed"] += 1
+                    continue
+                key_cells = [{"row": row, "col": plan.sort_key_col,
+                              "value": format_sort_key(key)}
+                             for row, key in sorted(plan.row_keys.items())]
+                try:
+                    cli.write_cells(plan.file_id, worksheet_id, key_cells)
+                    cli.sort_range(plan.file_id, worksheet_id, range_ref=plan.sort_range,
+                                   key=column_name(plan.sort_key_col), order="asc",
+                                   header=False)
+                except WpsCloudError as exc:
+                    # 排序还没生效（行还在原位）→ 插进去的新行可以整块删掉
+                    rolled_back, deleted = _rollback_inserts(
+                        cli, plan, worksheet_id, inserted, emit,
+                        new_names={c.name for c in new_changes})
+                    emit(f"[云同步] {plan.sheet} 按地址排序失败：{exc}")
+                    status, fields = _classify_after_failure(
+                        cli, journal, operation_id, plan, rollback_ok=rolled_back,
+                        rolled_back_rows=deleted)
+                    reason = f"按地址排序失败：{exc}"
+                    mark("uncertain" if status == "verified" else status,
+                         reason=reason, rollback_ok=rolled_back,
+                         **fields)
+                    result["sheets"].append({
+                        "sheet": plan.sheet, "status": "failed", "reason": reason,
+                        "uncertain": status != "failed_no_write",
+                        "rolled_back": deleted > 0})
+                    result["failed"] += 1
+                    continue
+                emit(f"[云同步] {plan.sheet}：已按地址顺序重排第 {FIRST_DATA_ROW}~"
+                     f"{plan.last_data_row} 行")
+                # 4b) 排序后复查一次：确实错位了就不要继续往这些行写数据。
+                safe, found_at = probe_sort_area(
+                    cli, plan, worksheet_id, col_from=plan.sort_key_col + 1,
+                    row_to=max(plan.last_data_row, FIRST_DATA_ROW))
+                if not safe:
+                    emit(f"[云同步] {plan.sheet}：排序后第 {plan.sort_key_col} 列右侧出现内容"
+                         f"（{found_at}），说明排序区未覆盖全部列，已停止写入后续数据。"
+                         "表已重排，请重新上传（重复执行安全）", "ERROR")
+                    reason = f"排序区未覆盖全部列（右侧有内容：{found_at}）"
+                    mark("uncertain", reason=reason)
+                    result["sheets"].append({
+                        "sheet": plan.sheet, "status": "failed",
+                        "reason": reason, "uncertain": True})
+                    result["failed"] += 1
+                    continue
+                try:
+                    cli.delete_columns(plan.file_id, worksheet_id,
+                                       column=plan.sort_key_col, rows=plan.last_data_row)
+                except WpsCloudError as exc:
+                    emit(f"[云同步] {plan.sheet}：排序辅助列（第 {plan.sort_key_col} 列）"
+                         f"删除失败，表右侧可能残留一排排序键：{exc}", "WARN")
+                    try:
+                        cli.write_cells(plan.file_id, worksheet_id, [
+                            {"row": row, "col": plan.sort_key_col, "value": ""}
+                            for row in sorted(plan.row_keys)])
+                    except WpsCloudError:
+                        pass
+
+            # 5) 重定位：整表重排后人行号全变了，必须回读（姓名,电话）重新定位。
+            #    定位失败就停手（不猜行号），此时只写了新行信息与底色，重传一次即可。
+            if plan.sort_enabled:
+                try:
+                    actual_rows = read_person_rows(cli, plan, worksheet_id,
+                                                   last_row=plan.last_data_row)
+                except WpsCloudError as exc:
+                    emit(f"[云同步] {plan.sheet} 排序后无法重新定位人员行号，已停止写入"
+                         f"（请重新上传，重复执行安全）：{exc}", "ERROR")
+                    mark("uncertain", reason=f"排序后回读失败：{exc}")
+                    result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                             "reason": f"排序后回读失败：{exc}",
+                                             "uncertain": True})
+                    result["failed"] += 1
+                    continue
+                missing = [c for c in plan.changes
+                           if person_key(c.name, c.phone) not in actual_rows]
+                if missing:
+                    names = "、".join(c.name for c in missing[:5])
+                    emit(f"[云同步] {plan.sheet} 排序后定位不到这些人：{names}，已停止写入",
+                         "ERROR")
+                    mark("uncertain", reason=f"排序后定位不到：{names}")
+                    result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                             "reason": f"排序后定位不到：{names}"})
+                    result["failed"] += 1
+                    continue
+                drift = 0
+                for change in plan.changes:
+                    key = person_key(change.name, change.phone)
+                    rows = actual_rows[key]
+                    # 一个人多行（多槽位）：第 i 个槽位对应他第 i 行，不能取同一个行号。
+                    position = max(1, int(change.slot or 1)) - 1
+                    row = rows[position] if position < len(rows) else rows[-1]
+                    predicted = plan.final_rows.get(key)
+                    if predicted and position < len(predicted) and predicted[position] != row:
+                        drift += 1
+                        if drift <= 3:
+                            emit(f"[云同步] {plan.sheet}：{change.name} 第 {change.slot} 行"
+                                 f"实际排在第 {row} 行，与预测不符（按实际行号写入）", "WARN")
+                    change.row = row
+                if drift:
+                    plan.sort_mismatch = True
+                    emit(f"[云同步] {plan.sheet}：{drift} 行的实际行号与预测不同"
+                         f"（已按实际行号写入，不影响数据正确性）", "WARN")
+
+            # 6) 其余写入：日期格 / 总餐次 / 公式 / 通讯记号
+            cells: list[dict[str, Any]] = []
+            pending: list[Change] = []
+            for change in plan.changes:
+                if not change.needs_write:
+                    continue          # 已经一致：一个字都不写
+                pending.append(change)
+                if change.total_after != change.total_before and plan.columns.get("total"):
+                    cells.append({"row": change.row, "col": plan.columns["total"],
+                                  "value": change.total_after})
+                if change.kind == "existing":
+                    if change.fill_type and plan.columns.get("type"):
+                        cells.append({"row": change.row, "col": plan.columns["type"],
+                                      "value": change.meal_type})
+                    if change.fill_kind and plan.columns.get("kind"):
+                        cells.append({"row": change.row, "col": plan.columns["kind"],
+                                      "value": change.meal_kind})
+                if not change.target_ok and not change.target_blocked:
+                    cells.append({"row": change.row, "col": change.target_col, "value": CELL_MARK})
+            formula_cells = formula_cells_for_new_rows(
+                plan, [c.row for c in pending if c.kind == "new"])
+            # 半成品行自愈：老客户缺公式的也补上（同一套公式）
+            formula_cells.extend(formula_cells_for_new_rows(
+                plan, [c.row for c in pending if c.kind == "existing" and c.fill_formula]))
+            cells.extend(formula_cells)
+            if marker_enabled and plan.marker_col:
+                cells.append({"row": HEADER_ROW, "col": plan.marker_col,
+                              "value": str(plan.weekday_number)})
+            if not cells:
+                # 没有任何待写内容（本次也没新客户，否则一定有格子要写）
+                mark("verified", reason="noop")
+                result["sheets"].append({"sheet": plan.sheet, "status": "noop",
+                                         "people": 0, "cloud_writes": 0,
+                                         "ledger_updates": 0})
+                continue
+            try:
+                cli.write_cells(plan.file_id, worksheet_id, cells)
+            except WpsCloudError as exc:
+                note = "（表已按地址重排，请重新上传；重复执行是安全的）" if plan.sort_enabled else ""
+                emit(f"[云同步] {plan.sheet} 写入失败：{exc}{note}", "ERROR")
+                mark("uncertain", reason=str(exc))
+                result["sheets"].append({"sheet": plan.sheet, "status": "failed",
+                                         "reason": str(exc), "uncertain": True})
+                result["failed"] += 1
+                continue
+
+            # 回读校验：逐格核对，而不是只抽查首尾行。
+            # （曾出现过"只抽查末尾行、恰好该行原本就是 1"导致的假阳性。）
+            rows_written = sorted({int(c["row"]) for c in cells if int(c["row"]) >= FIRST_DATA_ROW})
+            if rows_written:
+                lo, hi = rows_written[0] - 1, rows_written[-1] - 1
+                verify_cols = {plan.target_col}
+                if plan.columns.get("total"):
+                    verify_cols.add(plan.columns["total"])
+                if plan.columns.get("name"):
+                    verify_cols.add(plan.columns["name"])
+                if formula_cells:
+                    for formula_col in (plan.columns.get("served"), plan.columns.get("left")):
+                        if formula_col:
+                            verify_cols.add(formula_col)
+                c_lo, c_hi = min(verify_cols) - 1, max(verify_cols) - 1
+                try:
+                    back = cli.read_grid(plan.file_id, worksheet_id, lo, hi, c_lo, c_hi)
+                except WpsCloudError as exc:
+                    emit(f"[云同步] {plan.sheet} 写入已完成，但回读校验失败（网络/接口问题）：{exc}",
+                         "WARN")
+                    mark("uncertain", reason=f"写入完成但回读失败：{exc}")
+                    result["sheets"].append({"sheet": plan.sheet, "status": "verify_unreadable",
+                                             "reason": f"写入完成但回读失败：{exc}",
+                                             "uncertain": True})
+                    if ledger is not None and pending:
+                        # 数据已写入，账本仍要记，避免下次重复写入
+                        ok, detail = _commit_ledger(
+                            ledger, plan, _ledger_entries(
+                                plan.changes, only_keys={_change_key(c) for c in pending},
+                                ledger=ledger, date_key=plan.target_date.isoformat(),
+                                file_id=plan.file_id))
+                        if not ok:
+                            mark("ledger_pending", reason=detail)
+                        batch_digest = _advance_batch_digest(ledger, batch_digest)
+                    result["written"] += 1
+                    continue
+                problems: list[str] = []
+                formula_back = {}
+                if formula_cells:
+                    formula_back = cli.read_formulas(
+                        plan.file_id, worksheet_id, lo, hi, c_lo, c_hi)
+                name_col = plan.columns.get("name") or 0
+                for change in pending:
+                    if name_col:
+                        got_name = str(back.get((change.row - 1, name_col - 1), "")).strip()
+                        if got_name != str(change.name).strip():
+                            problems.append(f"第 {change.row} 行应为「{change.name}」，"
+                                            f"实际「{got_name}」")
+                    got_mark = str(back.get((change.row - 1, plan.target_col - 1), "")).strip()
+                    expected_mark = (change.target_occupied if change.target_blocked
+                                     else CELL_MARK)
+                    if got_mark != expected_mark:
+                        problems.append(f"{change.name}: 目标列应为 {expected_mark!r}，"
+                                        f"实际 {got_mark!r}")
+                    if plan.columns.get("total"):
+                        got_total = _as_int(back.get((change.row - 1, plan.columns["total"] - 1)))
+                        if got_total != change.total_after:
+                            problems.append(
+                                f"{change.name}: 总餐次应为 {change.total_after}，实际 {got_total}")
+                    if change.kind == "new" and plan.columns.get("served") and plan.columns.get("left"):
+                        expected_served = f"=SUM({column_name(min(plan.date_cols))}{change.row}:{column_name(max(plan.date_cols))}{change.row})"
+                        expected_left = f"={column_name(plan.columns['total'])}{change.row}-{column_name(plan.columns['served'])}{change.row}"
+                        if formula_back.get((change.row - 1, plan.columns["served"] - 1)) != expected_served:
+                            problems.append(f"{change.name}: 已出餐公式未写入或不正确")
+                        if formula_back.get((change.row - 1, plan.columns["left"] - 1)) != expected_left:
+                            problems.append(f"{change.name}: 剩余餐公式未写入或不正确")
+                if problems:
+                    for item in problems[:10]:
+                        emit(f"[云同步] {plan.sheet} 校验不一致：{item}")
+                    mark("uncertain", reason="写入后回读校验未通过", problems=problems[:20])
+                    result["sheets"].append({"sheet": plan.sheet, "status": "verify_failed",
+                                             "problems": problems[:20], "uncertain": True})
+                    result["failed"] += 1
+                    continue
+            ledger_error = ""
+            if ledger is not None and pending:
+                # 账本记录本次写入后每个人的**每槽位本地餐次**（幂等锚点）与总餐次。
+                ok, detail = _commit_ledger(
+                    ledger, plan, _ledger_entries(
+                        plan.changes, only_keys={_change_key(c) for c in pending},
+                        ledger=ledger, date_key=plan.target_date.isoformat(),
+                        file_id=plan.file_id))
+                if not ok:
+                    ledger_error = detail
+                    emit(f"[云同步] {plan.sheet}：数据已写入但账本没记上（{detail}），"
+                         f"下一次上传可能重复加餐，请不要直接重传", "ERROR")
+                batch_digest = _advance_batch_digest(ledger, batch_digest)
+            sort_skipped = ""
+            if new_changes and not plan.sort_enabled:
+                # 具体原因（设置里关了排序 / 表格结构检查没过）由 plan.warnings 给出，
+                # 这里只保证"确实没排序"这件事在日志里有一句醒目的话。
+                sort_skipped = "本次未按地址重排整表：新客户留在表格最上面，原因见上方警告"
+            mark("ledger_pending" if ledger_error else "verified",
+                 reason=ledger_error, cloud_checked=True,
+                 evidence="executor_cloud_readback")
+            result["sheets"].append({"sheet": plan.sheet, "status": "ok",
+                                     "cells": len(cells), "people": len(pending),
+                                     "sorted": bool(plan.sort_enabled),
+                                     "sort_skipped": sort_skipped,
+                                     "sort_mismatch": bool(plan.sort_mismatch),
+                                     "ledger_error": ledger_error,
+                                     "ledger_updates": len(pending)})
+            if ledger_error:
+                result["failed"] += 1
+                result.setdefault("ledger_errors", []).append(
+                    {"sheet": plan.sheet, "reason": ledger_error})
+            result["written"] += 1
+        except Exception as exc:  # noqa: BLE001 - 兜底见 _abort_sheet 的说明
+            _abort_sheet(plan, exc, emit, mark, result)
+            continue
     if ledger is not None:
         try:
             ledger.save()

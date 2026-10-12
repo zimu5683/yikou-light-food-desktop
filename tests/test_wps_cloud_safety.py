@@ -24,6 +24,13 @@ BASE_HEADER = {0: "名字", 1: "地址", 2: "电话", 3: "9.10 周四",
                8: "已出餐", 9: "剩余餐", 10: "备注"}
 
 
+def _grid_text(value):
+    """把格子载荷转成文本：允许用例传 ``{"text": ...}`` 模拟带格式读取。"""
+    if isinstance(value, dict):
+        return str(value.get("text", ""))
+    return str(value)
+
+
 def make_grid(header, rows):
     grid = {}
     for col, text in header.items():
@@ -61,8 +68,8 @@ class FakeCli:
         hits = {k: v for k, v in self.grid.items()
                 if row_from <= k[0] <= row_to and col_from <= k[1] <= col_to}
         if with_format:
-            return {k: {"text": str(v), "fill": ""} for k, v in hits.items()}
-        return hits
+            return {k: {"text": _grid_text(v), "fill": ""} for k, v in hits.items()}
+        return {k: _grid_text(v) for k, v in hits.items()}
 
     def write_cells(self, file_id, ws, cells):
         if self.fail_write:
@@ -340,22 +347,79 @@ def test_cloud_failures_never_raise_out_of_apply_plan(tmp_path, kwargs):
     assert isinstance(result["sheets"], list) and result["sheets"][0]["status"] != "ok"
 
 
-def test_unexpected_exception_propagates_out_of_apply_plan(tmp_path):
-    """记录实际分层：``apply_plan`` **只吞 WpsCloudError**，其它意外异常照抛。
+def test_unexpected_exception_is_contained_to_its_own_sheet():
+    """未预期异常只把**这张表**记成结果未知，排在后面的表照常写入。
 
-    这不是缺陷 —— 它是纯云端逻辑层，让编程错误暴露出来更好排查；真正的安全边界在
-    上一层 ``Bridge.wps_upload``（见下一条）。写下来免得后人误以为这层也兜底。
+    2026-10-12 需求「表间独立上传」：原先 ``apply_plan`` 只吞 ``WpsCloudError``，
+    其它异常会跳出逐表循环 —— 一张表出意外，排在它后面的表一张都不写。
+
+    记 uncertain 而不是 failed 是刻意的不对称：异常可能发生在任何一个云端请求
+    之后，本地无法证明"一个格子都没写"；记错方向的代价是重复加餐，所以宁可多一次
+    人工核对。
     """
     cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
-    plans = _plans(cli)
 
-    def boom(*_a, **_k):
-        raise KeyError("坏数据")
+    target = dt.date(2026, 9, 11)
+
+    def plan_for(file_id, name, phone):
+        return build_plan(cli, local_orders={"东湖中餐": [
+            CloudOrder("东湖中餐", name, "小", phone, "中餐", "经济", 7)]},
+            tables={"东湖中餐": {"file_id": file_id}},
+            target=target, ledger=None, address_order={}, sort_enabled=False)
+
+    bad = plan_for("F2", "老客户二", "222")
+    good = plan_for("F1", "老客户", "111")
+
+    real_write = cli.write_cells
+
+    def boom(file_id, ws, cells):
+        if file_id == "F2":
+            raise KeyError("坏数据")
+        return real_write(file_id, ws, cells)
 
     cli.write_cells = boom  # type: ignore[method-assign]
+    messages: list[tuple[str, str]] = []
+    result = apply_plan(cli, [*bad, *good], ledger=None, marker_enabled=False,
+                        log=lambda msg, level="INFO": messages.append((msg, level)))
 
-    with pytest.raises(KeyError):
-        apply_plan(cli, plans, ledger=None, marker_enabled=False)
+    assert len(result["sheets"]) == 2, "两张表都要有各自的结论"
+    assert result["sheets"][0]["status"] == "failed" and result["sheets"][0]["uncertain"]
+    assert "KeyError" in result["sheets"][0]["reason"]
+    # 关键断言：排在后面的表没有被第一张表的意外异常带停
+    assert result["sheets"][1]["status"] == "ok", result["sheets"]
+    assert any("其余表继续" in msg and level == "ERROR"
+               for msg, level in messages), messages
+
+
+def test_unexpected_exception_still_writes_the_following_sheets():
+    """同一场景走真实写入路径：后面的表**真的**把数据写进云端。"""
+    cli = FakeCli(make_grid(BASE_HEADER, _existing_rows()))
+
+    target = dt.date(2026, 9, 11)
+
+    def plan_for(file_id, name, phone):
+        return build_plan(cli, local_orders={"东湖中餐": [
+            CloudOrder("东湖中餐", name, "小", phone, "中餐", "经济", 7)]},
+            tables={"东湖中餐": {"file_id": file_id}},
+            target=target, ledger=None, address_order={}, sort_enabled=False)
+
+    bad = plan_for("F2", "老客户二", "222")
+    good = plan_for("F1", "老客户", "111")
+
+    real_write = cli.write_cells
+
+    def maybe_boom(file_id, ws, cells):
+        if file_id == "F2":
+            raise KeyError("坏数据")
+        return real_write(file_id, ws, cells)
+
+    cli.write_cells = maybe_boom  # type: ignore[method-assign]
+    result = apply_plan(cli, [*bad, *good], ledger=None, marker_enabled=False)
+
+    assert result["failed"] == 1 and result["written"] == 1
+    assert result["sheets"][1]["status"] == "ok"
+    # 第二张表的目标日期格（9.11 周五 = 第 5 列，0-based 4）真的写进去了
+    assert cli.grid[(2, 4)] == "1", "后面的表必须真的写出去了"
 
 
 def test_wps_upload_swallows_every_exception(tmp_path, monkeypatch):
