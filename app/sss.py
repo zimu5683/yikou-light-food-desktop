@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from threading import Lock, local
-from typing import Any, Callable, Iterable, NamedTuple
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urlencode
 
 try:
@@ -46,11 +46,7 @@ try:
     )
     from .locators import SSS_LOCATORS, load_sss_locators
     from .sss_import import ImportRefused, prepare_day_orders
-    from .sss_journal import (UncertainJournalError, append_records, batch_key,
-                              batch_submission_lock, blocking_state,
-                              default_uncertain_path, discard_records,
-                              load_journal, pending_records,
-                              platform_origin, resolve_records)
+    from .sss_url import SssUrlConfigError, canonical_sss_origin
 except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from api_client import (ApiError, SssApiClient, SssTransportError,
                             auth_error_message, is_auth_expired_payload,
@@ -66,11 +62,7 @@ except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     )
     from locators import SSS_LOCATORS, load_sss_locators
     from sss_import import ImportRefused, prepare_day_orders
-    from sss_journal import (UncertainJournalError, append_records, batch_key,
-                            batch_submission_lock, blocking_state,
-                            default_uncertain_path, discard_records,
-                            load_journal, pending_records,
-                            platform_origin, resolve_records)
+    from sss_url import SssUrlConfigError, canonical_sss_origin
 
 DEFAULT_SHEETS = ("午餐", "晚餐")
 LUNCH_TIME = "11:00:00"
@@ -2191,137 +2183,6 @@ def _merge_reconciliation(preconfirmed: set[str], current: _Reconciliation) -> _
     )
 
 
-class _JournalHooks:
-    """把"提交前写意图、提交后定状态、对账后清账"三件事包成一组钩子。
-
-    之所以抽出来：纯 HTTP 与 Playwright 两条提交路径都会调用
-    :func:`_run_reconciled_submission`，未决机制必须**同时覆盖两条路径**，
-    否则换个模式就能绕过阻断。``path`` 为空时全部退化成空操作（只在没有
-    权威日志的调用场景，例如库用户直接调用）。
-
-    失败语义：意图**写不下去就不许发 POST**（``prepare`` 返回 False →
-    调用方必须停止本批），因为"发出去但没留痕"正是重复下单的根源。
-    """
-
-    def __init__(self, path: str | os.PathLike[str] | None, *, key: str,
-                 meta: dict[str, Any] | None = None,
-                 emit: Callable[[str], Any] | None = None) -> None:
-        self.path = str(path) if path else ""
-        self.key = str(key or "")
-        self.meta = dict(meta or {})
-        self._emit = emit
-        self.error = ""
-        self.ids: set[str] = set()
-        # 是否**至少成功写过一次**意图：决定了"日志坏了"是"本批没提交"
-        # 还是"已经提交过、但留痕不可信"——后者必须按结果未知处理。
-        self.prepared_any = False
-
-    # ---- 提交前 ----
-    def prepare(self, round_tasks: list[dict[str, Any]]) -> bool:
-        """把本轮任务写成 ``inflight``；失败返回 False（调用方必须停止）。"""
-        if not self.path or not round_tasks:
-            return True
-        entries = [self._entry(task, "提交前置记录：POST 即将发出，等待响应/对账",
-                              status="inflight")
-                   for task in round_tasks]
-        try:
-            append_records(self.path, self.key, entries, meta=self.meta)
-        except Exception as exc:  # noqa: BLE001 - 留痕失败就不能发请求
-            self.error = f"本地未决日志写入失败：{exc}"
-            if self._emit:
-                self._emit(self.error + "；为避免重复下单，本批不会发出任何请求")
-            return False
-        self.ids.update(str(task.get("identifier") or "") for task in round_tasks)
-        self.prepared_any = True
-        return True
-
-    # ---- 本轮结束后 ----
-    def finalize(self, round_tasks: list[dict[str, Any]],
-                 result: _SubmitResult) -> bool:
-        """本轮结束后的状态修正：明确未落单的 discard，已发出的保持 active。
-
-        ``failures`` 是**拿到确定拒绝响应**（``success=false``）的任务 —— 服务端
-        明确没接单，可以关闭记录；超时/断线（``uncertain``）与"返回 success 但
-        站内还没对账"的任务一律保持 active，直到站内只读对账确认。
-        """
-        if not self.path:
-            return True
-        round_ids = {str(task.get("identifier") or "") for task in round_tasks}
-        active = self.ids & round_ids
-        if not active:
-            return True
-        rejected = {identifier for identifier, _detail in result.failures}
-        sent_unknown = active - rejected
-        try:
-            if sent_unknown:
-                entries = [self._entry(task, "POST 已发出，等待站内只读对账确认",
-                                      status="unresolved")
-                           for task in round_tasks
-                           if str(task.get("identifier") or "") in sent_unknown]
-                append_records(self.path, self.key, entries, meta=self.meta)
-            if rejected:
-                discard_records(
-                    self.path, self.key, rejected,
-                    reason="服务端明确拒绝下单（返回 success=false），未落单")
-                self.ids.difference_update(rejected)
-        except Exception as exc:  # noqa: BLE001
-            self.error = f"本地未决日志更新失败：{exc}"
-            if self._emit:
-                self._emit(self.error + "；已停止后续提交，只允许只读对账")
-            return False
-        return True
-
-    # ---- 站内确认后 ----
-    def resolve(self, identifiers: Iterable[str], *, note: str = "") -> bool:
-        """站内只读对账确认这些单已有 → 标记 ``resolved``（解除阻断）。"""
-        if not self.path:
-            return True
-        wanted = sorted({str(item) for item in identifiers if str(item or "")})
-        if not wanted:
-            return True
-        try:
-            resolve_records(self.path, self.key, wanted, note=note)
-        except Exception as exc:  # noqa: BLE001
-            self.error = f"本地未决日志清理失败：{exc}"
-            if self._emit:
-                self._emit(self.error + "；为避免重复提交，已停止恢复流程")
-            return False
-        self.ids.difference_update(wanted)
-        return True
-
-    def discard(self, identifiers: Iterable[str], reason: str) -> bool:
-        """明确未派发/明确未落单时关闭记录（有充分证据才允许）。"""
-        if not self.path:
-            return True
-        wanted = sorted({str(item) for item in identifiers if str(item or "")})
-        if not wanted:
-            return True
-        try:
-            discard_records(self.path, self.key, wanted, reason=reason)
-        except Exception as exc:  # noqa: BLE001
-            self.error = f"本地未决日志清理失败：{exc}"
-            return False
-        self.ids.difference_update(wanted)
-        return True
-
-    def _entry(self, task: dict[str, Any], error: str, *, status: str
-               ) -> dict[str, Any]:
-        fingerprint = task.get("fingerprint")
-        return {
-            "identifier": str(task.get("identifier") or ""),
-            "client_request_id": str(task.get("client_request_id") or ""),
-            "sheet": str(task.get("sheet") or ""),
-            "batch_id": str(task.get("batch_id") or ""),
-            "fingerprint": (fingerprint.as_dict()
-                            if isinstance(fingerprint, OrderFingerprint)
-                            else dict(fingerprint or {})),
-            "error": error,
-            "status": status,
-            "account": str(task.get("account") or ""),
-            "platform": str(self.meta.get("platform") or ""),
-        }
-
-
 def _run_reconciled_submission(
         tasks: list[dict[str, Any]],
         submit_factory: Callable[[], tuple[Callable[[dict[str, Any]], dict[str, Any]], Callable[[], None]]],
@@ -2331,7 +2192,6 @@ def _run_reconciled_submission(
         decision_callback: Callable[[str, str], str] | None,
         max_workers: int,
         relogin: Callable[[], None] | None = None,
-        journal: "_JournalHooks | None" = None,
         submit_min_interval_s: float = 0.0,
         ) -> tuple[_Reconciliation | None, bool]:
     """执行"先对账、提交、再对账"的至少一次语义。
@@ -2343,10 +2203,6 @@ def _run_reconciled_submission(
     ``submit_min_interval_s`` > 0 时，每轮提交的相邻 POST 起点至少间隔该值
     （见 `_SubmitPacer`；每轮新建一个节流器，0 = 关闭）。节流只影响发送节奏，
     不改变分类、记录与重发语义。
-
-    ``journal`` 非空时：每个 POST 在发出前先落一条 ``inflight`` 记录，
-    本轮结束后未获确认的保持活跃；站内确认后才 ``resolved``。任何一步写盘
-    失败都会让本批**停止提交**（留不下证据就不许发请求）。
     """
     batch_started_at = time.time()
     batch_window_start = batch_started_at - _BATCH_CLOCK_SKEW_S
@@ -2366,63 +2222,19 @@ def _run_reconciled_submission(
     all_errors: dict[str, str] = {}
     balance_error = ""
 
-    def journal_blocked() -> bool:
-        """留痕失败后必须立即停：把剩余任务记成错误并以站内对账为准。"""
-        if journal is None or not journal.error:
-            return False
-        stop_event.set()
-        all_errors.update({task["identifier"]: journal.error for task in current})
-        return True
-
-    def journal_settle(identifiers: list[str], label: str) -> bool:
-        """清账失败要当作对账失败处理（否则阻断状态与站内事实不一致）。"""
-        if journal is None:
-            return True
-        if not journal.resolve(identifiers, note=f"站内只读对账确认：{label}"):
-            _emit(callback, journal.error + "；本次不解除阻断，请人工核对")
-            stop_event.set()
-            return False
-        return True
-
     def reconcile(round_tasks: list[dict[str, Any]], label: str, **options: Any
                   ) -> "_Reconciliation | None":
-        """只读对账，并把站内已确认的订单在未决日志里标记 ``resolved``。
-
-        这是解除阻断的**唯一**自动途径：只有"站内确实已经有这一单"才算确认；
-        "查不到"（missing）与"查失败"（返回 None）都保持 active。
-        """
-        reconciliation = _safe_reconcile(round_tasks, fetch_json, callback, label,
-                                        **options)
-        if reconciliation is not None and reconciliation.confirmed:
-            if not journal_settle(sorted(reconciliation.confirmed), label):
-                return None
-        return reconciliation
+        """只读对账；"查不到"（missing）与"查失败"（返回 None）都如实返回。"""
+        return _safe_reconcile(round_tasks, fetch_json, callback, label, **options)
 
     def submit_round(round_tasks: list[dict[str, Any]], workers: int) -> _SubmitResult:
-        if journal is not None and not journal.prepare(round_tasks):
-            result = _SubmitResult()
-            result.stopped = True
-            stop_event.set()
-            return result
         submit, close = submit_factory()
         try:
-            result = _submit_tasks_concurrent(round_tasks, submit, stop_event,
-                                             callback, workers, on_stop=close,
-                                             min_interval_s=submit_min_interval_s)
+            return _submit_tasks_concurrent(round_tasks, submit, stop_event,
+                                            callback, workers, on_stop=close,
+                                            min_interval_s=submit_min_interval_s)
         finally:
             close()
-        if journal is not None:
-            journal.finalize(round_tasks, result)
-            # 明确"没派发"的任务（停止/401/余额不足在派发前就被拦下）关闭记录，
-            # 否则它们会永远阻断下一次运行。
-            unsent = [task["identifier"] for task in round_tasks
-                      if not result.stopped and task["identifier"] not in
-                      ({i for i, _d in result.failures}
-                       | {i for i, _d in result.uncertain}
-                       | result.succeeded)]
-            if unsent:
-                journal.discard(unsent, "本批未派发（停止/登录态/余额保护）")
-        return result
 
     preconfirmed = set(initial.confirmed)
     current = list(initial.missing)
@@ -2435,7 +2247,6 @@ def _run_reconciled_submission(
     if first.balance_error:
         _emit(callback, f"余额不足，已停止后续下单：{first.balance_error}")
         stop_event.set()
-    journal_blocked()
 
     # 401 只能统一重登一次；重登后先对账，再仅提交确认仍缺失的任务。
     if first.auth_error and not stop_event.is_set() and relogin is not None:
@@ -2542,35 +2353,45 @@ def _run_reconciled_submission(
 
 
 def _final_status_fields(*, processed: int, created: int, stopped: bool,
-                         partial: bool, reconciled: bool, pending_active: int,
-                         journal_error: str = "", prepared_any: bool = False,
+                         partial: bool, reconciled: bool,
                          idempotency_field: str = "") -> dict[str, Any]:
-    """收尾状态：把"订单结果"与"本地留痕是否可信"分开表达。
+    """收尾状态：把"订单结果"与"是否完成站内对账"分开表达。
 
-    * ``pending_active`` > 0：本批有未结案的未决记录 → 结果未知，下一步做只读核对；
-    * ``journal_error`` 非空：未决日志写不下去 —— 如果本批**已经提交过**，
-      必须在结果里标成未知（留痕不可信）；如果一次都没提交，则明确是
-      "本批未提交、日志不可用"，让用户先去修日志而不是重跑。
+    ``reconciled`` 为假（收尾对账失败）时结果按未知处理：订单是否创建无法从
+    平台得到确定回答，绝不能显示成一次干净的失败。
     """
-    fields: dict[str, Any] = {
+    return {
         "processed": processed,
         "created": created,
         "stopped": stopped,
         "partial": partial,
         "reconciled": reconciled,
-        "uncertain": bool(not reconciled or pending_active
-                          or (journal_error and prepared_any)),
-        "uncertain_pending": max(0, pending_active),
-        "next_action": ("start_sss_review" if pending_active
-                        else "fix_journal" if journal_error else ""),
+        "uncertain": bool(not reconciled),
         "semantics": ("idempotency-key+reconciliation"
                       if idempotency_field else "at-least-once+reconciliation"),
     }
-    if journal_error:
-        fields["journal_error"] = journal_error
-        fields["status"] = ("uncertain_partial_journal" if prepared_any
-                            else "journal_unavailable")
-    return fields
+
+
+def _emit_sss_completion(callback: Callable[[str], Any] | None, *, processed: int,
+                         created: int, stopped: bool, partial: bool,
+                         reconciled: bool, job_start: float,
+                         idempotency_field: str) -> dict[str, Any]:
+    """收尾播报与结果字段（纯接口/浏览器两条分支共用，避免话术漂移）。"""
+    if stopped:
+        _emit(callback,
+              f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
+              f"确认 {created}/{processed}")
+    elif partial:
+        _emit(callback,
+              f"闪时送任务部分完成：确认 {created}/{processed}，"
+              f"{processed - created} 单未完成")
+    else:
+        _emit(callback,
+              f"闪时送下单完成：确认 {created}/{processed}，"
+              f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
+    return _final_status_fields(
+        processed=processed, created=created, stopped=stopped, partial=partial,
+        reconciled=reconciled, idempotency_field=idempotency_field)
 
 
 def _exclusive_sss_job(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -2643,55 +2464,14 @@ def run_sss_job(config: Any, stop_event: Any,
         orders_by_sheet = load_sss_orders(excel_path)
 
     def _result(payload: dict[str, Any]) -> dict[str, Any]:
-        """给结果补上名单来源、云端导入摘要与未决日志信息（界面/日志用）。"""
+        """给结果补上名单来源与云端导入摘要（界面/日志用）。"""
         payload["source"] = source
-        payload["uncertain_journal"] = journal_info
         if import_summary is not None:
             payload["import"] = import_summary
         return payload
 
-    def _pending_journal_count() -> int:
-        """本次运行结束后仍然活跃（会阻断下一次运行）的未决记录数。"""
-        try:
-            records = load_journal(journal_path).get("records", [])
-        except UncertainJournalError:
-            return -1
-        return len(pending_records(records, journal_info["batch_key"]))
-
-    def _blocked_result(block: dict[str, Any]) -> dict[str, Any]:
-        """未决记录阻断：**没有登录、没有发出任何下单请求**。"""
-        _emit(progress_callback, "错误：" + block["reason"])
-        _emit(progress_callback,
-              "已安全停止：本次不会发送任何下单请求。请用「只读核对」确认站内订单，"
-              "或人工处置未决记录后再运行。")
-        return _result({
-            "status": "blocked_by_uncertain",
-            "processed": 0, "created": 0, "submitted": 0, "previewed": 0,
-            "stopped": True, "partial": False, "reconciled": False,
-            "uncertain": True, "blocked": True,
-            "block_code": block.get("code") or "",
-            "block_reason": block.get("reason") or "",
-            "uncertain_counts": {
-                "same_scope": len(block.get("same_scope") or []),
-                "cross_scope": len(block.get("cross_scope") or []),
-                "other_pending": len(block.get("other_pending") or []),
-            },
-            "semantics": "blocked-by-uncertain-journal",
-        })
-
-    # ---- 平台身份与未决日志路径（在任何登录/POST 之前冻结） ----
+    # ---- 平台身份与网址校验（在任何登录/POST 之前） ----
     account = str(getattr(config, "sss_account", "") or "")
-    delivery_date_text = expected_delivery_date(now).isoformat()
-    journal_path = default_uncertain_path(config)
-    journal_info: dict[str, Any] = {
-        "path": str(journal_path),
-        "batch_key": batch_key(delivery_date_text, "", account),
-        "delivery_date": delivery_date_text,
-        "blocked": False,
-        "code": "",
-        "block_reason": "",
-        "active": 0,
-    }
     _validate_sss_orders(orders_by_sheet)
     total = sum(len(orders) for orders in orders_by_sheet.values())
     if total == 0:
@@ -2704,39 +2484,22 @@ def run_sss_job(config: Any, stop_event: Any,
     _emit(progress_callback,
           f"读取订单表耗时 {(time.perf_counter() - load_start):.1f} 秒，共 {total} 单")
 
-    # ---- 未决日志闸门：在**任何登录/POST 之前**判定是否允许本次运行 ----
-    # 网址先严格校验：非法写法会在下一步 fail-closed，绝不为它另建一个 scope。
+    # ---- 网址闸门：在**任何登录/POST 之前**严格校验配置的闪时送网址 ----
+    timeout_ms = int(getattr(config, "element_timeout_ms", 8000))
     try:
-        frozen_origin = platform_origin(config)
-    except UncertainJournalError as exc:
+        read_timeout_s = float(getattr(config, "sss_read_timeout_s", 20.0))
+    except (TypeError, ValueError):
+        read_timeout_s = 20.0
+    read_timeout_s = max(1.0, min(120.0, read_timeout_s))
+    url = str(getattr(config, "sss_url", "") or "").strip() or DEFAULT_SSS_URL
+    try:
+        canonical_sss_origin(url)
+    except SssUrlConfigError as exc:
         _emit(progress_callback, "错误：" + str(exc))
         return _result({"status": "url_config_error", "processed": 0, "created": 0,
                         "submitted": 0, "previewed": 0, "stopped": True,
-                        "partial": False, "reconciled": False, "uncertain": True,
+                        "partial": False, "reconciled": False, "uncertain": False,
                         "reason": str(exc)})
-    try:
-        block = blocking_state(journal_path, delivery_date=delivery_date_text,
-                               account=account, origin=frozen_origin)
-    except UncertainJournalError as exc:
-        # 日志损坏/不可读：失败关闭。绝不把它当成"没有未决记录"。
-        _emit(progress_callback,
-              f"错误：本地未决日志不可用（{exc}）：为避免重复下单，"
-              f"本次不会发送任何请求。请先人工核对站内订单并修复该文件。")
-        return _result({"status": "uncertain_journal_unreadable", "processed": 0,
-                        "created": 0, "submitted": 0, "previewed": 0,
-                        "stopped": True, "partial": False, "reconciled": False,
-                        "uncertain": True, "reason": str(exc)})
-    journal_info["origin"] = frozen_origin
-    journal_info["counts"] = {
-        "same_scope": len(block.get("same_scope") or []),
-        "cross_scope": len(block.get("cross_scope") or []),
-        "other_pending": len(block.get("other_pending") or []),
-    }
-    journal_info["active"] = (journal_info["counts"]["same_scope"]
-                             + journal_info["counts"]["cross_scope"])
-    journal_info["blocked"] = bool(block.get("blocked"))
-    journal_info["code"] = str(block.get("code") or "")
-    journal_info["block_reason"] = str(block.get("reason") or "")
     if password is None:
         password = ""
     dry_run = bool(getattr(config, "sss_dry_run", False))
@@ -2750,83 +2513,6 @@ def run_sss_job(config: Any, stop_event: Any,
     batch_id = uuid.uuid4().hex[:12]
     idempotency_field = str(getattr(config, "sss_idempotency_field", "") or _CLIENT_IDEMPOTENCY_FIELD).strip()
 
-    journal_hooks = _JournalHooks(
-        journal_path, key=journal_info["batch_key"],
-        meta={"delivery_date": delivery_date_text, "account": account,
-              "platform": frozen_origin, "source": source,
-              "batch_started_at": time.time()},
-        emit=progress_callback)
-
-    def _begin_submission() -> tuple[bool, Any]:
-        """真实提交前的最后闸门：未决阻断 + 批次互斥锁。
-
-        顺序很重要：**先看未决日志、再抢锁**，两者都在任何 POST 之前完成。
-        未决阻断返回的是"安全停止"结果（没有登录、没有下单请求）。
-
-        抢锁失败必须 fail-closed：日志目录不可写、锁原语不可用、别的进程正在跑
-        同一批次 —— 三种情况都不允许继续发 POST。这里捕获 **Exception** 而不是
-        只捕 :class:`UncertainJournalError`：``FileLock`` 抛出的
-        ``AtomicWriteError`` / ``OSError`` 同样意味着"无法证明独占"，必须转成
-        结构化结果而不是让异常穿透整个任务。
-        """
-        if block.get("blocked"):
-            return False, _blocked_result(block)
-        try:
-            lock = batch_submission_lock(journal_path, journal_info["batch_key"])
-        except UncertainJournalError as exc:
-            _emit(progress_callback, "错误：" + str(exc))
-            return False, _result({
-                "status": "concurrent_batch", "processed": 0, "created": 0,
-                "submitted": 0, "previewed": 0, "stopped": True, "partial": False,
-                "reconciled": False, "uncertain": True,
-                "reason": str(exc), "semantics": "single-batch-lock",
-            })
-        except Exception as exc:  # noqa: BLE001 - 拿不到独占就不能发 POST
-            message = (f"无法取得下单批次互斥锁（{type(exc).__name__}: {exc}）："
-                       f"为避免两个批次同时提交同一批订单，本次不会发送任何请求。"
-                       f"请检查 {journal_path} 所在目录是否可写。")
-            _emit(progress_callback, "错误：" + message)
-            return False, _result({
-                "status": "journal_unavailable", "processed": 0, "created": 0,
-                "submitted": 0, "previewed": 0, "stopped": True, "partial": False,
-                "reconciled": False, "uncertain": True,
-                "reason": message, "semantics": "single-batch-lock",
-            })
-        # 取得批次锁后**再读一次**权威状态：先读阻断、后取锁之间有一整个窗口，
-        # 另一个进程可能正好在窗口里留下未决记录（或者把记录处置掉）。锁内重读
-        # 才是权威结论；读取失败一律 fail-closed（不登录、不发单）。
-        try:
-            fresh = blocking_state(journal_path, delivery_date=delivery_date_text,
-                                   account=account, origin=frozen_origin)
-        except UncertainJournalError as exc:
-            lock.release()
-            _emit(progress_callback,
-                  f"错误：取得批次锁后无法重读未决日志（{exc}）："
-                  f"为避免重复下单，本次不会发送任何请求。")
-            return False, _result({
-                "status": "uncertain_journal_unreadable", "processed": 0,
-                "created": 0, "submitted": 0, "previewed": 0, "stopped": True,
-                "partial": False, "reconciled": False, "uncertain": True,
-                "reason": str(exc)})
-        if fresh.get("blocked"):
-            lock.release()
-            _emit(progress_callback,
-                  "取得批次锁后发现新的未决记录（可能来自另一个窗口/进程）："
-                  "本次不会发送任何请求。")
-            return False, _blocked_result(fresh)
-        return True, lock
-
-    # 干跑短路：组装报文即返回，不取验证码、不登录、不查门店地址。
-    timeout_ms = int(getattr(config, "element_timeout_ms", 8000))
-    try:
-        read_timeout_s = float(getattr(config, "sss_read_timeout_s", 20.0))
-    except (TypeError, ValueError):
-        read_timeout_s = 20.0
-    read_timeout_s = max(1.0, min(120.0, read_timeout_s))
-    url = str(getattr(config, "sss_url", "") or "").strip() or DEFAULT_SSS_URL
-    if block.get("blocked"):
-        _emit(progress_callback,
-              f"注意：本批次当前处于阻断状态 —— {block['reason']}")
     if dry_run:
         store_id = _cached_store_id(config, store_name) or 0
         if store_id:
@@ -2842,11 +2528,6 @@ def run_sss_job(config: Any, stop_event: Any,
             account=str(getattr(config, "sss_account", "") or ""),
             batch_id=batch_id, idempotency_field=idempotency_field, now=now)
         return _result(_run_dry_run(tasks, progress_callback))
-
-    if block.get("blocked"):
-        # 硬阻断：放在**登录之前**。登录本身要发请求，还会打扰用户输验证码；
-        # 未决记录的问题不需要登录就能判定，这里直接安全停止。
-        return _blocked_result(block)
 
     if locators is None:
         locators = load_sss_locators()
@@ -2940,9 +2621,6 @@ def run_sss_job(config: Any, stop_event: Any,
                     "semantics": "preflight-only",
                 })
 
-            allowed, lock = _begin_submission()
-            if not allowed:
-                return lock
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，创建订单 {max_workers} 路"
                   f"{'串行' if max_workers == 1 else '并发'}提交，"
@@ -2950,21 +2628,17 @@ def run_sss_job(config: Any, stop_event: Any,
                   + (f"，提交最小间隔 {submit_min_interval_s:g}s"
                      if submit_min_interval_s > 0 else ""))
             submit_start = time.perf_counter()
-            try:
-                final, reconciled = _run_reconciled_submission(
-                    tasks,
-                    lambda: _make_api_submitter(client),
-                    client.get_json,
-                    stop_event,
-                    progress_callback,
-                    decision_callback,
-                    max_workers,
-                    relogin=relogin,
-                    journal=journal_hooks,
-                    submit_min_interval_s=submit_min_interval_s,
-                )
-            finally:
-                lock.release()
+            final, reconciled = _run_reconciled_submission(
+                tasks,
+                lambda: _make_api_submitter(client),
+                client.get_json,
+                stop_event,
+                progress_callback,
+                decision_callback,
+                max_workers,
+                relogin=relogin,
+                submit_min_interval_s=submit_min_interval_s,
+            )
             created = len(final.confirmed) if final is not None else 0
             processed = len(tasks)
             _emit(progress_callback,
@@ -2983,25 +2657,10 @@ def run_sss_job(config: Any, stop_event: Any,
             _emit(progress_callback, "结束" + _format_balance(end_total, end_frozen))
             stopped = bool(stop_event.is_set())
             partial = bool(reconciled and final is not None and final.missing and not stopped)
-            if stopped:
-                _emit(progress_callback,
-                      f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
-                      f"确认 {created}/{processed}")
-            elif partial:
-                _emit(progress_callback,
-                      f"闪时送任务部分完成：确认 {created}/{processed}，"
-                      f"{processed - created} 单未完成")
-            else:
-                _emit(progress_callback,
-                      f"闪时送下单完成：确认 {created}/{processed}，"
-                      f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
-            pending_active = _pending_journal_count()
-            result: dict[str, Any] = _final_status_fields(
-                processed=processed, created=created, stopped=stopped, partial=partial,
-                reconciled=reconciled, pending_active=pending_active,
-                journal_error=journal_hooks.error,
-                prepared_any=journal_hooks.prepared_any,
-                idempotency_field=idempotency_field)
+            result: dict[str, Any] = _emit_sss_completion(
+                progress_callback, processed=processed, created=created,
+                stopped=stopped, partial=partial, reconciled=reconciled,
+                job_start=job_start, idempotency_field=idempotency_field)
             if balance_total is not None:
                 result["balance_total"] = balance_total
             if end_total is not None:
@@ -3120,9 +2779,6 @@ def run_sss_job(config: Any, stop_event: Any,
                     "estimate": estimate,
                     "semantics": "preflight-only",
                 })
-            allowed, lock = _begin_submission()
-            if not allowed:
-                return lock
             _emit(progress_callback,
                   f"开始下单：共 {len(tasks)} 单，浏览器表单模式（创建订单弹窗）串行提交"
                   + (f"，提交最小间隔 {submit_min_interval_s:g}s"
@@ -3136,7 +2792,7 @@ def run_sss_job(config: Any, stop_event: Any,
 
                 * 最终确定点击**之前**的任何失败（按钮/输入框定位不到、送达时间
                   确定失败等）→ 普通异常按 ``failure`` 处理 —— 此刻确定没有创建
-                  订单，未决日志按“未落单”关闭，可安全人工重试；
+                  订单，可安全人工重试；
                 * 最终确定点击后无法确认弹窗收场 → ``_SubmissionUncertain``，
                   结果未知，由站内只读对账定论，绝不自动重发；
                 * 「创建订单」按钮消失 → ``_AuthExpired``，触发统一重登。
@@ -3148,23 +2804,19 @@ def run_sss_job(config: Any, stop_event: Any,
                     store_name=store_name, address_label=common_address,
                     callback=progress_callback)
 
-            try:
-                final, reconciled = _run_reconciled_submission(
-                    tasks,
-                    lambda: (submit_browser, lambda: None),
-                    fetch_json,
-                    stop_event,
-                    progress_callback,
-                    decision_callback,
-                    # 浏览器分支只有单个 page，Playwright 同步 API 非线程安全，
-                    # 因此这里固定串行；并发只作用于纯接口分支。
-                    max_workers=1,
-                    relogin=relogin_browser,
-                    journal=journal_hooks,
-                    submit_min_interval_s=submit_min_interval_s,
-                )
-            finally:
-                lock.release()
+            final, reconciled = _run_reconciled_submission(
+                tasks,
+                lambda: (submit_browser, lambda: None),
+                fetch_json,
+                stop_event,
+                progress_callback,
+                decision_callback,
+                # 浏览器分支只有单个 page，Playwright 同步 API 非线程安全，
+                # 因此这里固定串行；并发只作用于纯接口分支。
+                max_workers=1,
+                relogin=relogin_browser,
+                submit_min_interval_s=submit_min_interval_s,
+            )
             created = len(final.confirmed) if final is not None else 0
             processed = len(tasks)
             stopped = bool(stop_event.is_set())
@@ -3175,23 +2827,9 @@ def run_sss_job(config: Any, stop_event: Any,
         finally:
             browser.close()
 
-    if stopped:
-        _emit(progress_callback,
-              f"闪时送任务已停止：{'已完成站内对账' if reconciled else '站内对账失败'}，"
-              f"确认 {created}/{processed}")
-    elif partial:
-        _emit(progress_callback,
-              f"闪时送任务部分完成：确认 {created}/{processed}，"
-              f"{processed - created} 单未完成")
-    else:
-        _emit(progress_callback,
-              f"闪时送下单完成：确认 {created}/{processed}，"
-              f"总耗时 {(time.perf_counter() - job_start):.1f} 秒")
-    pending_active = _pending_journal_count()
-    return _result(_final_status_fields(
-        processed=processed, created=created, stopped=stopped, partial=partial,
-        reconciled=reconciled, pending_active=pending_active,
-        journal_error=journal_hooks.error, prepared_any=journal_hooks.prepared_any,
+    return _result(_emit_sss_completion(
+        progress_callback, processed=processed, created=created, stopped=stopped,
+        partial=partial, reconciled=reconciled, job_start=job_start,
         idempotency_field=idempotency_field))
 
 

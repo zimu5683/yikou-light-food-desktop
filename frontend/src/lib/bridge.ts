@@ -357,106 +357,6 @@ export interface WpsRecoveryResolveResult {
   allowed_decisions?: WpsRecoveryDecision[]
 }
 
-// ---------- 闪时送未决记录 ----------
-
-export interface SssUncertainRecordView {
-  journal_id: string
-  identifier: string
-  sheet: string
-  batch_id: string
-  delivery_date: string
-  status: 'inflight' | 'unresolved' | string
-  error: string
-  created_at: string
-  name: string
-  /** 已脱敏（前 3 后 4）。 */
-  phone: string
-  delivery_time: string
-  door_num: string
-  address: string
-  goods_name: string
-  account: string
-  platform: string
-  source: string
-}
-
-/** `sss_uncertain_records()`：日志损坏时 `journal_unreadable=true`，绝不能当成"没有"。 */
-export interface SssUncertainState {
-  ok: boolean
-  reason?: string
-  error_code?: 'journal_unreadable' | string
-  journal_unreadable: boolean
-  records: SssUncertainRecordView[]
-  counts: {
-    active: number
-    inflight: number
-    unresolved: number
-    resolved: number
-    discarded: number
-  }
-  journal_path?: string
-  fingerprint?: string
-  delivery_date?: string
-  account?: string
-  next_action?: string
-}
-
-export type SssReviewClassification =
-  | 'station_confirmed'
-  | 'station_missing'
-  | 'station_found_other_day'
-  | 'scan_failed'
-
-export interface SssUncertainReviewItem {
-  journal_id: string
-  classification: SssReviewClassification
-  reason: string
-  name: string
-  phone: string
-  delivery_time: string
-  error: string
-}
-
-/** `start_sss_review()`：只读核对（不对远端订单产生写副作用）。 */
-export interface SssUncertainReview {
-  ok: boolean
-  reason?: string
-  next_action?: string
-  journal_path?: string
-  batch_key?: string
-  delivery_date?: string
-  account?: string
-  created_at?: string
-  expires_at?: string
-  ttl_seconds?: number
-  queried_cloud?: boolean
-  read_only?: boolean
-  cloud_write?: false
-  results: SssUncertainReviewItem[]
-  counts?: Record<string, number>
-  confirmed?: number
-  missing?: number
-  other_day?: number
-  scan_failed?: number
-}
-
-export type SssUncertainDecision = 'station_present' | 'station_absent' | 'keep'
-
-/** `sss_uncertain_resolve()`：只写本地日志，**不会发送创建订单请求**。 */
-export interface SssUncertainResolveResult {
-  ok: boolean
-  status: string
-  code?: string
-  reason?: string
-  reason_code?: string
-  next_action?: string
-  cloud_write: boolean
-  changed: boolean
-  note?: string
-  record_ids?: string[]
-  operations: Array<{ journal_id: string; status: string }>
-}
-
 // ---------- 统一操作状态 ----------
 
 export interface OperationInfo {
@@ -732,17 +632,6 @@ interface PywebviewApi {
     note: string
     confirm_structure_checked?: boolean
   }): Promise<WpsRecoveryResolveResult>
-  /** 未决记录列表（脱敏）；日志损坏时 `journal_unreadable=true`。 */
-  sss_uncertain_records(): Promise<SssUncertainState>
-  /** 只读核对：登录 + 查订单 + 存快照；不发送创建订单请求。 */
-  start_sss_review(payload?: { password?: string }): Promise<SssUncertainReview>
-  /** 人工处置未决记录：不发送创建订单请求。 */
-  sss_uncertain_resolve(payload: {
-    decision: SssUncertainDecision
-    confirm: string
-    note: string
-    record_ids: string[]
-  }): Promise<SssUncertainResolveResult>
   /** 统一操作状态：前端据此禁用按钮并显示"谁在跑、跑到哪一步"。 */
   operation_status(operationId?: string): Promise<OperationStatusResult>
   save_wps_config(payload: WpsConfigPayload): Promise<{ ok: boolean; reason?: string }>
@@ -1058,7 +947,6 @@ export function classifyOutcome(input: {
   code?: string
   ok?: boolean
   executionSummary?: WpsExecutionSummary
-  uncertainPending?: number
 }): OutcomeView {
   const status = String(input.status ?? '').toLowerCase()
   const code = String(input.code ?? '')
@@ -1070,8 +958,7 @@ export function classifyOutcome(input: {
   } else if (code === 'preview_changed' || code?.startsWith('preview_')
              || code === 'missing_preview') {
     kind = 'rejected'
-  } else if (status === 'uncertain' || status === 'verify_unreadable'
-             || status === 'blocked_by_uncertain' || status === 'uncertain_journal_unreadable') {
+  } else if (status === 'uncertain' || status === 'verify_unreadable') {
     kind = 'unknown'
   } else if (status === 'blocked' || status === 'stale_batch'
              || status === 'insufficient_balance' || status === 'balance_unknown'
@@ -1089,9 +976,6 @@ export function classifyOutcome(input: {
     kind = 'rejected'
   }
 
-  if ((input.uncertainPending ?? 0) > 0 && kind === 'success') {
-    kind = 'unknown'
-  }
   const meta = OUTCOME_LABELS[kind]
   return { kind, label: meta.label, tone: meta.tone, nextAction: '' }
 }

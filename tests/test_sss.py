@@ -1542,7 +1542,6 @@ def test_preflight_reads_but_never_submits(monkeypatch, tmp_path):
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
         sss_product_name="轻食", api_mode=True,
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1621,7 +1620,6 @@ def test_preflight_succeeds_when_station_has_no_orders(monkeypatch, tmp_path):
         sss_fixed_area_code="330110",
         sss_fixed_address_detail="浙江农林大学东湖校区",
         sss_product_name="轻食", api_mode=True,
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1697,7 +1695,6 @@ def test_preflight_stops_when_order_list_is_unreadable(monkeypatch, tmp_path):
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
         sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",
@@ -1780,7 +1777,6 @@ def test_configured_workers_reach_the_submission_call_site(monkeypatch, tmp_path
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=30.0, sss_idempotency_field="",
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
     )
 
     class Stop:
@@ -1860,7 +1856,6 @@ def test_configured_submit_interval_reaches_the_submission_call_site(
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_submit_min_interval_s=interval,
         sss_unit_price=1.9, sss_read_timeout_s=30.0, sss_idempotency_field="",
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
     )
 
     class Stop:
@@ -1934,7 +1929,6 @@ def test_balance_guard_stops_before_any_submit(monkeypatch, tmp_path):
         sss_common_address="嗯哼", sss_use_fixed_address=True,
         sss_fixed_lnt=1.0, sss_fixed_lat=2.0, sss_fixed_area_code="330110",
         sss_fixed_address_detail="X", sss_product_name="轻食", api_mode=True,
-        sss_uncertain_path=str(tmp_path / "sss_uncertain.json"),
         element_timeout_ms=8000, sss_url="https://example.invalid",
         sss_store_id=None, sss_store_name_cached="", sss_max_workers=4,
         sss_unit_price=1.9, sss_read_timeout_s=20.0, sss_idempotency_field="",

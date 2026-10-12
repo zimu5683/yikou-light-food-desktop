@@ -25,7 +25,7 @@ from typing import Any, Mapping
 
 #: 受统一互斥保护的操作模式（键 = 前端可见的模式名）。
 MODES = (
-    "order", "sss", "sss_review", "sss_uncertain_resolve", "sss_day_orders",
+    "order", "sss", "sss_day_orders",
     "wps_preview", "wps_upload", "wps_authorize", "wps_check_copies",
     "wps_recovery_resolve", "check_update", "install_update",
 )
@@ -37,8 +37,6 @@ _EXCLUSIVE_MODES = frozenset(MODES)
 _MODE_TITLES = {
     "order": "订单处理",
     "sss": "闪时送下单",
-    "sss_review": "闪时送只读核对",
-    "sss_uncertain_resolve": "闪时送未决处置",
     "sss_day_orders": "读取云端当天名单",
     "wps_check_copies": "副本一致性核对",
     "wps_preview": "云文档预览",
@@ -68,7 +66,7 @@ class Operation:
     """一个被占用的操作。
 
     ``active`` 是**显式字段**，不由 ``status`` 推断：``status`` 是结果描述
-    （可以是任何业务词，例如 ``preview_ready`` / ``dry_run`` / ``blocked_by_uncertain``），
+    （可以是任何业务词，例如 ``preview_ready`` / ``dry_run``），
     一旦终结就必须立刻不再显示为"进行中"。用状态词表去推断会让没列进词表的
     业务状态永远停留在 active，前端就会一直禁用按钮。
     """

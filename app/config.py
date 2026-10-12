@@ -284,8 +284,6 @@ class AppConfig:
     wps_sort_enabled: bool = True
     # {子表名: [地址, ...]}；空列表 = 该表按地址自然升序。
     wps_address_order: Dict[str, Any] = field(default_factory=default_wps_address_order)
-    # 权威未决日志路径；留空 = 固定的用户数据目录（不要从网址/账号推导）。
-    sss_uncertain_path: str = ""
     # 出厂默认值迁移版本号（见模块顶部 DEFAULTS_REVISION）；旧配置缺键 = 0。
     defaults_revision: int = DEFAULTS_REVISION
     config_path: Optional[str] = None
@@ -333,7 +331,6 @@ class AppConfig:
                  wps_marker_enabled: bool = True,
                  wps_sort_enabled: bool = True,
                  wps_address_order: Optional[Dict[str, Any]] = None,
-                 sss_uncertain_path: str = "",
                  defaults_revision: int = DEFAULTS_REVISION,
                  config_path: Optional[str] = None,
                  *, url: Optional[str] = None, phone: Optional[str] = None,
@@ -441,7 +438,6 @@ class AppConfig:
         self.wps_marker_enabled = bool(wps_marker_enabled)
         self.wps_sort_enabled = bool(wps_sort_enabled)
         self.wps_address_order = normalize_wps_address_order(wps_address_order)
-        self.sss_uncertain_path = str(sss_uncertain_path or "").strip()
         self.config_path = config_path
         # Snapshot used by ``save`` to distinguish "this instance never touched
         # the field" from "another thread/process wrote a newer value".

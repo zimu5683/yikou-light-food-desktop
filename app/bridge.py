@@ -46,7 +46,6 @@ from pathlib import Path as _Path
 from typing import Any
 
 from . import __version__
-from .api_client import SssApiClient
 from .operations import OperationCoordinator
 from .redact import redact
 from .automation import (
@@ -63,10 +62,6 @@ from .credentials import (delete_password, delete_sss_password, get_password,
 from .excel_templates import write_order_template, write_sss_template
 from .sss import expected_delivery_date, run_sss_job
 from .sss_import import ImportRefused, prepare_day_orders
-from .sss_journal import (UncertainJournalError, default_uncertain_path,
-                          platform_origin)
-from .sss_review import (SCAN_FAILED, pending_views, resolve_records as
-                         resolve_uncertain_records, start_review)
 from .updater import ReleaseInfo, UpdateError, check_for_update, download_and_install
 from .wps_cloud import (KdocsCli, SyncLedger, WpsCloudError,
                         apply_plan, build_plan, effective_tables, format_plan,
@@ -659,218 +654,6 @@ class Bridge:
             self.log("留档 Excel 写入失败：" + str(summary["archive_error"]), "WARN")
         return {"ok": True, **summary}
 
-    # ------------------------------------------------------------------
-    # 闪时送：未决记录列表 / 只读核对 / 人工处置
-    #
-    # 这三个入口是"上一次下单结果未知"时的唯一出路：只读核对查站内订单并留
-    # 证据；人工处置只写本地日志，**永不写云端**、不创建订单。解除阻断后，
-    # 用户下一次主动点「开始下单」才会真正发单。
-    # ------------------------------------------------------------------
-    def _sss_journal_path(self) -> _Path:
-        """权威未决日志路径。
-
-        生产环境就是固定的用户数据目录（与 ``sss_journal.default_uncertain_path``
-        一致）；只在**显式指定了非默认配置文件**（测试/独立安装）时，才把状态
-        放在配置文件旁边，避免测试碰到真实用户的日志。
-
-        刻意**不**从网址/账号/名单来源/Excel 路径推导 —— 那些都是用户可改的
-        业务配置，一旦参与文件名，改一下配置就能换一个日志、看不到原来的未决记录。
-        """
-        explicit = str(getattr(self._config, "sss_uncertain_path", "") or "").strip()
-        if explicit:
-            return _Path(explicit).expanduser()
-        config_path = getattr(self._config, "config_path", None)
-        if config_path and _Path(config_path) != AppConfig.default_path():
-            return _Path(config_path).parent / "sss_uncertain.json"
-        return default_uncertain_path(self._config)
-
-    def _sss_scope(self) -> tuple[str, str, str]:
-        """本次运行的 ``(送达日, 账号, 平台 origin)``；网址非法时抛错。"""
-        account = str(self._config.sss_account or "")
-        origin = platform_origin(self._config)
-        return (expected_delivery_date().isoformat(), account, origin)
-
-    def sss_uncertain_records(self) -> dict[str, Any]:
-        """列出闪时送未决记录（脱敏）；日志损坏时明确报错而不是谎称"没有"。"""
-        journal_path = self._sss_journal_path()
-        try:
-            delivery_date, account, _origin = self._sss_scope()
-        except UncertainJournalError as exc:
-            return {"ok": False, "reason": str(exc), "records": [], "counts": {},
-                    "journal_unreadable": False, "next_action": "修正闪时送网址"}
-        try:
-            result = pending_views(journal_path, delivery_date=delivery_date,
-                                   account=account, origin=_origin)
-        except UncertainJournalError as exc:
-            # 关键：损坏时绝不能返回空列表伪装成"没有未决记录"。
-            self.log(f"[闪时送] 未决日志不可用：{exc}", "ERROR")
-            return {"ok": False, "reason": str(exc), "records": [], "counts": {},
-                    "journal_unreadable": True, "error_code": "journal_unreadable",
-                    "journal_path": str(journal_path),
-                    "next_action": "先人工核对站内订单并修复/移走该文件",
-                    "delivery_date": delivery_date, "account": account}
-        group_counts = result.get("group_counts") or {}
-        other = int(group_counts.get("other_scope", 0) or 0)
-        history = int(group_counts.get("history", 0) or 0)
-        hints: list[str] = []
-        if result["counts"].get("active"):
-            hints.append("先做「只读核对」或人工处置")
-        if other:
-            hints.append("其它范围仍有未决记录：切回原账号/原平台后再核对与处置"
-                         "（当前账号/网址下的核对结果不能用于它们）")
-        next_action = "；".join(hints)
-        result.update({
-            "delivery_date": delivery_date,
-            "account": account,
-            "origin": _origin,
-            "other_scope_count": other,
-            "history_count": history,
-            "next_action": next_action,
-        })
-        return result
-
-    def start_sss_review(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
-        """闪时送**只读核对**：登录、查订单、保存核对快照。
-
-        只允许登录、查询订单、查询目标时间窗和保存核对快照；**严禁**创建订单
-        请求或自动补发（登录本身可能用 POST，"只读"指对远端订单没有写副作用）。
-
-        可靠匹配到的未决记录会被标记为本地已确认（因此本地文件会变），仍然缺失
-        或无法确认的记录只生成证据。本入口不会因为 ``remember`` 保存密码。
-        """
-        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
-        if self.worker_alive():
-            return {"ok": False, "reason": "已有任务正在运行，请先停止后再核对",
-                    "records": [], "next_action": "停止当前任务"}
-        operation, conflict = self._reserve(
-            "sss_review", title="闪时送只读核对",
-            summary={"read_only": True, "cloud_write": False})
-        if conflict is not None:
-            conflict.update({"records": [], "cloud_write": False})
-            return conflict
-        try:
-            result = self._start_sss_review_impl(data)
-        except BaseException:
-            self._operations.finish(operation, status="error", reason="unexpected")
-            raise
-        status = "success" if result.get("ok") else "error"
-        self._operations.finish(operation, status=status,
-                                reason=str(result.get("reason") or ""))
-        return result
-
-    def _start_sss_review_impl(self, data: dict[str, Any]) -> dict[str, Any]:
-        """``start_sss_review`` 的实际实现（调用方已取占位）。"""
-        journal_path = self._sss_journal_path()
-        try:
-            delivery_date, account, _origin = self._sss_scope()
-        except UncertainJournalError as exc:
-            return {"ok": False, "reason": str(exc), "records": [],
-                    "next_action": "修正闪时送网址"}
-        if not account:
-            return {"ok": False, "reason": "尚未填写闪时送账号", "records": [],
-                    "next_action": "在「闪时送下单」里填写账号"}
-        password = str(data.get("password") or "").strip() or get_sss_password(account)
-        if not password:
-            return {"ok": False, "reason": "没有可用于只读核对的闪时送密码",
-                    "records": [], "next_action": "输入密码后重试（不会保存）"}
-        url = str(self._config.sss_url or "").strip()
-        try:
-            read_timeout = float(getattr(self._config, "sss_read_timeout_s", 20.0))
-        except (TypeError, ValueError):
-            read_timeout = 20.0
-        self.log("[闪时送] 开始只读核对：登录 → 查询订单 → 保存核对快照（不下单）")
-        client = None
-        try:
-            client = SssApiClient(url, account, password,
-                                  timeout=(5.0, max(1.0, min(120.0, read_timeout))),
-                                  pool_size=1)
-            captcha = client.fetch_captcha()
-            client.login(self._sss_captcha(captcha))
-            result = start_review(journal_path, delivery_date=delivery_date,
-                                  account=account, origin=_origin,
-                                  fetch_json=client.get_json,
-                                  log=lambda message: self.log(message))
-        except _InteractionCancelled as exc:
-            return {"ok": False, "reason": f"验证码输入已取消或超时：{exc}",
-                    "records": [], "next_action": "重新核对"}
-        except Exception as exc:  # noqa: BLE001 - 界面需要原样原因
-            self.log(f"[闪时送] 只读核对失败：{type(exc).__name__}: {exc}", "ERROR")
-            return {"ok": False, "reason": f"{type(exc).__name__}: {exc}",
-                    "records": [], "next_action": "检查账号/验证码/网络后重试"}
-        finally:
-            if client is not None:
-                client.close()
-        self.log("[闪时送] 只读核对完成："
-                 f"站内已确认 {result.get('confirmed', 0)}、"
-                 f"站内没有 {result.get('missing', 0)}、"
-                 f"日期不符 {result.get('other_day', 0)}、"
-                 f"读取失败 {result.get('scan_failed', 0)}", "OK")
-        for item in result.get("results") or []:
-            if item.get("classification") == SCAN_FAILED:
-                self.log(f"[闪时送] ⚠ {item.get('name')}：{item.get('reason')}", "WARN")
-        return result
-
-    def sss_uncertain_resolve(self, payload: dict[str, Any] | None = None,
-                             **options: Any) -> dict[str, Any]:
-        """人工处置闪时送未决记录；**不会发送任何创建订单请求**。
-
-        ``payload`` 需要 ``decision``（``station_present`` / ``station_absent`` /
-        ``keep``）、``confirm``（与 decision 完全相同）、``record_ids``，以及
-        ``note``（``station_absent`` 至少 4 个字符）。
-        ``station_absent`` 还必须有新鲜的只读核对证据，且所选记录全部是
-        "站内确认没有"；解除后**下一次主动运行才会真正发单**。
-        """
-        data: dict[str, Any] = dict(payload) if isinstance(payload, dict) else {}
-        for key, value in options.items():
-            if value is not None:
-                data[key] = value
-        journal_path = self._sss_journal_path()
-        try:
-            delivery_date, account, origin = self._sss_scope()
-        except UncertainJournalError as exc:
-            return {"ok": False, "reason": str(exc), "cloud_write": False,
-                    "changed": False, "operations": []}
-        # 人工处置也纳入统一协调器：它与下单、只读核对、云同步上传互相排斥。
-        operation, conflict = self._reserve(
-            "sss_uncertain_resolve", title="闪时送未决处置",
-            summary={"record_count": len(data.get("record_ids") or []),
-                     "cloud_write": False})
-        if conflict is not None:
-            conflict.update({"cloud_write": False, "changed": False,
-                             "operations": []})
-            return conflict
-        try:
-            result = resolve_uncertain_records(
-                journal_path, delivery_date=delivery_date, account=account,
-                origin=origin,
-                decision=str(data.get("decision") or ""),
-                record_ids=data.get("record_ids") or [],
-                confirm=str(data.get("confirm") or ""),
-                note=str(data.get("note") or ""))
-        except UncertainJournalError as exc:
-            self.log(f"[闪时送] 人工处置失败：未决日志不可用：{exc}", "ERROR")
-            self._operations.finish(operation, status="blocked",
-                                    reason=str(exc)[:200],
-                                    next_action="fix_journal")
-            return {"ok": False, "status": "blocked", "code": "journal_unreadable",
-                    "reason": str(exc), "next_action": "先修复未决日志",
-                    "cloud_write": False, "changed": False, "operations": []}
-        except BaseException as exc:
-            self._operations.finish(operation, status="error",
-                                    reason=f"{type(exc).__name__}: {exc}")
-            raise
-        self._operations.finish(
-            operation, status="success" if result.get("ok") else "rejected",
-            reason=str(result.get("reason") or result.get("code") or "")[:200],
-            summary={"changed": bool(result.get("changed")),
-                     "reason_code": str(result.get("reason_code") or "")},
-            next_action=str(result.get("next_action") or ""))
-        if result.get("ok") and result.get("changed"):
-            self.log(f"[闪时送] 人工处置未决记录：{result.get('reason')}；"
-                     f"备注：{str(data.get('note') or '')[:60]}（未发送任何下单请求）",
-                     "WARN")
-        return result
-
     def _launch(self, mode: str, config: AppConfig, count: int | None, password: str) -> bool:
         """启动 worker；已有任务时拒绝，返回 False（不覆盖在跑线程）。
 
@@ -967,9 +750,9 @@ class Bridge:
         self.log(message, "OK")
         operation, self._worker_operation = self._worker_operation, None
         if operation is not None:
-            # 如实透传业务状态（dry_run / preflight_ok / blocked_by_uncertain /
-            # no_orders / insufficient_balance …）：终结由 finish() 显式置
-            # active=False 决定，不再靠状态词表，所以任何业务词都能安全展示。
+            # 如实透传业务状态（dry_run / preflight_ok / no_orders /
+            # insufficient_balance …）：终结由 finish() 显式置 active=False
+            # 决定，不再靠状态词表，所以任何业务词都能安全展示。
             status = str(result.get("status") or "")
             overall = status or ("partial" if partial
                                  else "stopped" if stopped else "success")
@@ -977,8 +760,7 @@ class Bridge:
                 operation, status=overall,
                 reason=str(result.get("reason") or result.get("block_reason") or ""),
                 summary={"message": message, "created": result.get("created"),
-                         "processed": result.get("processed"),
-                         "uncertain_pending": result.get("uncertain_pending")},
+                         "processed": result.get("processed")},
                 next_action=str(result.get("next_action") or ""))
         self._worker = None
         self._set_status("partial" if partial else "stopped" if stopped else "success")

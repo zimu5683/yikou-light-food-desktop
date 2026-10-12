@@ -40,13 +40,13 @@ def test_finish_is_idempotent_and_status_is_readable():
     assert coordinator.status()["operation"]["phase"] == "submitting"
 
     coordinator.finish(operation, status="partial", reason="2 单未完成",
-                       next_action="start_sss_review")
+                       next_action="检查日志后重试")
     coordinator.finish(operation, status="success")   # 重复结束不应改变结论
 
     status = coordinator.status(operation.operation_id)
     assert status["ok"] is True and status["active"] is False
     assert status["operation"]["status"] == "partial"
-    assert status["operation"]["next_action"] == "start_sss_review"
+    assert status["operation"]["next_action"] == "检查日志后重试"
     assert status["operation"]["summary"]["processed"] == 5
 
 
@@ -117,7 +117,7 @@ def test_task_occupies_slot_until_it_finishes(tmp_path):
 
 
 def test_cloud_entries_conflict_with_a_running_task(tmp_path):
-    """任务在跑时，云同步预览/上传/恢复与闪时送只读核对都必须被拒绝。"""
+    """任务在跑时，云同步预览/上传/恢复与读取当天名单都必须被拒绝。"""
     bridge = _bridge(tmp_path)
     operation, _conflict = bridge._reserve("order", title="订单处理")
     try:
@@ -129,9 +129,8 @@ def test_cloud_entries_conflict_with_a_running_task(tmp_path):
         upload = bridge.wps_upload("pv-anything")
         assert upload["ok"] is False and upload["code"] == "operation_conflict"
 
-        review = bridge.start_sss_review()
-        assert review["ok"] is False and review["code"] == "operation_conflict"
-        assert review["records"] == []
+        day_orders = bridge.sss_day_orders()
+        assert day_orders["ok"] is False and day_orders["code"] == "operation_conflict"
 
         resolve = bridge.wps_recovery_resolve({"operation_id": "wps-x"})
         assert resolve["ok"] is False and resolve["code"] == "operation_conflict"

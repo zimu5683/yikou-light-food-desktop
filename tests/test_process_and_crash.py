@@ -2,7 +2,7 @@
 
 这些用例刻意**不**只用 monkeypatch 模拟：
 
-* A21/A22/A27：另一个执行体必须是**独立进程**（同一进程内的重入语义完全不同，
+* A21/A27：另一个执行体必须是**独立进程**（同一进程内的重入语义完全不同，
   用线程或 mock 证明不了跨进程互斥）；
 * A33：崩溃必须是 ``os.kill``/``os._exit``，不是抛异常（抛异常会走正常的收尾
   路径，证明不了"日志在崩溃后依然有效"）；
@@ -52,10 +52,9 @@ def isolated_user_dirs(tmp_path, monkeypatch):
 def test_user_data_dir_follows_the_isolated_environment(isolated_user_dirs):
     """默认路径必须落在隔离环境里（证明上面那个 fixture 真的生效）。"""
     from app.config import user_data_dir
-    from app.sss_journal import default_uncertain_path
     from app.wps_cloud import default_state_path
 
-    for path in (user_data_dir(), default_uncertain_path(), default_state_path()):
+    for path in (user_data_dir(), default_state_path()):
         assert str(isolated_user_dirs) in str(path), path
 
 
@@ -81,10 +80,9 @@ def test_sentinel_real_config_directory_is_never_touched(tmp_path, monkeypatch):
     monkeypatch.setattr(pathlib.Path, "read_text", guard)
     monkeypatch.setattr(pathlib.Path, "write_text", guard_write)
 
-    from app.config import AppConfig
-    from app.sss_journal import default_uncertain_path
+    from app.config import AppConfig, user_data_dir
 
-    config = AppConfig.load(default_uncertain_path().with_name("config.json"))
+    config = AppConfig.load(user_data_dir() / "config.json")
     config.save()
     assert touched == [], touched
 
@@ -124,27 +122,6 @@ def test_bridge_logs_and_errors_never_leak_a_canary_secret(tmp_path):
         "cloud_error", f"底层报错 password={canary}，手机 13812345678 未确认")
     assert canary not in rejected["reason"]
     assert "13812345678" not in rejected["reason"]
-
-
-def test_pending_views_mask_phone_numbers(tmp_path):
-    """未决列表是给界面/证据用的：手机号必须脱敏。"""
-    from app.sss_journal import append_records, batch_key
-    from app.sss_review import pending_views
-
-    journal = tmp_path / "sss_uncertain.json"
-    append_records(journal, batch_key("2026-09-12", "", "18758187837"),
-                   [{"identifier": "第 3 行 张", "sheet": "午餐", "batch_id": "b",
-                     "fingerprint": {"receive_name": "张",
-                                     "receive_phone": "13812345678",
-                                     "address_detail": "浙江农林大学"}}],
-                   meta={"account": "18758187837", "platform": "https://sss.example.com",
-                         "delivery_date": "2026-09-12"})
-
-    view = pending_views(journal, delivery_date="2026-09-12",
-                         account="18758187837", origin="https://sss.example.com")
-    blob = json.dumps(view, ensure_ascii=False)
-    assert "13812345678" not in blob, "未决列表不能带完整手机号"
-    assert "138****5678" in blob
 
 
 # ======================================================================
@@ -318,169 +295,6 @@ def test_a21_reentrancy_and_idempotent_release():
     thread.join()
     assert aliased == [True], "符号链接别名必须被识别为同一把锁"
     holder.release()
-
-
-# ======================================================================
-# A22：取锁前后的 journal 变更（真双进程 + 锁内重读）
-# ======================================================================
-
-_PREPARE_CHILD = textwrap.dedent('''
-    """模拟"另一个进程在窗口期留下未决记录"，然后尝试下单。"""
-    import sys, threading, json, pathlib
-    sys.path.insert(0, {root!r})
-    from app import sss as sss_module
-    from app.sss_journal import append_records, batch_key
-
-    from app.config import AppConfig
-
-    # 注意：python -c 时 sys.argv[0] == "-c"，所以业务参数从 argv[1] 起。
-    state_path = pathlib.Path(sys.argv[1])
-    target_date = sys.argv[2]
-    target_account = sys.argv[3]
-    target_origin = sys.argv[4]
-    cfg = AppConfig.load(sys.argv[5])
-
-    # 1) 先做一次"提交前的只读检查"（此时日志还是空的）
-    key = batch_key(target_date, "", target_account)
-    before = sss_module.blocking_state(state_path, delivery_date=target_date,
-                                       account=target_account,
-                                       origin=target_origin)
-    print("PRE_BLOCKED", json.dumps(before["blocked"]), flush=True)
-
-    # 2) 复现窗口：另一个进程在"已读空日志、尚未取锁"之间留下未决记录
-    append_records(state_path, key, [{{"identifier": "另一个进程的单",
-                                      "sheet": "午餐", "batch_id": "other",
-                                      "fingerprint": {{"receive_name": "别",
-                                                      "receive_phone": "13900000000"}},
-                                      "status": "unresolved"}}],
-                   meta={{"account": target_account, "platform": target_origin,
-                          "delivery_date": target_date}})
-    print("WROTE", flush=True)
-
-    # 3) 真正开始下单：必须由锁内重读发现这条记录
-    calls = {{"posts": 0}}
-    class FakeClient:
-        def fetch_captcha(self): return b"png"
-        def login(self, code): return {{"success": True}}
-        def get_json(self, path):
-            if "list" in path:
-                return {{"success": True, "result": {{"records": [], "total": 0}}}}
-            if "store" in path:
-                return {{"success": True, "result": [{{"name": "一口轻食", "id": 7}}]}}
-            if "account" in path:
-                return {{"success": True, "result": {{"totalAmount": 1000.0}}}}
-            return {{"success": True, "result": []}}
-        def post_json(self, path, payload):
-            calls["posts"] += 1
-            return {{"success": True}}
-        def fork(self): return self
-        def close(self): pass
-
-    sss_module.SssApiClient = lambda *a, **k: FakeClient()
-    result = sss_module.run_sss_job(cfg, threading.Event(),
-                                    progress_callback=lambda _m: None,
-                                    password="pw", captcha_callback=lambda _i: "1234")
-    print("RESULT", json.dumps({{"status": result.get("status"),
-                                 "posts": calls["posts"]}}), flush=True)
-''')
-
-
-def test_a22_in_lock_reread_catches_a_record_written_in_the_window(tmp_path):
-    """窗口期（先读空日志 → 另一进程写未决 → 再取锁）必须被锁内重读挡住。"""
-    from app.config import AppConfig
-
-    state_path = tmp_path / "sss_uncertain.json"
-    excel = tmp_path / "闪时送.xlsx"
-    _write_minimal_xlsx(excel)
-    cfg = AppConfig(config_path=str(tmp_path / "config.json"))
-    cfg.sss_order_source = "excel"
-    cfg.sss_excel_path = excel
-    cfg.sss_account = "18758187837"
-    cfg.sss_url = "https://sss.example.com/takeout"
-    cfg.sss_dry_run = False
-    cfg.sss_uncertain_path = str(state_path)
-
-    cfg.save()
-    script = _PREPARE_CHILD.format(root=str(REPO_ROOT))
-    # 日期必须用程序真正会用的"送达日"：否则窗口期写下的记录落在别的批次键上，
-    # 就测不到"锁内重读"这件事了。
-    proc = subprocess.run(
-        [PYTHON, "-c", script, str(state_path), _expected_date(), "18758187837",
-         "https://sss.example.com", str(cfg.config_path)], capture_output=True,
-        text=True, timeout=60, cwd=str(REPO_ROOT))
-    out = proc.stdout or ""
-    assert "PRE_BLOCKED false" in out, out + (proc.stderr or "")
-    assert "WROTE" in out, out + (proc.stderr or "")
-    assert '"posts": 0' in out, "锁内重读必须挡住这次提交：" + out
-    assert '"status": "blocked_by_uncertain"' in out, out
-
-
-def test_a22_holder_of_the_batch_lock_makes_the_other_process_refuse(tmp_path):
-    """另一个进程持着批次锁时，本进程必须立即拒绝且零 POST（不是排队等待）。"""
-    from app.config import AppConfig
-    from app.sss_journal import batch_lock_path
-
-    state_path = tmp_path / "sss_uncertain.json"
-    lock = batch_lock_path(state_path)
-    marker = tmp_path / "held.marker"
-    holder = _spawn_lock_child("hold", lock, marker)
-    assert _wait_for(marker), "子进程没能拿到锁"
-    try:
-        excel = tmp_path / "闪时送.xlsx"
-        _write_minimal_xlsx(excel)
-        cfg = AppConfig(config_path=str(tmp_path / "config.json"))
-        cfg.sss_order_source = "excel"
-        cfg.sss_excel_path = excel
-        cfg.sss_account = "18758187837"
-        cfg.sss_url = "https://sss.example.com/takeout"
-        cfg.sss_dry_run = False
-        cfg.sss_uncertain_path = str(state_path)
-
-        import threading
-
-        from app import sss as sss_module
-
-        calls = {"posts": 0}
-
-        class FakeClient:
-            def fetch_captcha(self): return b"png"
-
-            def login(self, code): return {"success": True}
-
-            def get_json(self, path):
-                if "list" in path:
-                    return {"success": True,
-                            "result": {"records": [], "total": 0}}
-                if "store" in path:
-                    return {"success": True,
-                            "result": [{"name": "一口轻食", "id": 7}]}
-                if "account" in path:
-                    return {"success": True, "result": {"totalAmount": 1000.0}}
-                return {"success": True, "result": []}
-
-            def post_json(self, path, payload):
-                calls["posts"] += 1
-                return {"success": True}
-
-            def fork(self): return self
-
-            def close(self): pass
-
-        original = sss_module.SssApiClient
-        sss_module.SssApiClient = lambda *a, **k: FakeClient()
-        try:
-            result = sss_module.run_sss_job(cfg, threading.Event(),
-                                            progress_callback=lambda _m: None,
-                                            password="pw",
-                                            captcha_callback=lambda _i: "1234")
-        finally:
-            sss_module.SssApiClient = original
-
-        assert calls["posts"] == 0
-        assert result["status"] == "concurrent_batch"
-    finally:
-        holder.terminate()
-        holder.wait(timeout=10)
 
 
 # ======================================================================
@@ -703,90 +517,8 @@ def test_a27_recovery_refuses_while_another_process_holds_the_operation_lock(tmp
 
 
 # ======================================================================
-# A33：真进程崩溃后的恢复
+# A33：真进程崩溃后的恢复（云端写入；WPS 日志仍在，闪时送已无本地日志）
 # ======================================================================
-
-_CRASH_SSS_CHILD = textwrap.dedent('''
-    """在"意图已落盘但还没发 POST"时被 kill —— 用 os._exit 模拟（不走收尾路径）。"""
-    import sys, os, threading, pathlib
-    sys.path.insert(0, {root!r})
-    from app import sss as sss_module
-    from app.sss_journal import append_records, batch_key
-
-    from app.config import AppConfig
-
-    state_path = pathlib.Path(sys.argv[1])
-    cfg = AppConfig.load(sys.argv[3])
-
-    real_append = sss_module.append_records
-    def append_then_die(path, key, entries, **kwargs):
-        written = real_append(path, key, entries, **kwargs)
-        pathlib.Path(sys.argv[2]).write_text("intent-written", encoding="utf-8")
-        os._exit(9)          # 进程在这里"死掉"：绝不会执行 finalize
-        return written
-
-    sss_module.append_records = append_then_die
-    calls = {{"posts": 0}}
-    class FakeClient:
-        def fetch_captcha(self): return b"png"
-        def login(self, code): return {{"success": True}}
-        def get_json(self, path):
-            if "list" in path:
-                return {{"success": True, "result": {{"records": [], "total": 0}}}}
-            if "store" in path:
-                return {{"success": True, "result": [{{"name": "一口轻食", "id": 7}}]}}
-            if "account" in path:
-                return {{"success": True, "result": {{"totalAmount": 1000.0}}}}
-            return {{"success": True, "result": []}}
-        def post_json(self, path, payload):
-            calls["posts"] += 1
-            return {{"success": True}}
-        def fork(self): return self
-        def close(self): pass
-
-    sss_module.SssApiClient = lambda *a, **k: FakeClient()
-    sss_module.run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
-                           password="pw", captcha_callback=lambda _i: "1234")
-''')
-
-
-def test_a33_killed_before_post_leaves_a_blocking_record(tmp_path):
-    """进程在"已写意图、还没发 POST"时被杀 → 日志仍有 inflight，重启不重复提交。"""
-    from app.config import AppConfig
-    from app.sss_journal import blocking_state, load_journal
-
-    state_path = tmp_path / "sss_uncertain.json"
-    excel = tmp_path / "闪时送.xlsx"
-    _write_minimal_xlsx(excel)
-    cfg = AppConfig(config_path=str(tmp_path / "config.json"))
-    cfg.sss_order_source = "excel"
-    cfg.sss_excel_path = excel
-    cfg.sss_account = "18758187837"
-    cfg.sss_url = "https://sss.example.com/takeout"
-    cfg.sss_dry_run = False
-    cfg.sss_uncertain_path = str(state_path)
-
-    marker = tmp_path / "intent.marker"
-    cfg.save()
-    script = _CRASH_SSS_CHILD.format(root=str(REPO_ROOT))
-    proc = subprocess.run([PYTHON, "-c", script, str(state_path), str(marker),
-                           str(cfg.config_path)],
-                          capture_output=True, text=True, timeout=60,
-                          cwd=str(REPO_ROOT))
-    assert proc.returncode == 9, (proc.returncode, proc.stdout, proc.stderr)
-    assert marker.exists(), "意图必须先落盘再崩溃"
-
-    records = load_journal(state_path)["records"]
-    assert records and all(record["status"] == "inflight" for record in records)
-    state = blocking_state(state_path, delivery_date=cfg.__dict__.get(
-        "_ignored", "") or _expected_date(), account="18758187837",
-        origin="https://sss.example.com")
-    assert state["blocked"] is True, "崩溃留下的 inflight 必须继续阻断"
-
-
-def _expected_date() -> str:
-    from app.sss import expected_delivery_date
-    return expected_delivery_date().isoformat()
 
 
 _CRASH_WPS_CHILD = textwrap.dedent('''

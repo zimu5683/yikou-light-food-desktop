@@ -6,21 +6,17 @@
   ``tests/test_wps_cloud_safety.py``（增量累加、重复上传零写入、协作者 0 保护、
   多槽位、批次日期闸门、排序前回滚、排序后不误删）；
 * A11/A17（部分）—— ``tests/test_wps_recovery.py``；
-* A13/A14/A15（阻断侧）/A16/A18 —— ``tests/test_sss_journal.py``。
+* A14/A15 —— ``tests/test_sss.py``（站内对账是闪时送唯一的防重复闸门）。
+  A13/A16/A18 对应的**闪时送未决日志**一族已在 2026-10-12 随机制移除
+  （见 README「重复下单的最后一道防线」与发布记录）。
 
 本文件补的是审计确认的缺口 + 本轮修复的回归锁：
 
 * A08 预览后本地文件变化 → 上传前拒绝（重算 SHA-256）
 * A09 预览令牌过期 / 关闭后重新开启的复用
 * A10 意图日志损坏 → 结构化拒绝且零云端写入
-* A12 闪时送日志不可写 → 端到端零 POST
-* A13b ``inflight`` 残留（进程被杀）→ 下次运行阻断
-* A15b 换账号 / 换平台的**处置**必须被拒绝（快照作用域绑定）
-* A16b ``scan_failed`` 不能支撑 ``station_absent``，且仍保持阻断
-* A17b 核对快照过期 → 拒绝解除
-* A19 浏览器（Playwright）路径：POST 前留痕 + 异常归类与接口路径一致
+* A19 浏览器（Playwright）路径：异常归类与接口路径一致（结果未知不自动重发）
 * 新增：未处置的 ``uncertain`` 必须阻断同日期 + 同表重传（重复累加的最后防线）
-* 新增：锁拿不到 / 日志目录不可写 → fail-closed
 """
 from __future__ import annotations
 
@@ -35,14 +31,10 @@ from pathlib import Path
 import pytest
 
 from app import sss as sss_module
-from app import sss_review as review
 from app.sss import run_sss_job
-from app.sss_journal import (append_records, batch_key,
-                             blocking_state, load_journal)
 from app.wps_cloud import CloudOrder, SyncLedger, apply_plan, build_plan
 from app.wps_journal import SyncJournal, journal_path_for
-from tests.test_sss_journal import (_FakeClient, _config, _entry, _fetch_queue,
-                                    _id_of, _meta, _write_sss_excel)
+from tests.sss_test_support import _config, _write_sss_excel
 from tests.test_wps_cloud import BASE_HEADER, FakeCli, make_grid
 
 TARGET = dt.date(2026, 9, 11)
@@ -410,236 +402,6 @@ def test_blocked_result_reports_proven_no_write_and_zero_counts(wps_env):
 
 
 # ======================================================================
-# A12：闪时送日志不可写 → 端到端零 POST
-# ======================================================================
-
-def test_run_sss_job_sends_no_post_when_the_journal_cannot_be_written(
-        tmp_path, monkeypatch):
-    """端到端：日志写不下去时，一个 POST 都不许发（而不是"先发再补记"）。"""
-    _write_sss_excel(tmp_path)
-    cfg = _config(tmp_path, sss_order_source="excel", sss_max_workers=1)
-    client = _FakeClient()
-    monkeypatch.setattr(sss_module, "SssApiClient", lambda *a, **k: client)
-
-    def boom(*_a, **_k):
-        raise OSError("磁盘满")
-
-    monkeypatch.setattr(sss_module, "append_records", boom)
-    logs: list[str] = []
-
-    result = run_sss_job(cfg, threading.Event(), progress_callback=logs.append,
-                         password="pw", captcha_callback=lambda _img: "1234")
-
-    assert client.posts == [], "留痕失败就绝不能发 POST"
-    assert result["created"] == 0
-    # 一次都没提交过 → 明确是"本批未提交、日志不可用"，而不是含糊的"结果未知"。
-    assert result["status"] == "journal_unavailable"
-    assert result["journal_error"]
-    assert result["next_action"] == "fix_journal"
-    assert result["uncertain"] is False, "没有发出任何请求，订单结果并不未知"
-    assert any("未决日志写入失败" in line for line in logs)
-
-
-def test_run_sss_job_sends_no_post_when_the_lock_is_unavailable(
-        tmp_path, monkeypatch):
-    """拿不到批次独占锁（目录不可写 / 别的进程在跑）时同样零 POST。"""
-    _write_sss_excel(tmp_path)
-    cfg = _config(tmp_path, sss_order_source="excel", sss_max_workers=1)
-    client = _FakeClient()
-    monkeypatch.setattr(sss_module, "SssApiClient", lambda *a, **k: client)
-
-    def boom(*_a, **_k):
-        from app.wps_atomicio import AtomicWriteError
-        raise AtomicWriteError("锁文件不可写")
-
-    monkeypatch.setattr(sss_module, "batch_submission_lock", boom)
-    logs: list[str] = []
-
-    result = run_sss_job(cfg, threading.Event(), progress_callback=logs.append,
-                         password="pw", captcha_callback=lambda _img: "1234")
-
-    assert client.posts == []
-    assert result["status"] == "journal_unavailable"
-    assert any("无法取得下单批次互斥锁" in line for line in logs)
-
-
-# ======================================================================
-# A13b：inflight 残留（进程被杀）→ 下次运行阻断
-# ======================================================================
-
-def test_inflight_record_from_a_killed_process_blocks_the_next_run(tmp_path, monkeypatch):
-    """POST 前写下的 inflight 如果一直没结案，就说明进程没能收尾 —— 必须继续阻断。"""
-    _write_sss_excel(tmp_path)
-    cfg = _config(tmp_path, sss_order_source="excel", sss_max_workers=1)
-    journal_path = Path(cfg.sss_uncertain_path)
-    day = sss_module.expected_delivery_date().isoformat()
-    append_records(journal_path, batch_key(day, "", cfg.sss_account),
-                   [_entry(status="inflight")], meta=_meta(delivery_date=day))
-
-    state = blocking_state(journal_path, delivery_date=day,
-                           account=cfg.sss_account, origin="https://sss.example.com")
-    assert state["blocked"] is True and state["code"] == "unresolved_batch"
-
-    client = _FakeClient()
-    monkeypatch.setattr(sss_module, "SssApiClient", lambda *a, **k: client)
-    logs: list[str] = []
-    result = run_sss_job(cfg, threading.Event(), progress_callback=logs.append,
-                         password="pw", captcha_callback=lambda _img: "1234")
-
-    assert result["status"] == "blocked_by_uncertain"
-    assert client.posts == []
-
-
-# ======================================================================
-# A15b：换账号 / 换平台的**处置**必须被拒绝（快照作用域绑定）
-# ======================================================================
-
-@pytest.fixture
-def reviewed(tmp_path: Path):
-    """一条未决记录 + 一次"站内确认没有"的核对快照。"""
-    path = tmp_path / "sss_uncertain.json"
-    key = batch_key("2026-09-12", "", "18758187837")
-    append_records(path, key, [_entry(identifier="a")], meta=_meta())
-    fetch = _fetch_queue({"success": True, "result": {"records": [], "total": 0}})
-    review.start_review(path, delivery_date="2026-09-12", account="18758187837",
-                        origin="https://sss.example.com", fetch_json=fetch)
-    return path, _id_of(path, "a")
-
-
-def test_station_absent_refuses_after_the_account_changed(reviewed):
-    path, record_id = reviewed
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="13900000000",
-        decision="station_absent", record_ids=[record_id],
-        confirm="station_absent", note="我已确认站内没有", origin="https://sss.example.com")
-
-    assert got["ok"] is False
-    assert got["code"] in ("cross_scope_record", "review_stale")
-    assert "另一个账号" in got["reason"] or "当前账号" in got["reason"]
-
-
-def test_station_absent_refuses_after_the_platform_changed(reviewed):
-    """换网址之后，旧平台的核对结果对新平台无效（那边根本没查过订单）。"""
-    path, record_id = reviewed
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[record_id],
-        confirm="station_absent", note="我已确认站内没有",
-        origin="https://other.example.com")
-
-    assert got["ok"] is False
-    assert got["code"] in ("cross_scope_record", "review_stale")
-
-
-def test_station_absent_still_works_in_the_same_scope(reviewed):
-    """反向锁：作用域一致时必须能正常解除（否则功能不可用）。"""
-    path, record_id = reviewed
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[record_id],
-        confirm="station_absent", note="我已确认站内没有",
-        origin="https://sss.example.com")
-
-    assert got["ok"] is True and got["changed"] is True
-    state = blocking_state(path, delivery_date="2026-09-12", account="18758187837",
-                           origin="https://sss.example.com")
-    assert state["blocked"] is False
-
-
-# ======================================================================
-# A16b：scan_failed 不能支撑 station_absent，且仍保持阻断
-# ======================================================================
-
-def test_scan_failed_cannot_unblock(tmp_path: Path):
-    path = tmp_path / "sss_uncertain.json"
-    key = batch_key("2026-09-12", "", "18758187837")
-    append_records(path, key, [_entry(identifier="a")], meta=_meta())
-
-    def boom(_path: str):
-        raise RuntimeError("接口 500")
-
-    snapshot = review.start_review(path, delivery_date="2026-09-12",
-                                  account="18758187837",
-                                  origin="https://sss.example.com", fetch_json=boom)
-    assert snapshot["counts"]["scan_failed"] == 1
-
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[_id_of(path, "a")],
-        confirm="station_absent", note="读取失败但我认为没有",
-        origin="https://sss.example.com")
-
-    assert got["ok"] is False and got["code"] == "station_not_absent"
-    assert "查询失败或找到相似订单都不能当成没下单" in got["reason"]
-    state = blocking_state(path, delivery_date="2026-09-12", account="18758187837",
-                           origin="https://sss.example.com")
-    assert state["blocked"] is True, "读取失败后必须继续阻断"
-
-
-# ======================================================================
-# A17b：核对快照过期 → 拒绝解除
-# ======================================================================
-
-def test_expired_review_snapshot_cannot_unblock(reviewed):
-    path, record_id = reviewed
-    snapshot = review.load_snapshot(path)
-    assert snapshot is not None
-    # 把快照时间推到 2 小时前（TTL 是 600 秒）
-    stale = (dt.datetime.now() - dt.timedelta(hours=2)).isoformat(timespec="seconds")
-    snapshot["created_at"] = stale
-    review._atomic_write(review.review_snapshot_path(path), snapshot)
-
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[record_id],
-        confirm="station_absent", note="我用的是旧证据",
-        origin="https://sss.example.com")
-
-    assert got["ok"] is False and got["code"] == "review_stale"
-    assert "已过期" in got["reason"]
-
-
-def test_record_not_in_review_is_rejected(reviewed):
-    """记录在核对之后新增 → 不在快照里 → 不能拿别人的证据解除它。"""
-    path, _record_id = reviewed
-    key = batch_key("2026-09-12", "", "18758187837")
-    append_records(path, key, [_entry(identifier="b", name="新人", phone="13900000002")],
-                   meta=_meta())
-    new_id = _id_of(path, "b")
-
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[new_id],
-        confirm="station_absent", note="我认为也没有",
-        origin="https://sss.example.com")
-
-    assert got["ok"] is False
-    assert got["code"] in ("review_stale", "record_not_in_review")
-
-
-# ======================================================================
-# A18 补强：keep 之后必须仍然阻断
-# ======================================================================
-
-def test_keep_keeps_blocking_and_never_writes(tmp_path: Path):
-    path = tmp_path / "sss_uncertain.json"
-    key = batch_key("2026-09-12", "", "18758187837")
-    append_records(path, key, [_entry(identifier="a")], meta=_meta())
-
-    got = review.resolve_records(
-        path, delivery_date="2026-09-12", account="18758187837",
-        decision="keep", record_ids=[_id_of(path, "a")], confirm="keep",
-        note="先不动", origin="https://sss.example.com")
-
-    assert got["ok"] is True and got["status"] == "kept"
-    assert got["changed"] is False
-    assert got.get("cloud_write") is False
-    state = blocking_state(path, delivery_date="2026-09-12", account="18758187837",
-                           origin="https://sss.example.com")
-    assert state["blocked"] is True
-
-
-# ======================================================================
 # A19：浏览器表单路径 —— 提交前留痕 + 异常归类与接口路径一致
 # ======================================================================
 
@@ -732,6 +494,8 @@ class _FakePage:
             self.visible.discard(missing_element)
         self.form: dict[str, str] = {}
         self.mask_visible = True
+        # 置为 True 后列表接口返回 500：模拟"查站失败"（对账必须失败关闭）。
+        self.list_fails = False
         self.keyboard = _FakeKeyboard(self)
 
     def _click(self, key: str, picked: str) -> None:
@@ -791,6 +555,8 @@ class _FakePage:
         path = str(arg.get("path") or "")
         self.calls.append((method, path))
         assert method != "POST", "表单模式下建单不再走页面内 fetch POST"
+        if "list" in path and self.list_fails:
+            raise RuntimeError("对账列接口 500")
         if "list" in path:
             payload = {"success": True, "result": {"records": self._list_records,
                                                   "total": len(self._list_records)}}
@@ -848,86 +614,99 @@ def browser_env(tmp_path, monkeypatch):
     return cfg, page
 
 
-def test_browser_path_writes_inflight_before_submit(browser_env, tmp_path):
-    """A19：浏览器表单路径也必须在最终确定（提交动作）之前留下 inflight 记录。"""
+def test_browser_path_submits_and_reconciles(browser_env):
+    """A19：浏览器表单路径真的点下最终确定，并以站内对账确认为准。"""
     cfg, page = browser_env
-    journal_path = Path(cfg.sss_uncertain_path)
-    seen_statuses: list[str] = []
-    real_append = sss_module.append_records
 
-    def spy_append(path, key, entries, **kwargs):
-        if path == journal_path or str(path) == str(journal_path):
-            seen_statuses.extend(str(entry.get("status") or "")
-                                 for entry in entries)
-        return real_append(path, key, entries, **kwargs)
-
-    sss_module.append_records, original = spy_append, sss_module.append_records
-    try:
-        result = run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
-                             password="pw", captcha_callback=lambda _img: "1234")
-    finally:
-        sss_module.append_records = original
+    result = run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
+                         password="pw", captcha_callback=lambda _img: "1234")
 
     assert result["created"] == 2, "假实现里两单都应成功"
+    assert result["reconciled"] is True
+    assert result["uncertain"] is False
     assert len(page.confirms) == 2, "表单路径应该真的点下最终确定"
     assert all(method != "POST" for method, _path in page.calls), (
         "表单模式下建单不再走页面内 fetch POST")
-    assert "inflight" in seen_statuses, "最终确定之前必须先写 inflight"
-
-    # 提交之后收尾对账在站内找到了这两单 → 记录被标记为 resolved（这正是设计语义：
-    # 只有"站内确实已有"才算确认），闸门随之解除。
-    records = load_journal(journal_path)["records"]
-    assert records and all(record["status"] == "resolved" for record in records), (
-        [record["status"] for record in records])
-    state = blocking_state(journal_path,
-                           delivery_date=sss_module.expected_delivery_date().isoformat(),
-                           account=cfg.sss_account, origin="https://sss.example.com")
-    assert state["blocked"] is False
 
 
-def test_browser_path_modal_stuck_is_unknown_not_failure(browser_env, monkeypatch):
-    """A19：最终确定点击后弹窗收不了场 → 必须留 unresolved，不能当成"明确拒绝"。"""
+def test_browser_path_modal_stuck_ends_at_the_reconciliation_verdict(
+        browser_env, monkeypatch):
+    """A19：弹窗收不了场 → 提交层按未知处理；站内对账查得到就据实给结论。
+
+    平台驳回/超时都表现为"点了最终确定却没拿到收场信号"；此时**只看站内**：
+    假页面里这一单并没落单，于是收尾对账如实给出"确认 0/2、2 单未完成"，
+    而不是含糊的"结果未知"。绝不因为一次没收场就自动重发同一单。
+    """
     cfg, page = browser_env
     monkeypatch.setattr(sss_module, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
     monkeypatch.setattr(sss_module, "_UI_MODAL_POLL_MS", 100)
     page._modal_never_closes = True
 
-    run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
-                password="pw", captcha_callback=lambda _img: "1234")
+    result = run_sss_job(cfg, threading.Event(),
+                         progress_callback=lambda _m: None,
+                         password="pw", captcha_callback=lambda _img: "1234")
 
-    records = load_journal(Path(cfg.sss_uncertain_path))["records"]
-    assert records, "结果未知后必须留下未决记录"
-    assert all(record["status"] == "unresolved" for record in records), (
-        "弹窗收不了场绝不能被记成「未落单」——那样下一次运行就能重复下单")
-    state = blocking_state(Path(cfg.sss_uncertain_path),
-                           delivery_date=sss_module.expected_delivery_date().isoformat(),
-                           account=cfg.sss_account, origin="https://sss.example.com")
-    assert state["blocked"] is True
+    assert result["created"] == 0, "弹窗没收场就不该被当成确认成功"
+    assert result["reconciled"] is True
+    assert result["partial"] is True, "站内对账确认没落单，据实报部分完成"
+    assert result["uncertain"] is False
+    assert len(page.confirms) == 2, "假页面里每单只点一次，绝不自动重发同一单"
 
 
-def test_browser_path_stuck_page_after_modal_close_is_unknown(browser_env, tmp_path):
-    """遮罩收场但「创建订单」不恢复：同样是"没拿到可确认结果"。"""
+def test_browser_path_modal_stuck_with_failed_reconciliation_is_unknown(
+        browser_env, monkeypatch):
+    """A19：弹窗收不了场 **且**站内查不出来 → 结果未知，绝不显示成干净失败。"""
+    cfg, page = browser_env
+    monkeypatch.setattr(sss_module, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sss_module, "_UI_MODAL_POLL_MS", 100)
+    page._modal_never_closes = True
+    # 对账列接口整体 500：form 提交照常走，但查站失败。
+    original_click = page._click
+
+    def click_then_break_list(key: str, picked: str) -> None:
+        original_click(key, picked)
+        page.list_fails = True
+
+    page._click = click_then_break_list
+
+    result = run_sss_job(cfg, threading.Event(),
+                         progress_callback=lambda _m: None,
+                         password="pw", captcha_callback=lambda _img: "1234")
+
+    assert result["uncertain"] is True, (
+        "查站失败 + 弹窗没收场 = 结果未知；显示成干净失败会让用户直接重跑")
+    assert result["reconciled"] is False
+    assert result["created"] == 0
+
+
+def test_browser_path_stuck_page_after_modal_close_falls_back_to_reconciliation(
+        browser_env, tmp_path):
+    """遮罩收场但「创建订单」不恢复：提交层同样按未知处理，由站内对账定论。"""
     _write_sss_excel(tmp_path, rows=1)  # 单单场景，避免把重登路径搅进来
     cfg, page = browser_env
     page._create_never_recovers = True
 
-    run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
-                password="pw", captcha_callback=lambda _img: "1234")
+    result = run_sss_job(cfg, threading.Event(),
+                         progress_callback=lambda _m: None,
+                         password="pw", captcha_callback=lambda _img: "1234")
 
-    records = load_journal(Path(cfg.sss_uncertain_path))["records"]
-    assert records and all(record["status"] == "unresolved" for record in records)
+    assert result["created"] == 0
+    assert result["reconciled"] is True
+    assert result["partial"] is True, "查站确认没落单 → 部分完成，而不是含糊的未知"
+    assert len(page.confirms) == 1, "只点过一次最终确定，没有自动重发"
 
 
-def test_browser_path_pre_submit_failure_closes_the_record(browser_env):
-    """反向锁：最终确定**之前**的确定性失败（这一单确定没创建）可以安全关闭记录。"""
+def test_browser_path_pre_submit_failure_is_a_definite_failure(browser_env):
+    """反向锁：最终确定**之前**的确定性失败 → 这单确定没创建。"""
     cfg, page = browser_env
     page.visible.discard("#receiveName")  # 表单中途丢失姓名输入框
 
-    run_sss_job(cfg, threading.Event(), progress_callback=lambda _m: None,
-                password="pw", captcha_callback=lambda _img: "1234")
+    result = run_sss_job(cfg, threading.Event(),
+                         progress_callback=lambda _m: None,
+                         password="pw", captcha_callback=lambda _img: "1234")
 
-    records = load_journal(Path(cfg.sss_uncertain_path))["records"]
-    assert records and all(record["status"] == "discarded" for record in records)
+    assert result["created"] == 0
+    assert page.confirms == [], "最终确定从未被点击 —— 这单确定没有创建"
 
 
 def test_missing_success_field_is_treated_as_unknown():
@@ -1014,7 +793,7 @@ def test_conflict_reports_the_running_operation(tmp_path):
     bridge._config.excel_path.write_bytes(b"x")
     operation, _ = bridge._reserve("order", title="订单处理", phase="登录")
     try:
-        got = bridge.sss_uncertain_records()
+        got = bridge.operation_status()
         assert got["ok"] is True, "只读查询不该被互斥挡住"
         conflict = bridge.wps_preview()
         assert conflict["ok"] is False
@@ -1024,76 +803,6 @@ def test_conflict_reports_the_running_operation(tmp_path):
         assert conflict["conflicting_operation"]["mode"] == "order"
     finally:
         bridge._operations.finish(operation, status="success")
-
-
-# ======================================================================
-# A23：跨范围与历史未决必须可见、可在正确范围核对
-# ======================================================================
-
-def test_a23_cross_scope_records_stay_visible(tmp_path, monkeypatch):
-    """换账号/换日期之后，旧记录不能消失：要在 other_scope / history 里看得见。"""
-    from app.bridge import Bridge
-
-    # 日期必须用程序真正会用的"送达日"：其它日期会被归到 history。
-    from app.sss import expected_delivery_date
-
-    day = expected_delivery_date().isoformat()
-    yesterday = (expected_delivery_date() - dt.timedelta(days=1)).isoformat()
-    state = tmp_path / "sss_uncertain.json"
-    append_records(state, batch_key(day, "", "18758187837"),
-                   [_entry(identifier="今天的单")], meta=_meta(delivery_date=day))
-    append_records(state, batch_key(yesterday, "", "18758187837"),
-                   [_entry(identifier="昨天的单", phone="13900000009")],
-                   meta=_meta(delivery_date=yesterday))
-    append_records(state, batch_key(day, "", "13900000000"),
-                   [_entry(identifier="别的账号的单", phone="13900000008")],
-                   meta=_meta(account="13900000000", delivery_date=day))
-
-    bridge = Bridge(config_path=str(tmp_path / "config.json"))
-    bridge._config.sss_account = "18758187837"
-    bridge._config.sss_url = "https://sss.example.com/takeout"
-
-    got = bridge.sss_uncertain_records()
-
-    assert got["ok"] is True
-    identifiers = {item["identifier"] for item in got["records"]}
-    assert identifiers == {"今天的单"}, "当前范围只列自己的那一条"
-    groups = got["groups"]
-    assert {item["identifier"] for item in groups["other_scope"]} == {"别的账号的单"}
-    assert {item["identifier"] for item in groups["history"]} == {"昨天的单"}
-    assert got["other_scope_count"] == 1
-    assert "其它范围" in (got["next_action"] or ""), got["next_action"]
-    # 脱敏：列表里不能出现完整手机号
-    blob = json.dumps(got, ensure_ascii=False, default=str)
-    assert "13900000008" not in blob and "13900000009" not in blob
-    # 只读：查询不该改动日志
-    assert load_journal(state)["records"][0]["status"] == "unresolved"
-
-
-def test_a23_cannot_resolve_a_record_from_another_scope(tmp_path):
-    """用当前账号的证据处置别的账号的记录必须被拒绝。"""
-    from app import sss_review as review
-
-    state = tmp_path / "sss_uncertain.json"
-    append_records(state, batch_key("2026-09-12", "", "13900000000"),
-                   [_entry(identifier="别的账号的单", phone="13900000008")],
-                   meta=_meta(account="13900000000"))
-    fetch = _fetch_queue({"success": True, "result": {"records": [], "total": 0}})
-    review.start_review(state, delivery_date="2026-09-12", account="13900000000",
-                        origin="https://sss.example.com", fetch_json=fetch)
-    record_id = _id_of(state, "别的账号的单")
-
-    got = review.resolve_records(
-        state, delivery_date="2026-09-12", account="18758187837",
-        decision="station_absent", record_ids=[record_id],
-        confirm="station_absent", note="我用当前账号确认过",
-        origin="https://sss.example.com")
-
-    assert got["ok"] is False and got["code"] == "cross_scope_record"
-    state_now = blocking_state(state, delivery_date="2026-09-12",
-                               account="13900000000",
-                               origin="https://sss.example.com")
-    assert state_now["blocked"] is True, "别的账号的记录不能被当前账号解除"
 
 
 # ======================================================================
