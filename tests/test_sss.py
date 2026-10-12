@@ -388,7 +388,7 @@ def test_min_interval_spaces_post_starts():
 
 
 def test_zero_interval_keeps_immediate_dispatch_without_penalty():
-    """0 = 关闭节流：不排队等待、也不自动放宽（与引入节流前的行为一致）。"""
+    """0 = 关闭节流：不排队等待、也不产生任何节流日志（与引入节流前的行为一致）。"""
     tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(3)]
     logs = []
 
@@ -402,39 +402,31 @@ def test_zero_interval_keeps_immediate_dispatch_without_penalty():
     assert {identifier for identifier, _detail in result.failures} == {
         f"t{i}" for i in range(3)}
     assert result.succeeded == set()
-    assert not any("自动放宽" in message for message in logs)
     assert not any("提交最小间隔" in message for message in logs)
 
 
-def test_platform_fast_reject_widens_the_submit_interval():
-    """平台快速驳回（IndexOutOfBounds）后自动放宽间隔，且分类不变。"""
-    import time
+def test_platform_fast_reject_leaves_the_interval_untouched(monkeypatch):
+    """平台快速驳回（IndexOutOfBounds）不再放宽间隔：节奏恒定，分类不变。
 
+    2026-10-12 移除自适应放宽前的行为是每次驳回 ×1.5（上限 10 秒）。实测它既
+    不能阻止驳回，又把下单节奏拖慢数倍，因此直接删除；这条用例锁死间隔不变。
+    """
+    traces = []
+    monkeypatch.setattr(sss, "_trace", traces.append)
     tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(4)]
-    starts = []
-    logs = []
 
     def submit(payload):
-        starts.append(time.perf_counter())
         return {"success": False, "message": INTERNAL_ERROR}
 
-    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), logs.append,
+    result = sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), None,
                                           max_workers=4, min_interval_s=0.15)
-    gaps = [later - earlier for earlier, later in zip(starts, starts[1:])]
-    assert len(result.failures) == 4 and not result.succeeded
-    # 首次驳回即放宽到 0.225 秒，之后继续放宽：最后一个间隔应明显大于最初间隔。
-    assert gaps[-1] >= 0.3, gaps
-    assert gaps[-1] > gaps[0]
-    assert any("自动放宽" in message for message in logs)
-
-
-def test_pacer_penalty_stops_at_its_ceiling():
-    pacer = sss._SubmitPacer(4.0)
-    assert pacer.wait() is True
-    assert pacer.penalize() == pytest.approx(6.0)
-    assert pacer.penalize() == pytest.approx(9.0)
-    assert pacer.penalize() == pytest.approx(10.0)  # 13.5 → 夹到上限
-    assert pacer.penalize() is None  # 已到上限，不再放宽
+    # 4 单全部被明确拒绝 → 显式失败（分类与引入放宽时一致），且全部是快速返回
+    assert {identifier for identifier, _detail in result.failures} == {
+        f"t{i}" for i in range(4)}
+    assert result.succeeded == set()
+    intervals = {line.rsplit("min_interval_s=", 1)[1] for line in traces
+                 if "min_interval_s=" in line}
+    assert intervals == {"0.150"}, traces
 
 
 def test_pacer_aborts_waiting_on_stop_or_halt():
@@ -453,20 +445,25 @@ def test_disabled_pacer_never_waits_or_aborts():
     from threading import Event
 
     pacer = sss._SubmitPacer(0.0)
-    assert pacer.penalize() is None
     stopped = Event()
     stopped.set()
     assert pacer.wait(stopped) is True
 
 
-def test_rate_reject_signature_only_matches_the_over_rate_error():
-    assert sss._is_rate_reject_response(
-        {"success": False, "message": INTERNAL_ERROR}) is True
-    assert sss._is_rate_reject_response(
-        {"success": False, "message": "地址无效"}) is False
-    assert sss._is_rate_reject_response(
-        {"success": False, "message": "java.lang.RuntimeException: 其他异常"}) is False
-    assert sss._is_rate_reject_response(None) is False
+def test_pacer_interval_never_drifts(monkeypatch):
+    """节流间隔恒定：连发若干次（含被平台快速驳回）后仍是初始值。"""
+    traces = []
+    monkeypatch.setattr(sss, "_trace", traces.append)
+    tasks = [{"identifier": f"t{i}", "payload": {"i": i}} for i in range(4)]
+
+    def submit(payload):
+        return {"success": False, "message": INTERNAL_ERROR}
+
+    sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), None,
+                                 max_workers=4, min_interval_s=0.15)
+    intervals = [line.rsplit("min_interval_s=", 1)[1] for line in traces
+                 if "min_interval_s=" in line]
+    assert intervals and set(intervals) == {"0.150"}, traces
 
 
 # ----------------------------------------------------------------------
@@ -661,18 +658,22 @@ def test_api_settle_delays_each_post_attempt():
     assert starts[1] - starts[0] >= 0.15, starts
 
 
-def test_api_settle_is_excluded_from_the_http_latency_window():
-    """静默不计入 HTTP 耗时：否则会顶破快速驳回判定、让自动放宽节流失效。"""
-    logs = []
+def test_api_settle_is_excluded_from_the_http_latency_window(monkeypatch):
+    """静默不计入 HTTP 耗时：否则埋点里的耗时会把静默时长算进去。"""
+    traces = []
+    monkeypatch.setattr(sss, "_trace", traces.append)
 
     def submit(payload):
         return {"success": False, "message": INTERNAL_ERROR}
 
     sss._submit_tasks_concurrent(
-        _only_task(), submit, _NeverStopped(), logs.append, max_workers=1,
+        _only_task(), submit, _NeverStopped(), None, max_workers=1,
         min_interval_s=0.05, pre_submit_settle_s=1.6, submit_attempts=1)
-    assert any("自动放宽" in message for message in logs), (
-        "静默 1.6s 若被算进 HTTP 耗时，快速驳回（≤1.5s）判定就不会触发")
+    post_lines = [line for line in traces if line.startswith("POST ")]
+    assert len(post_lines) == 1, traces
+    elapsed = float(post_lines[0].split(": ", 1)[1].split("s ->", 1)[0])
+    assert elapsed < 1.0, (
+        f"静默 1.6s 若被算进 HTTP 耗时，埋点会记成 {elapsed:.2f}s：{post_lines[0]}")
 
 
 def test_run_sss_job_api_mode_recovers_from_platform_rejections(
@@ -744,7 +745,11 @@ def test_pacing_wait_aborts_on_halt_without_sending():
 
 
 def test_round_summary_reports_the_active_pacing():
-    """本轮汇总行（对齐服务端 v3.6.18）：耗时/吞吐 + 生效的提交最小间隔。"""
+    """本轮汇总行（对齐服务端 v3.6.18）：只报耗时/吞吐，不再附提交最小间隔。
+
+    2026-10-12 移除自适应放宽时一并去掉汇总行里的间隔后缀；逐单间隔仍可从
+    ``YIKOU_SSS_TRACE=1`` 的 POST 埋点（``min_interval_s``）读到。
+    """
     logs = []
     tasks = [{"identifier": "t0", "payload": {}}]
 
@@ -753,8 +758,8 @@ def test_round_summary_reports_the_active_pacing():
 
     sss._submit_tasks_concurrent(tasks, submit, _NeverStopped(), logs.append, 1,
                                  min_interval_s=2.5)
-    assert any("本轮提交 1 单" in message and "；提交最小间隔 2.5 秒" in message
-               for message in logs), logs
+    assert any("本轮提交 1 单" in message for message in logs), logs
+    assert not any("提交最小间隔" in message for message in logs), logs
 
 
 @pytest.mark.parametrize("given,expected", [

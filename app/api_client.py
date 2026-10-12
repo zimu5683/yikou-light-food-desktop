@@ -42,9 +42,9 @@ def is_internal_error_payload(payload: Any) -> bool:
     ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``。
 
     与结果分类**无关**：本项目的 ``_check_success`` 仍只按 ``success`` 字段归类
-    （``success=false`` = 服务端明确拒绝，可人工重试）。这个判定只用于识别平台的
-    「快速驳回」特征（内部异常且 message 含 ``IndexOutOfBounds``），供提交节流
-    自适应放宽使用，不参与记录与重发语义。
+    （``success=false`` = 服务端明确拒绝，可人工重试）。这个判定只用于识别"可以
+    安全重试的明确拒绝"（``app/sss.py::_is_retryable_reject``），不参与记录与
+    重发语义；提交节奏也不再由它触发任何自适应调整（2026-10-12 起）。
     """
     if not isinstance(payload, dict):
         return False

@@ -141,13 +141,18 @@ _FALLBACK_SSS_CREATE_WORKERS = 1
 # 且每个请求都消耗一个平台订单序列号）。4 路滚动补位下被驳回的车道会立刻补发
 # 下一单，实际发送节奏可达约 1.37 POST/秒（约 3 倍超速），于是每轮约 2/3 被驳回。
 # 这里令相邻两次 POST 的**起点**至少间隔 ``sss_submit_min_interval_s``（出厂
-# 2.5 秒，0 = 关闭），并发路数不变；出现快速驳回特征时自动放宽间隔自保。
-# 节流只影响发送节奏，不改变任何结果分类、记录与重发语义。
-# 注意：2.1 秒是现场观察到的受理节奏，不是已证实的平台硬限速（见
-# docs/闪时送周期失败与序号跳号排查-2026-10-09.md §5.3），2.5 秒是保守试探值。
-_SUBMIT_FAST_REJECT_MAX_S = 1.5          # 「快速驳回」的耗时上限（秒）
-_SUBMIT_INTERVAL_PENALTY_FACTOR = 1.5    # 每次自动放宽的倍数
-_SUBMIT_INTERVAL_PENALTY_MAX_S = 10.0    # 自动放宽的上限（秒）
+# 2.5 秒，0 = 关闭），并发路数不变。节流只影响发送节奏，不改变任何结果分类、
+# 记录与重发语义。
+# 注意：2.1 秒是当时现场观察到的受理节奏，**不是已证实的平台硬限速**（见
+# docs/闪时送周期失败与序号跳号排查-2026-10-09.md §5.3；服务端后来以当晚实测
+# 推翻了这一推断，见 yikou-light-food-server 的 docs/SSS-下单失败与重试排查.md
+# 修正段与 `app/ordering/constants.py`），2.5 秒是保守试探值。
+# 2026-10-12 移除「快速驳回自动放宽间隔（×1.5、上限 10 秒）」，与服务端现版本
+# 对齐：平台的建单内部异常（IndexOutOfBounds 等）只代表"结果待对账"，既不是受理
+# 超速的证据，也不能被当成"没有落单"。实测在 2.5 秒节流下平台仍会零星快速驳回，
+# 再把间隔放大到 8.4-10 秒并不能阻止驳回，只是把每单节奏拖慢数倍。现在间隔一旦
+# 按配置生效就恒定不变；要放宽或彻底关闭，一律改 ``sss_submit_min_interval_s``
+# （0 = 关闭），不设自适应。
 _DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S = 2.5 # 出厂默认提交最小间隔（秒）
 _SSS_SUBMIT_MIN_INTERVAL_CEILING_S = 60.0
 # 对账页大小。实测 2026-09-10：100 条/页每页约 2.0s；改成 1000 条/页反而要
@@ -1758,7 +1763,8 @@ def resolve_submit_min_interval_s(config: Any) -> float:
 
     拿不到配置（缺字段或取值不可解析）时按出厂默认（2.5 秒）保守节流——宁可
     按节奏慢发，也不要全速连发触发平台的快速驳回（内部异常，且每个请求都会
-    消耗一个平台订单序列号）。
+    消耗一个平台订单序列号）。间隔一经确定就不再变化（2026-10-12 起没有自适应
+    放开/放宽；要改只改配置本身，见 ``_DEFAULT_SSS_SUBMIT_MIN_INTERVAL_S``）。
     """
     try:
         interval = float(getattr(config, "sss_submit_min_interval_s",
@@ -1772,42 +1778,18 @@ def resolve_submit_min_interval_s(config: Any) -> float:
 
 def _emit_round_summary(callback: Callable[[str], Any] | None,
                         latencies: list[float],
-                        started_at: float,
-                        min_interval_s: float | None = None) -> None:
+                        started_at: float) -> None:
     """本轮提交的实测汇总：并发到底有没有用，全看这一行。
 
-    吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。启用提交节流时补一句当前
-    生效的最小间隔，便于与平台受理节奏（现场观察约 1 单 / 2.1 秒）对照。
+    吞吐 = 单数 / 墙钟，每单均时 = 服务端建单耗时。
     """
     if not latencies:
         return
     wall = max(0.0, time.perf_counter() - started_at)
     average = sum(latencies) / len(latencies)
     throughput = (len(latencies) / wall) if wall > 0 else 0.0
-    message = (f"本轮提交 {len(latencies)} 单，耗时 {wall:.1f} 秒，"
-               f"每单平均 {average:.1f} 秒（吞吐 {throughput:.2f} 单/秒）")
-    try:
-        pacing = float(min_interval_s) if min_interval_s else 0.0
-    except (TypeError, ValueError):
-        pacing = 0.0
-    if pacing > 0:
-        message += f"；提交最小间隔 {pacing:g} 秒"
-    _emit(callback, message)
-
-
-def _is_rate_reject_response(response: Any) -> bool:
-    """平台「受理超速」特征的快速驳回：内部异常且 message 含 ``IndexOutOfBounds``。
-
-    2026-10-09 现场（见 docs/闪时送周期失败与序号跳号排查-2026-10-09.md）：超过
-    平台受理节奏的建单请求在约 0.3-1 秒内返回
-    ``java.lang.IndexOutOfBoundsException: Index: 0, Size: 0``，且仍会消耗一个
-    平台订单序列号。该判定只用于提交节奏的自适应放宽（``_SubmitPacer.penalize``），
-    不参与任何结果分类、记录或重发语义。
-    """
-    if not isinstance(response, dict) or not is_internal_error_payload(response):
-        return False
-    message = str(response.get("message") or response.get("msg") or "")
-    return "IndexOutOfBounds" in message
+    _emit(callback, (f"本轮提交 {len(latencies)} 单，耗时 {wall:.1f} 秒，"
+                     f"每单平均 {average:.1f} 秒（吞吐 {throughput:.2f} 单/秒）"))
 
 
 def _is_retryable_reject(response: Any) -> bool:
@@ -1829,14 +1811,14 @@ class _SubmitPacer:
 
     4 路滚动补位下，被快速驳回的车道能在 0.36 秒内补发下一单，实际发送节奏
     会被推到远超平台受理节奏的水平。这里在 POST 之前统一排队，让发送起点按
-    最小间隔错开；出现平台的快速驳回特征时自动放宽间隔（``penalize``）。
-    节流只影响节奏，不改变任何结果分类与重发语义。
+    最小间隔错开。间隔恒定：既不随驳回自适应放宽（2026-10-12 移除，实测它只
+    拖慢下单速度），也不做任何加速。节流只影响节奏，不改变任何结果分类与重发
+    语义。
     """
 
     def __init__(self, interval_s: float) -> None:
         self._lock = Lock()
         self._interval = max(0.0, float(interval_s or 0.0))
-        self._ceiling = max(_SUBMIT_INTERVAL_PENALTY_MAX_S, self._interval)
         self._next_allowed = 0.0  # time.perf_counter 时间基准
 
     def wait(self, stop_event: Any = None,
@@ -1865,15 +1847,6 @@ class _SubmitPacer:
                     return True
                 delay = min(self._next_allowed - now, 0.25)
             time.sleep(delay)
-
-    def penalize(self) -> float | None:
-        """平台快速驳回后放宽间隔；返回放宽后的值，未启用/已到上限时返回 None。"""
-        with self._lock:
-            if self._interval <= 0.0 or self._interval >= self._ceiling:
-                return None
-            self._interval = min(self._ceiling,
-                                 self._interval * _SUBMIT_INTERVAL_PENALTY_FACTOR)
-            return self._interval
 
     @property
     def interval(self) -> float:
@@ -1904,18 +1877,18 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
     等价，还省掉线程切换。
 
     ``min_interval_s`` > 0 时启用全局提交节流（见 `_SubmitPacer`）：相邻两次
-    POST 的**起点**至少间隔该值，贴近平台对同一账号的建单受理节奏；出现平台
-    快速驳回特征时自动放宽间隔。0 = 关闭节流（行为与引入节流前完全一致）。
-    结束后输出一行本轮汇总（见 `_emit_round_summary`）。
+    POST 的**起点**至少间隔该值，贴近平台对同一账号的建单受理节奏；间隔恒定
+    （2026-10-12 起不再随驳回自适应放宽），0 = 关闭节流（行为与引入节流前完全
+    一致）。结束后输出一行本轮汇总（见 `_emit_round_summary`）。
 
     ``pre_submit_settle_s`` > 0 时在**每次 POST 之前**静默该秒数（位置等价于
-    浏览器模式"填完等 0.5s 再点确定"）；静默**不计入 HTTP 耗时**，否则会顶破
-    ``_SUBMIT_FAST_REJECT_MAX_S`` 的快速驳回判定、让自动放宽节流失效。
+    浏览器模式"填完等 0.5s 再点确定"）；静默**不计入 HTTP 耗时**，避免把静默
+    时长混进请求耗时统计。
 
     ``submit_attempts`` > 1 时，**仅当**服务端明确拒绝且属于平台内部错误
-    （``_is_retryable_reject``）才重试；重试同样先过 ``pacer.wait``（吃全局节流
-    与自动放宽），被停止/401/余额拦下时保留本次失败结论（该单确实发出过请求，
-    绝不记成"未发送"）。默认 1 = 与引入重试前完全一致。
+    （``_is_retryable_reject``）才重试；重试同样先过 ``pacer.wait``（吃全局节流），
+    被停止/401/余额拦下时保留本次失败结论（该单确实发出过请求，绝不记成
+    "未发送"）。默认 1 = 与引入重试前完全一致。
     """
     result = _SubmitResult()
     workers = max(1, int(max_workers))
@@ -1975,18 +1948,6 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                 state, detail = "success", ""
             elapsed = time.perf_counter() - started
             spent += elapsed
-            # 平台「受理超速」的快速驳回：自动放宽提交节奏（自保）。桌面版把
-            # ``success=false`` 的平台拒绝归类为显式失败，与把平台内部异常归为
-            # uncertain 的服务端不同；因此这里按「响应特征 + 快速返回」判定，
-            # 两种分类都接受，只放宽节奏，不改变分类与重发语义。
-            if (state in ("uncertain", "failure")
-                    and elapsed <= _SUBMIT_FAST_REJECT_MAX_S
-                    and _is_rate_reject_response(response)):
-                widened = pacer.penalize()
-                if widened is not None:
-                    _emit(callback, "平台快速驳回（疑似建单受理超速）；"
-                                    f"提交最小间隔自动放宽到 {widened:g} 秒"
-                                    "（结果分类与重发语义不变）")
             _trace(f"POST {identifier}"
                    + (f"（第 {attempts_done}/{attempts} 次尝试）" if attempts > 1 else "")
                    + f": {elapsed:.2f}s -> {state}；min_interval_s={interval_at_send:.3f}")
@@ -2037,7 +1998,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
         if stop_event.is_set() and on_stop is not None:
             on_stop()
         result.stopped = bool(result.stopped or stop_event.is_set())
-        _emit_round_summary(callback, latencies, round_started, pacer.interval)
+        _emit_round_summary(callback, latencies, round_started)
         return result
 
     iterator = iter(tasks)
@@ -2072,7 +2033,7 @@ def _submit_tasks_concurrent(tasks: list[dict[str, Any]],
                     identifier, state, detail = task["identifier"], "uncertain", str(exc)
                 classify(identifier, state, detail)
         result.stopped = bool(result.stopped or stop_event.is_set())
-    _emit_round_summary(callback, latencies, round_started, pacer.interval)
+    _emit_round_summary(callback, latencies, round_started)
     return result
 
 
