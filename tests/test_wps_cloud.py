@@ -1583,7 +1583,7 @@ def test_sync_is_idempotent_for_text_phone_values():
     grid = make_grid(BASE_HEADER, [{0: "mer", 1: "小", 2: "'159678999961", 7: "4"}])
     cli = FakeCli(grid)
     orders = [CloudOrder("东湖中餐", "mer", "小", "159678999961", "中餐", "经济", 4)]
-    ledger = _ledger_with(tmpdir := tmp_path_dir(), "2026-09-11", "F1",
+    ledger = _ledger_with(tmp_path_dir(), "2026-09-11", "F1",
                           "mer", "159678999961", [4])
 
     first = _plan(cli, orders, ledger=ledger, sort=False)
