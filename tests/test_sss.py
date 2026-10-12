@@ -2024,7 +2024,10 @@ def test_expected_delivery_date_rolls_over_month_boundary():
 #
 # FakePage/FakeLocator 只实现 _ui_create_order 用到的 Playwright 最小表面：
 # 候选链定位（css/text/placeholder 的“是否可见”由 visible 集合决定）、点击、
-# 填充、按键、遮罩 hidden 轮询。真实浏览器交互不在离线测试范围（与旧约定一致）。
+# 填充、按键、遮罩可见性轮询。真实浏览器交互不在离线测试范围（与旧约定一致）。
+#
+# 平台驳回（2026-10-12 实测）：点了最终确定但弹窗不关，原表单数据不丢，
+# 再点一次即成功。FakePage.reject_times 模拟「前 N 次确定都被驳回」。
 
 
 class FakeLocator:
@@ -2058,6 +2061,8 @@ class FakeLocator:
 
     def click(self, timeout=None):
         self._page.record("click", self._key, self.picked)
+        # 只有**真正点下**才改变页面状态：wait_for 探测不能触发受理。
+        self._page.apply_click(self._key, self.picked)
 
     def fill(self, value, timeout=None):
         self._page.record("fill", self._key, str(value))
@@ -2073,9 +2078,19 @@ class FakeLocator:
 
 
 class FakePage:
-    def __init__(self, visible, mask_visible=True):
+    def __init__(self, visible, mask_visible=True, *, reject_times=0):
         self.visible = set(visible)
         self.mask_visible = mask_visible
+        # 遮罩可见性与 visible 集合保持同步：生产代码用
+        # ``.ant-modal-mask:visible`` 计数判定收场，两个表示必须一致。
+        if mask_visible:
+            self.visible.add(".ant-modal-mask:visible")
+        else:
+            self.visible.discard(".ant-modal-mask:visible")
+        # 前 reject_times 次点「最终确定」都被平台驳回（弹窗不关、无报错框按钮）。
+        self.reject_times = reject_times
+        self.final_clicks = 0   # 「最终确定」被真正点下的次数
+        self.reject_clicks = 0  # 驳回后"点掉报错"的次数（实测里点的是同一个按钮）
         self.actions = []
         self.on_click = None
 
@@ -2083,6 +2098,25 @@ class FakePage:
         self.actions.append((kind, key, value))
         if kind == "click" and self.on_click:
             self.on_click(key, value)
+
+    def apply_click(self, key, picked):
+        """把点击翻译成页面状态变化：最终确定按驳回预算决定收不收场。
+
+        ``picked`` 区分两个按钮：地址确定与"点掉报错"是 ``"last"``，最终确定
+        是首命中（""）。因此地址确定不会被算作提交；驳回报错在实测里点到的
+        很可能就是同一个按钮，这里按"再点一次确定"处理并单独计数。
+        """
+        if key not in ("确定", ".ant-modal-footer .ant-btn-primary"):
+            return
+        if picked != "":
+            if self.final_clicks > self.reject_clicks:
+                self.reject_clicks += 1
+            return
+        self.final_clicks += 1
+        if self.final_clicks <= self.reject_times:
+            return  # 平台驳回：弹窗不关、原表单数据不丢，等下一次点击
+        self.mask_visible = False
+        self.visible.discard(".ant-modal-mask:visible")
 
     # ---- _build_locator 的最小表面 ----
     def locator(self, selector):
@@ -2108,7 +2142,9 @@ class FakePage:
         raise AssertionError(f"unexpected wait_for_selector: {selector} {state}")
 
     def wait_for_timeout(self, ms):
-        pass
+        # 不真睡（否则整条流程要按 0.5s + 重试间隔累计）；把调用记进 actions，
+        # 用例据此断言"填完→首次点击"确实有静默。
+        self.actions.append(("wait", "timeout", int(ms)))
 
     def evaluate(self, script, arg=None):
         self.record("evaluate", "js", "")
@@ -2125,6 +2161,8 @@ def _ui_visible_set():
         "常用地址", "嗯哼", "确定",
         ".ant-picker-ok button",
         ".ant-modal-footer .ant-btn-primary",  # 地址确定/最终确定的 css 候选
+        ".ant-modal-footer .ant-btn-primary:visible",  # 驳回后重试点击的候选
+        ".ant-modal-mask:visible",  # 遮罩可见性轮询
         "请选择日期时间",  # 送达时间输入 placeholder
         "#receiveName", "#receiveMobile", _NAME_INPUT_XPATH, "#doorNum",
     }
@@ -2144,12 +2182,8 @@ def test_ui_create_order_success_drives_full_form_flow(monkeypatch, tmp_path):
     from app import automation as automation_mod
 
     monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    # mask_visible 的收场由 FakePage._apply_click 按点击语义驱动（首点即受理）。
     page = FakePage(_ui_visible_set(), mask_visible=True)
-    # 点下最终确定（普通 pick 的主按钮）后模拟服务端受理、弹窗收场。
-    # 候选链首选是 css（has_text_re），命中 key 是 css 字符串而非文本“确定”。
-    page.on_click = lambda key, picked: (
-        setattr(page, "mask_visible", False)
-        if key in ("确定", ".ant-modal-footer .ant-btn-primary") and picked == "" else None)
 
     result = sss._ui_create_order(
         page, _ui_payload(), SSS_LOCATORS, store_name="一口轻食",
@@ -2178,6 +2212,103 @@ def test_ui_create_order_success_drives_full_form_flow(monkeypatch, tmp_path):
     assert typed == ["2026-10-11 11:00:00"]
     presses = [value for kind, key, value in page.actions if kind == "press"]
     assert presses == ["ControlOrMeta+a", "Delete"]
+    # 收场一次成功：只点了一次最终确定，重试路径完全没被触发
+    assert page.final_clicks == 1, keys
+
+
+def test_ui_create_order_delays_before_the_first_confirm_click(monkeypatch, tmp_path):
+    """填完所有字段后必须先静默 _UI_FINAL_CONFIRM_DELAY_S 再点最终确定。"""
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    page = FakePage(_ui_visible_set(), mask_visible=True)
+
+    sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                         store_name="一口轻食", address_label="嗯哼",
+                         callback=None)
+
+    kinds = [(kind, value) for kind, _k, value in page.actions]
+    last_fill = max(i for i, (kind, _v) in enumerate(kinds) if kind == "fill")
+    first_confirm = next(
+        i for i, a in enumerate(page.actions)
+        if a == ("click", ".ant-modal-footer .ant-btn-primary", ""))
+    assert last_fill < first_confirm, page.actions
+    # 中间那次等待必须是 0.5s 静默（用户要求：填完不要立刻点）
+    waits = [(i, value) for i, (kind, _k, value) in enumerate(page.actions)
+             if kind == "wait"]
+    assert waits == [(last_fill + 1, int(sss._UI_FINAL_CONFIRM_DELAY_S * 1000))], waits
+
+
+def test_ui_create_order_retries_after_platform_rejection(monkeypatch, tmp_path):
+    """平台驳回（弹窗不关、原表单不丢）→ 点掉报错后重试，第 2 轮成功。"""
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    page = FakePage(_ui_visible_set(), mask_visible=True, reject_times=1)
+    logs: list[str] = []
+
+    result = sss._ui_create_order(
+        page, _ui_payload(), SSS_LOCATORS, store_name="一口轻食",
+        address_label="嗯哼", callback=logs.append)
+
+    assert result == {"success": True}
+    # 最终确定被点两次：首点被驳回、再点收场（表单数据不重填）
+    assert page.final_clicks == 2
+    assert any("平台驳回（第 1 次）" in line for line in logs)
+    assert any("平台驳回重试生效" in line for line in logs)
+    # 重试不是"重新填表"：姓名只填过一次
+    fills = [a for a in page.actions if a[:2] == ("fill", "#receiveName")]
+    assert len(fills) == 1
+
+
+def test_ui_create_order_retries_up_to_three_rounds(monkeypatch, tmp_path):
+    """连续两次驳回后第 3 轮成功（实测里存在这种单）。"""
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    page = FakePage(_ui_visible_set(), mask_visible=True, reject_times=2)
+
+    result = sss._ui_create_order(
+        page, _ui_payload(), SSS_LOCATORS, store_name="一口轻食",
+        address_label="嗯哼", callback=None)
+
+    assert result == {"success": True}
+    assert page.final_clicks == 3
+
+
+def test_ui_create_order_retry_exhausted_is_uncertain(monkeypatch, tmp_path):
+    """3 轮都收不了场 → 抛结果未知（交给收尾站内对账），绝不判"失败"。"""
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(sss, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(sss, "_UI_MODAL_POLL_MS", 100)
+    monkeypatch.setattr(sss, "_UI_REJECT_SETTLE_WINDOW_S", 0.0)
+    page = FakePage(_ui_visible_set(), mask_visible=True, reject_times=99)
+    logs: list[str] = []
+
+    with pytest.raises(sss._SubmissionUncertain):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=logs.append)
+    assert page.final_clicks == sss._UI_FINAL_CONFIRM_ATTEMPTS
+    assert any(f"重试 {sss._UI_FINAL_CONFIRM_ATTEMPTS} 次仍未收场" in line
+               for line in logs)
+
+
+def test_ui_create_order_no_retry_when_the_reject_click_fails(monkeypatch, tmp_path):
+    """点不到报错/确定按钮（弹窗被遮挡等）→ 立即停止重试，交给收尾等待判定。"""
+    from app import automation as automation_mod
+
+    monkeypatch.setattr(automation_mod, "user_data_dir", lambda: tmp_path)
+    monkeypatch.setattr(sss, "_UI_REJECT_SETTLE_WINDOW_S", 0.0)
+    page = FakePage(_ui_visible_set(), mask_visible=True)
+    page.visible.discard(".ant-modal-footer .ant-btn-primary")  # 脚部按钮整体消失
+
+    with pytest.raises(sss.LocatorError):
+        sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
+                             store_name="一口轻食", address_label="嗯哼",
+                             callback=None)
 
 
 def test_ui_create_order_raises_auth_expired_when_logged_out():
@@ -2208,7 +2339,9 @@ def test_ui_create_order_fails_before_final_confirm_keeps_no_uncertainty(monkeyp
 def test_ui_create_order_uncertain_when_modal_never_closes(monkeypatch):
     monkeypatch.setattr(sss, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
     monkeypatch.setattr(sss, "_UI_MODAL_POLL_MS", 100)
-    page = FakePage(_ui_visible_set(), mask_visible=True)  # 遮罩永远不收场
+    monkeypatch.setattr(sss, "_UI_REJECT_SETTLE_WINDOW_S", 0.0)
+    # 每次最终确定都被驳回：遮罩永远不收场
+    page = FakePage(_ui_visible_set(), mask_visible=True, reject_times=99)
     with pytest.raises(sss._SubmissionUncertain):
         sss._ui_create_order(page, _ui_payload(), SSS_LOCATORS,
                              store_name="一口轻食", address_label="嗯哼",
@@ -2218,6 +2351,7 @@ def test_ui_create_order_uncertain_when_modal_never_closes(monkeypatch):
 def test_ui_create_order_uncertain_when_create_button_never_recovers(monkeypatch):
     monkeypatch.setattr(sss, "_UI_MODAL_CLOSE_TIMEOUT_S", 0.6)
     monkeypatch.setattr(sss, "_UI_MODAL_POLL_MS", 100)
+    monkeypatch.setattr(sss, "_UI_RECOVER_TIMEOUT_MS", 300)
     page = FakePage(_ui_visible_set(), mask_visible=True)
 
     def on_click(key, picked):

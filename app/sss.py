@@ -38,11 +38,11 @@ try:
     from .automation import (
         BrowserNotFoundError,
         LocatorError,
-        _build_locator,
         _emit,
         _find_by_candidates,
         _launch_browser,
         _locator_failure,
+        _save_failure_snapshot,
     )
     from .locators import SSS_LOCATORS, load_sss_locators
     from .sss_import import ImportRefused, prepare_day_orders
@@ -54,11 +54,11 @@ except ImportError:  # pragma: no cover - allows ``python app/sss.py``
     from automation import (
         BrowserNotFoundError,
         LocatorError,
-        _build_locator,
         _emit,
         _find_by_candidates,
         _launch_browser,
         _locator_failure,
+        _save_failure_snapshot,
     )
     from locators import SSS_LOCATORS, load_sss_locators
     from sss_import import ImportRefused, prepare_day_orders
@@ -101,6 +101,17 @@ _UI_FINAL_CONFIRM_TIMEOUT_MS = 15_000   # 最终确定按钮
 _UI_MODAL_CLOSE_TIMEOUT_S = 90.0        # 点最终确定后等弹窗遮罩收场的总时限
 _UI_MODAL_POLL_MS = 5_000               # 遮罩轮询单次等待
 _UI_RECOVER_TIMEOUT_MS = 50_000         # 弹窗收场后等「创建订单」恢复可点
+# 最终确定的重试节奏（2026-10-12 真实账号 102 单实测值，见
+# docs/闪时送弹窗重试与移除未决阻断-实施计划-2026-10-12.md §2）。
+# 平台在建单节奏过快或内部偶发时会对「最终确定」快速驳回
+# （antd 顶部浅色提示「操作失败，java.lang.IndexOutOfBoundsException: Index: 0,
+# Size: 0」，无按钮），表现是弹窗不关闭；**原表单数据不丢失，再点一次即成功**。
+# 83 单提交里 81 单首点被驳回，重试救回 77 单，102 单最终 0 重复。
+_UI_FINAL_CONFIRM_DELAY_S = 0.5         # 全部字段填完 → 首次点击前的静默（用户要求）
+_UI_FINAL_CONFIRM_ATTEMPTS = 3          # 驳回后最多点击轮数（实测值）
+_UI_REJECT_SETTLE_WINDOW_S = 5.0        # 单轮点击后等收场的观察窗（实测值）
+_UI_REJECT_RETRY_PAUSE_MS = 600         # 驳回后到下一轮点击的间隔（实测值）
+_UI_MASK_POLL_S = 0.3                   # 遮罩可见性轮询间隔（实测值）
 # 创建订单接口是非幂等 POST，且平台在并发请求下曾间歇性返回
 # ``IndexOutOfBoundsException: Index: 0, Size: 0``（2026-09 实测，未定根因）。
 # 当时为此把提交固定成 1 路串行排查；2026-10-08 恢复为配置值（默认 4 路），
@@ -561,16 +572,50 @@ def _ui_wait_modal_closed(page: Any, locators: dict[str, Any],
             continue
     _emit(callback, "确认弹窗已收场，等待页面恢复…")
     recover_step = _resolve(locators, "创建订单")
-    candidates = recover_step.get("candidates") if isinstance(recover_step, dict) else None
-    if candidates:
-        try:
-            _build_locator(page, candidates[0]).wait_for(
-                state="visible", timeout=_UI_RECOVER_TIMEOUT_MS)
-        except Exception as exc:  # noqa: BLE001 - 页面恢复不了就无法确认结果
+    # 恢复检查必须走收窄定位（``_find_by_candidates`` 内部取 ``.first`` 并轮询）：
+    # 2026-10-12 实测，页面同时存在导航按钮与弹窗标题残留时 ``get_by_text`` 多匹配，
+    # Playwright strict mode 直接抛 ``Error``（不是超时），把每一单成功提交都误报成
+    # 「创建订单按钮未恢复」→ 全部被标成"结果未知"。加收窄即修复。
+    if recover_step:
+        if _find_by_candidates(page, recover_step, _UI_RECOVER_TIMEOUT_MS)[0] is None:
             raise _SubmissionUncertain(
-                f"弹窗收场后「创建订单」按钮未恢复（{type(exc).__name__}），"
-                "无法确认订单状态") from exc
+                f"弹窗收场后 {_UI_RECOVER_TIMEOUT_MS / 1000:g} 秒内「创建订单」"
+                "按钮未恢复，无法确认订单状态")
     time.sleep(0.5)
+
+
+def _ui_wait_mask_hidden(page: Any, window_s: float) -> bool:
+    """轮询等待弹窗遮罩消失，返回是否在观察窗内收场。
+
+    实测用 ``.ant-modal-mask:visible`` 的 ``count() == 0`` 判定收场：antd 弹窗
+    入场/退场期间可能同时存在多个遮罩，``wait_for_selector(state="hidden")``
+    在多遮罩下会误判，而 ``count()`` 直接数"还有几个可见遮罩"。
+    """
+    deadline = time.monotonic() + max(0.0, window_s)
+    while True:
+        try:
+            if not page.locator(".ant-modal-mask:visible").count():
+                return True
+        except Exception:  # noqa: BLE001 - 页面短暂忙就继续轮询
+            pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(_UI_MASK_POLL_S)
+
+
+def _snapshot_rejection_once(page: Any,
+                             callback: Callable[[str], Any] | None) -> None:
+    """首次平台驳回时抓一份现场（截图/HTML/网址）；纯诊断，失败即忽略。
+
+    用于回答实施计划 §2.4 的遗留问题：驳回报错是 page 级 antd message（无按钮），
+    因此"点掉报错"实际点到的是弹窗自己的「确定」——有现场证据后即可确认动作语义，
+    必要时再按证据微调点击目标。
+    """
+    try:
+        log_dir = _save_failure_snapshot(page, "最终确定被平台驳回")
+        _emit(callback, f"已保存驳回现场截图与页面 HTML：{log_dir}")
+    except Exception:  # noqa: BLE001 - 诊断失败绝不能影响重试
+        pass
 
 
 def _store_option_step(locators: dict[str, Any], store_name: str) -> dict[str, Any]:
@@ -681,10 +726,45 @@ def _ui_create_order(page: Any, payload: dict[str, Any], locators: dict[str, Any
         _ui_dismiss_modal(page)
         raise
 
-    # 7. 最终确定：从这里开始结果才可能未知
-    _ui_click(page, step("最终确定"), _UI_FINAL_CONFIRM_TIMEOUT_MS, "点击最终确定")
+    # 7. 全部字段填完后先静默 _UI_FINAL_CONFIRM_DELAY_S 再点（用户要求；
+    #    首点驳回疑似与"填完立刻点"的平台竞态有关）。
+    page.wait_for_timeout(int(_UI_FINAL_CONFIRM_DELAY_S * 1000))
 
-    # 8. 等弹窗收场（遮罩消失 + 创建订单恢复），失败即结果未知
+    # 8. 最终确定 + 平台驳回重试（≤ _UI_FINAL_CONFIRM_ATTEMPTS 轮）
+    # 从这一步开始结果才可能未知：点是点了，但"订单是否创建"无法从页面断言。
+    # 平台驳回的形态是**弹窗不关闭**（顶部一条无按钮的 antd message），原表单
+    # 数据不丢，再点一次即成功；因此按实测节奏重试，最多 N 轮后交给收尾对账。
+    final_step = step("最终确定")
+    reject_step = {"candidates": [
+        {"css": ".ant-modal-footer .ant-btn-primary:visible"},
+    ]}
+    for attempt in range(_UI_FINAL_CONFIRM_ATTEMPTS):
+        _ui_click(page, final_step, _UI_FINAL_CONFIRM_TIMEOUT_MS, "点击最终确定")
+        if _ui_wait_mask_hidden(page, _UI_REJECT_SETTLE_WINDOW_S):
+            if attempt:
+                _emit(callback,
+                      f"第 {attempt + 1} 次点击「最终确定」后弹窗收场"
+                      "（平台驳回重试生效）")
+            break
+        _emit(callback, f"平台驳回（第 {attempt + 1} 次），点掉报错后原表单重试…")
+        if attempt == 0:
+            # 首次驳回留一份现场（截图 + HTML），用来回答"点掉报错到底点到了
+            # 谁"：若报错是 page 级 message，此处点到的是弹窗自己的「确定」，
+            # 动作语义就是"再点一次"（与实测一致）。纯诊断、失败不影响重试。
+            _snapshot_rejection_once(page, callback)
+        try:
+            # 实测版本点的是脚部主按钮的最后一个（.last）：先照抄实测点击序列，
+            # 语义以首次实跑的现场快照为准（实施计划 §2.4 备注）。
+            _ui_click(page, reject_step, _UI_STEP_TIMEOUT_MS, "点掉平台驳回报错",
+                      pick="last")
+        except Exception:  # noqa: BLE001 - 点不到就交给收尾等待判定
+            break
+        page.wait_for_timeout(_UI_REJECT_RETRY_PAUSE_MS)
+    else:
+        _emit(callback,
+              f"重试 {_UI_FINAL_CONFIRM_ATTEMPTS} 次仍未收场，交给站内对账判定")
+
+    # 9. 等弹窗收场（恢复检查已改为收窄版）；失败即结果未知
     _ui_wait_modal_closed(page, locators, callback)
     return {"success": True}
 
