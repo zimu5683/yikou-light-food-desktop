@@ -1455,6 +1455,14 @@ def _address_combo(fingerprint: OrderFingerprint) -> str:
             + _normalise_text(fingerprint.door_num, compact=True))
 
 
+# 楼栋内部的房号/单元/楼层后缀：数字串后面跟着这些字样时，数字按“楼内编号”理解。
+# 刻意不含 栋/楼/号/座/区——它们可能是楼栋名的一部分（如“…B12栋”），纳入会把
+# 另一栋重新误判成同一栋（D06 式漏单）。集合刻意留窄，可按真实样例再扩。
+_ROOM_SUFFIX_MARKERS = ("室", "房", "间", "单元", "层")
+# 无字样、纯数字串的最小位数：≥3 位按房号理解；1–2 位与楼栋号（B10/B12/B100）无法区分。
+_ROOM_DIGIT_RUN_MIN = 3
+
+
 def _addresses_compatible(record_address: str, task_address: str) -> bool:
     """地址是否指向同一处：折叠后相等，或一方以**非数字边界**包含另一方。
 
@@ -1464,10 +1472,19 @@ def _addresses_compatible(record_address: str, task_address: str) -> bool:
 
     但包含关系不能跨过门牌数字：``…b1`` 是 ``…b10`` 的前缀，只看子串会把
     不同门牌的订单判成同址（D06：站内 B10 顶替本次 B1 任务，导致漏下单）。
-    因此取较短串在较长串里逐个出现位置检查，只有被包含片段两侧的相邻字符
-    都不是数字才算同址；门牌数字边界被吞并的一律判为不同地址——与
-    ``_fingerprint_compatibility`` 的 fail-closed 口径一致：已知字段冲突即
-    按他人订单忽略，不做任何新猜测。
+    因此取较短串在较长串里逐个出现位置检查；只有被包含片段两侧的相邻字符
+    都不是数字才算同址。右邻是数字时再按“楼内编号”口径放宽两档（2026-10-13
+    D06 收紧：同栋写了房号/单元/楼层不能被当成“还没下”而重复下单）：
+
+    - 数字串后面紧跟 室/房/间/单元/层（``…b1101室``、``…b12单元``）——同一
+      送餐点写了房号/单元/楼层，判同址；
+    - 裸数字串 ≥ ``_ROOM_DIGIT_RUN_MIN`` 位（``…b1101``）——按房号理解，
+      宁可按“已有单”处理，也不重复下单。
+
+    1–2 位数字扩展（``…b10``/``…b12``/``…b100``）与楼栋号无法区分，仍判不同
+    址，保住 D06 本体保护；左邻是数字（片段嵌在更长的数字里）保持保守，
+    不套用上面两档——与 ``_fingerprint_compatibility`` 的 fail-closed 口径
+    一致：已知字段冲突即按他人订单忽略，不做任何新猜测。
     """
     if record_address == task_address:
         return True
@@ -1481,6 +1498,14 @@ def _addresses_compatible(record_address: str, task_address: str) -> bool:
         right = longer[end:end + 1]
         if not (left.isdigit() or right.isdigit()):
             return True
+        if right.isdigit() and not left.isdigit():
+            run_end = end
+            while run_end < len(longer) and longer[run_end].isdigit():
+                run_end += 1
+            if longer[run_end:].startswith(_ROOM_SUFFIX_MARKERS):
+                return True
+            if run_end - end >= _ROOM_DIGIT_RUN_MIN:
+                return True
         start = longer.find(shorter, start + 1)
     return False
 

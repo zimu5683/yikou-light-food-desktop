@@ -1056,6 +1056,7 @@ def test_reconcile_normalizes_door_and_keeps_lunch_dinner_separate():
 
 # ---------------------------------------------------------------------------
 # D06：地址门牌数字边界（B10 与 B1 不是同一处）
+# 2026-10-13 第二轮收紧：同栋的房号/单元/楼层写法（…B1 101室、…B1101）视为同址
 # ---------------------------------------------------------------------------
 
 def test_地址兼容_b1_与_b10_门牌数字边界不得被吞并():
@@ -1073,6 +1074,31 @@ def test_地址兼容_b1_与_b10_门牌数字边界不得被吞并():
     # 纯格式差异仍是同址
     assert sss._addresses_compatible("东湖校区b1", "浙江农林大学东湖校区b1") is True
     assert sss._addresses_compatible("东湖校区b1号", "东湖校区b1") is True
+
+
+def test_地址兼容_楼内房号单元楼层视为同址():
+    """同一栋楼写了房号/单元/楼层仍是同一送餐点（2026-10-13 D06 收紧口径）。
+
+    ``…b1101室``/``…b12单元``/``…b13层`` 与裸数字串 ``…b1101`` 都按“B1 楼内
+    编号”理解，判同址；否则站内已有订单会被当成“还没下”而重复下单（方向与
+    D06 本体相反）。
+    """
+    for station, task in (
+        ("东湖校区b1101室", "东湖校区b1"),
+        ("东湖校区b12单元", "东湖校区b1"),
+        ("东湖校区b13层", "东湖校区b1"),
+        ("东湖校区b1101", "东湖校区b1"),
+    ):
+        assert sss._addresses_compatible(station, task) is True, station
+        assert sss._addresses_compatible(task, station) is True, station
+
+
+def test_地址兼容_一位两位数字扩展仍判不同址():
+    """1–2 位数字扩展与楼栋号无法区分，仍判不同址（D06 本体保护不回退）。"""
+    assert sss._addresses_compatible("东湖校区b100", "东湖校区b1") is False
+    assert sss._addresses_compatible("东湖校区b12栋", "东湖校区b1") is False
+    assert sss._addresses_compatible("东湖校区b12楼", "东湖校区b1") is False
+    assert sss._addresses_compatible("12", "1202") is False
 
 
 def test_对账_站内_b10_记录不得确认_b1_任务():
@@ -1107,12 +1133,44 @@ def test_对账_站内_b10_记录不得确认_b1_任务():
     assert result.matched_count == 0
 
 
-def _b10_only_station_fixture(tmp_path, *, reject=False):
+def test_对账_站内房间号写法应确认_b1_任务():
+    """站内概要地址写了房号（…B1 101室）时，应确认为本次 B1 任务的完成证据。
+
+    折叠后 ``…b1101室`` 是 ``…b1`` 加房号，不能再判成“他人订单”——否则任务
+    留在 missing 里会被重新下单（2026-10-13 D06 收紧口径）。
+    """
+    payload = {
+        "receiveName": "张三",
+        "receivePhone": "13800000001",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "receiveAddress": {"addressDetail": "浙江农林大学东湖校区", "doorNum": "B1"},
+    }
+    task = {"identifier": "t1", "payload": payload,
+            "fingerprint": sss._payload_fingerprint(payload)}
+    record = {
+        "id": 9002,
+        "recipientName": "张三",
+        "recipientPhone": ["13800000001"],
+        "recipientAddress": "浙江农林大学东湖校区B1 101室",
+        "expectedDeliveryTime": "2026-09-10 11:00:00",
+        "status": 2,
+    }
+
+    def fetch(path):
+        return {"success": True, "result": {"records": [record], "total": 1}}
+
+    result = sss._reconcile_tasks([task], fetch)
+    assert result.confirmed == {"t1"}
+    assert result.missing == []
+
+
+def _b10_only_station_fixture(tmp_path, *, reject=False, station_door="B10"):
     """名单只送到 B1；站内只有同一客户的概要订单，地址是「…东湖校区B10」。
 
     站内记录的姓名/电话/预约送达时间与任务完全相同，只有门牌数字不同
     （B1 是 B10 的前缀）——这正是 D06 的触发条件。``reject=True`` 时下单
-    会被站内以业务理由明确拒绝（确定未建单）。
+    会被站内以业务理由明确拒绝（确定未建单）；``station_door`` 可换成同栋
+    的房号/单元写法（如 ``"B1 101室"``），用于 D06 收紧口径的端到端用例。
     """
     from openpyxl import Workbook
 
@@ -1144,7 +1202,7 @@ def _b10_only_station_fixture(tmp_path, *, reject=False):
         "id": 9001,
         "recipientName": payload["receiveName"],
         "recipientPhone": [payload["receivePhone"]],
-        "recipientAddress": f"{address.get('addressDetail', '')}B10",
+        "recipientAddress": f"{address.get('addressDetail', '')}{station_door}",
         "expectedDeliveryTime": payload["expectedDeliveryTime"],
         "status": 2,
     }
@@ -1190,6 +1248,23 @@ def test_端到端_站内明确拒绝_b1_时如实报部分完成(monkeypatch, t
     assert (client.posts[0].get("receiveAddress") or {}).get("doorNum") == "B1"
     assert result["created"] == 0, logs
     assert result["partial"] is True, logs
+
+
+@pytest.mark.parametrize("station_door", ["B1 101室", "B1 2单元", "B1101"])
+def test_端到端_站内房间号写法时不再重复下单(monkeypatch, tmp_path, station_door):
+    """端到端（D06 收紧）：站内已有同栋房号/单元写法的订单时，不得再 POST 一遍。"""
+    config, client = _b10_only_station_fixture(tmp_path, station_door=station_door)
+    monkeypatch.setattr(sss, "SssApiClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(sss, "_API_SUBMIT_SETTLE_S", 0.0)
+
+    logs: list[str] = []
+    result = sss.run_sss_job(config, threading.Event(), progress_callback=logs.append,
+                             password="pw", captcha_callback=lambda _img: "1234")
+
+    assert client.posts == [], logs
+    assert result["created"] == 1, logs
+    assert result["reconciled"] is True, logs
+    assert result["partial"] is False, logs
 
 
 def test_list_pending_orders_paginates():
